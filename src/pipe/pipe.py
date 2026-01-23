@@ -556,6 +556,9 @@ class Pipe:
         self.start()
         print(f"Pipeline restarted due to {reason}")
 
+    def stop(self, force=False):
+        self._stop(force=force)
+
     def _stop(self, force=False):
         self.should_stop.value = 1
 
