@@ -239,14 +239,65 @@ Background thread checks `process.is_alive()` every `health_check_interval`:
 - Restarts individual workers with same config
 - Repeated crashes (3+ in short window) → full pipeline restart via `pipe.restart()`
 
-## Tensor Handling
+## Tensor Handling (Shared Memory)
 
-When `share_tensors=True` or tensors detected in items:
-- Tensors serialized to bytes via `torch.save()` before queue.put()
-- Deserialized via `torch.load()` after queue.get()
-- Works in nested structures (dict, list, tuple)
-- Avoids PyTorch's FD-sharing mechanism (breaks when sender exits first)
-- Workers auto-increase file descriptor limits
+Items containing torch tensors are automatically serialized to `/dev/shm` files. The queue carries only a path reference (~60 bytes), not the tensor data.
+
+**Why not use torch.multiprocessing's built-in tensor sharing?**
+PyTorch's default `file_descriptor` strategy passes tensors via a socket server in the producer process. If the producer dies (crash, autoscale-down), the socket is gone and consumers can't retrieve the data. Our approach writes named files to `/dev/shm` which persist regardless of process state.
+
+**How it works:**
+1. Producer: `_item_to_shm(item)` → writes tensors + pickled metadata to `/dev/shm/pipe_<pid>_<uuid>`
+2. Queue carries: `{"__shm__": "/dev/shm/pipe_12345_abcdef"}` (tiny)
+3. Consumer: `_item_from_shm(ref)` → mmaps file, reconstructs tensors, unlinks file
+
+**File format:** `[4B header_len][JSON header][field bytes...]`
+- Tensors: raw numpy bytes at offsets (bfloat16 stored as uint16)
+- Non-tensor fields: pickled at offsets
+- Header maps field names → type, dtype, shape, offset, size
+
+**Performance (round-trip serialize + deserialize):**
+
+| Item size | Overhead | vs typical processing |
+|-----------|----------|----------------------|
+| 64KB (1s audio @16kHz) | 0.1ms | <0.1% |
+| 640KB (10s audio) | 0.4ms | ~0.4% |
+| 1.9MB (30s audio) | 2.7ms | ~1% |
+| 58MB (10min audio) | 118ms | significant |
+| 346MB (1hr audio) | 715ms | bottleneck |
+
+**Current cost breakdown:** each stage boundary copies ALL tensor fields, even if the worker only read metadata. A 5-stage pipeline with 10s audio = 5 × 0.4ms = 2ms total serialization overhead.
+
+**Best practice:** drop tensor fields once no longer needed:
+```python
+def __call__(self, item):
+    result = self.model(item["audio"])
+    item["audio"] = None  # stop serializing audio downstream
+    item["result"] = result
+    return item
+```
+
+**Stale file cleanup:** `_cleanup_stale_shm()` runs on `Pipe()` init, removes any `/dev/shm/pipe_*` files from previous crashed runs.
+
+### Future: ShmPool (not yet implemented)
+
+Pre-allocated pool of shared memory slots with cached handles per worker process. Eliminates per-item file create/open/mmap/unlink syscalls.
+
+**Benchmarks vs current file approach (with cached handles):**
+
+| Item size | File (current) | Pool | Speedup |
+|-----------|---------------|------|---------|
+| 64KB | 0.10ms | 0.10ms | 1x |
+| 640KB | 0.42ms | 0.11ms | 3.9x |
+| 1.9MB | 2.7ms | 0.19ms | 14x |
+
+**Pass-through optimization:** stages that don't access tensor fields can forward the slot reference without any copy. A 5-stage pipeline where only 1 stage reads audio: 4 stages × 0.001ms + 1 stage × 0.11ms = 0.1ms total (vs 2ms current).
+
+**Tradeoffs:**
+- Requires reserving memory upfront: pool_size = sum(all outqn) × slot_size
+- Slot size must fit largest expected item (fallback to file-based for oversized)
+- Pool grows on demand (new slots allocated if free queue empty)
+- Slots released by final consumer, not intermediate stages
 
 ## Common Patterns
 
