@@ -476,6 +476,97 @@ for result in pipe:
 - **flush() not called**: Only called if worker has the method AND there's an output queue
 - **Slow shutdown**: Workers blocked on queue.put(). Framework uses 0.1s timeouts to eventually exit
 
+## Web Server (from pipe.web import ...)
+
+Serve pipe output over HTTP. Useful for distributed pipelines where producer and consumer run on separate machines.
+
+Install: `uv pip install -e ".[web]"` (adds fastapi, uvicorn, lz4)
+
+### Quick Start
+
+```python
+from pipe import Pipe
+from pipe.web import serve_pipe
+
+pipe = Pipe()
+pipe.add(DataLoader(), workers=2, outqn=50)
+pipe.add(Processor(), workers=4, outqn=50)
+serve_pipe(pipe, port=8000, compression="lz4")
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/next` | GET | Returns next item as torch-serialized bytes. Headers: `X-Compression`, `X-Items-Served`, `X-Size-Bytes` |
+| `/health` | GET | JSON: status, pipe_alive, items_served, errors, uptime |
+| `/stats` | GET | JSON: throughput (items/s, MB/s), queue_depth, total served |
+| `/` | GET | API info |
+
+### Pre-serialization (offload from HTTP handler)
+
+Add `SerializerWorker` as final pipe stage to serialize + compress in parallel workers rather than in the single-threaded HTTP handler:
+
+```python
+from pipe.web import SerializerWorker, serve_pipe
+
+pipe = Pipe()
+pipe.add(DataLoader(), workers=2, outqn=50)
+pipe.add(Processor(), workers=4, outqn=50)
+pipe.add(SerializerWorker(compression="lz4"), workers=2, outqn=20)
+serve_pipe(pipe, port=8000, pre_serialized=True)
+```
+
+### Client (consumer side)
+
+```python
+import httpx
+import torch
+import io
+import lz4.frame
+
+def fetch_item(url="http://localhost:8000/next"):
+    r = httpx.get(url, timeout=60)
+    r.raise_for_status()
+    data = r.content
+    if r.headers.get("X-Compression") == "lz4":
+        data = lz4.frame.decompress(data)
+    return torch.load(io.BytesIO(data), weights_only=False)
+```
+
+### PipeServer class (for more control)
+
+```python
+from pipe.web import PipeServer
+
+server = PipeServer(
+    pipe,
+    compression="lz4",   # "none" or "lz4"
+    timeout=30.0,         # seconds to wait for next item before 503
+    pre_serialized=False, # True if using SerializerWorker
+)
+server.start(host="0.0.0.0", port=8000, workers=1)  # uvicorn kwargs
+```
+
+### Bandwidth considerations
+
+| Scenario | Per-item size | Throughput needed |
+|----------|--------------|-------------------|
+| Small metadata dicts | ~1 KB | trivial |
+| Audio tensors (10s) | ~640 KB | ~50 MB/s for 80/s |
+| Mel batches (batch=8) | ~6.5 MB (lz4) | ~100 MB/s for 15/s |
+
+Recommended for localhost or same-datacenter (10+ Gbps). For WAN, run pipeline locally.
+
+### Pipe.stop()
+
+Public method to gracefully stop the pipeline. Sends end signals, joins workers, cleans up queues and manager.
+
+```python
+pipe.stop()         # graceful (waits for workers)
+pipe.stop(force=True)  # terminate immediately
+```
+
 ## Helpers (from pipe import ...)
 
 - `Batcher(size, collate_fn=None)` - simple batching, returns None until full then returns batch
