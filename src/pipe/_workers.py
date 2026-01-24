@@ -64,7 +64,6 @@ def _increase_fd_limit(worker_id: str):
         return
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-        print(f"Worker {worker_id}: Increased FD limit from {soft} to {hard}")
     except Exception as e:
         print(f"Worker {worker_id}: Warning - could not increase FD limit: {e}")
 
@@ -95,13 +94,10 @@ def _worker_run(
     is_root = (in_queue is None)
 
     _increase_fd_limit(worker_desc)
-    fd_info = _get_fd_info()
-    print(f"Worker {worker_desc} starting up - FD info: {fd_info}")
 
     if gpu_id is not None:
         try:
             torch.cuda.set_device(gpu_id)
-            print(f"Worker process set to GPU {gpu_id}")
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
 
@@ -345,13 +341,10 @@ def _threaded_worker_run(
     is_root = (in_queue is None)
 
     _increase_fd_limit(worker_desc)
-    fd_info = _get_fd_info()
-    print(f"Threaded worker {worker_desc} starting with {num_threads} threads - FD info: {fd_info}")
 
     if gpu_id is not None:
         try:
             torch.cuda.set_device(gpu_id)
-            print(f"Threaded worker {worker_desc} set to GPU {gpu_id}")
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
 
