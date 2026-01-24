@@ -93,6 +93,12 @@ def _worker_run(
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
     is_root = (in_queue is None)
 
+    # Limit CPU threads to avoid oversubscription across worker processes
+    torch.set_num_threads(2)
+    os.environ["OMP_NUM_THREADS"] = "2"
+    os.environ["MKL_NUM_THREADS"] = "2"
+    os.environ["OPENBLAS_NUM_THREADS"] = "2"
+
     _increase_fd_limit(worker_desc)
 
     if gpu_id is not None:
@@ -339,6 +345,12 @@ def _threaded_worker_run(
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
     is_root = (in_queue is None)
+
+    # Limit CPU threads to avoid oversubscription across worker processes
+    torch.set_num_threads(2)
+    os.environ["OMP_NUM_THREADS"] = "2"
+    os.environ["MKL_NUM_THREADS"] = "2"
+    os.environ["OPENBLAS_NUM_THREADS"] = "2"
 
     _increase_fd_limit(worker_desc)
 
