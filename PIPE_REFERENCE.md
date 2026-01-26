@@ -52,11 +52,14 @@ for result in pipe:
 
 ## Worker Types
 
-### Generator (first stage, no input queue)
+### Root Worker (first stage, no input queue)
 
-Called repeatedly with no arguments. Must eventually return "end".
+Two patterns for root workers:
 
+**Return-based** - called repeatedly, return `End` when done:
 ```python
+from pipe import End
+
 class Source:
     def load(self):
         self.db = connect()
@@ -65,22 +68,23 @@ class Source:
 
     def __call__(self):
         if self.idx >= len(self.items):
-            return "end"
+            return End
         item = self.items[self.idx]
         self.idx += 1
         return item
 ```
 
-Or using yield (called once, framework iterates):
+**Generator-based** - yield items, exhaustion signals completion:
 ```python
 class Source:
     def __call__(self):
         for row in query_db():
             yield row
-        return "end"
 ```
 
 ### Processor (receives items from upstream)
+
+Workers never see `End` - the framework handles it. Just process items:
 
 ```python
 class Processor:
@@ -88,13 +92,23 @@ class Processor:
         self.model = load_model()
 
     def __call__(self, item):
-        if item == "end": return item
         return {"result": self.model(item)}
+```
+
+### Expander using yield (1 input → N outputs)
+
+Processors can use generators to emit multiple items per input:
+
+```python
+class Splitter:
+    def __call__(self, item):
+        for chunk in split_into_chunks(item["data"]):
+            yield {"chunk": chunk, "parent_id": item["id"]}
 ```
 
 ### Batcher (accumulate then flush)
 
-Buffer items, emit when batch full. Framework calls both `worker("end")` AND `flush()` on shutdown.
+Buffer items, emit when batch full. Implement `flush()` to return remaining items at shutdown:
 
 ```python
 class Batcher:
@@ -102,8 +116,6 @@ class Batcher:
         self._buf = []
 
     def __call__(self, item):
-        if item == "end":
-            return self._flush()
         self._buf.append(item)
         if len(self._buf) >= 32:
             return self._flush()
@@ -115,7 +127,7 @@ class Batcher:
         return out  # list = multiple items downstream
 
     def flush(self):
-        # called by framework after worker("end") - safety net
+        # called by framework at shutdown
         if self._buf:
             return self._flush()
 ```
@@ -165,21 +177,22 @@ class AsyncDownloader:
 |--------|--------|
 | Single item (dict, etc.) | Passed downstream as one item |
 | List of items | Each element emitted separately downstream |
+| Generator (yield) | Each yielded item emitted separately downstream |
 | `None` | Item consumed/filtered - nothing downstream |
-| `"end"` | Only meaningful from root generator (signals done) |
+| `End` | Root worker only: signals completion (or use generator exhaustion) |
 
-The framework wraps non-list returns in a list, filters out None and "end" from lists before putting to output queue.
+The framework handles `End` internally - middle workers never see it. Generators are iterated until exhausted.
 
 ## Completion Signaling
 
 Uses Event-based coordination (not sentinel passing):
 
-1. Root generator returns "end" → root worker exits → sets `stage_done_events[0]`
+1. Root worker returns `End` (or generator exhausts) → root worker exits → sets `stage_done_events[0]`
 2. Stage 1 workers see `upstream_done` Event set + input queue empty for 1s → exit
 3. Last worker at stage N sets `stage_done_events[N]` → signals stage N+1
 4. Final stage done → consumer iteration ends
 
-Workers are flushed on exit: framework calls `worker("end")` then `worker.flush()` to drain buffered items before signaling downstream.
+Workers are flushed on exit: framework calls `worker.flush()` to drain buffered items before signaling downstream.
 
 ## pipe.add() Options
 

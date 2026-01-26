@@ -61,9 +61,6 @@ class TensorProcessor:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         tensor = item["tensor"]
         for _ in range(self.iterations):
             tensor = tensor @ tensor.T

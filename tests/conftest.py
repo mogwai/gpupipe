@@ -69,8 +69,6 @@ class SlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.delay)
         item["processed"] = True
         return item
@@ -82,8 +80,6 @@ class FastWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         item["processed"] = True
         return item
 
@@ -94,8 +90,6 @@ class FilterWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         if item["id"] % 2 == 0:
             return item
         return None
@@ -110,13 +104,11 @@ class ExpandWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         return [{"id": item["id"], "sub": i, "original_id": item["id"]} for i in range(self.factor)]
 
 
 class Batcher:
-    """Batches items, with flush support."""
+    """Batches items, with flush support. Workers don't handle 'end' - use flush()."""
     def __init__(self, size: int):
         self.size = size
         self.buffer = []
@@ -125,13 +117,6 @@ class Batcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            result = self.buffer.copy() if self.buffer else []
-            self.buffer = []
-            if result:
-                result.append("end")
-                return result
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer.copy()
@@ -139,9 +124,16 @@ class Batcher:
             return result
         return None
 
+    def flush(self):
+        if self.buffer:
+            result = self.buffer.copy()
+            self.buffer = []
+            for item in result:
+                yield item
+
 
 class FlushingBatcher:
-    """Batcher that uses flush() mechanism."""
+    """Batcher that uses flush() mechanism. No 'end' handling needed."""
     def __init__(self, size: int):
         self.size = size
         self.buffer = []
@@ -150,8 +142,6 @@ class FlushingBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer.copy()
@@ -184,8 +174,6 @@ class VerySlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(0.1)
         return item
 
@@ -196,8 +184,6 @@ class VariableSlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         delay = 0.02 + (item["id"] % 10) * 0.01
         time.sleep(delay)
         return item
@@ -212,8 +198,6 @@ class WorkGeneratingWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(0.02)
         return [{"id": item["id"], "sub": i} for i in range(self.factor)]
 
@@ -228,18 +212,19 @@ class BufferingBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            if self.buffer:
-                result = self.buffer + ["end"]
-                self.buffer = []
-                return result
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer
             self.buffer = []
             return result
         return None
+
+    def flush(self):
+        if self.buffer:
+            result = self.buffer
+            self.buffer = []
+            for item in result:
+                yield item
 
 
 class BurstGenerator:
@@ -337,9 +322,6 @@ class DownloadSimulator:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         n_bytes = item["n_samples"] * 2
         download_time = n_bytes / self.bytes_per_second
         download_time *= random.uniform(0.8, 1.5)
@@ -359,9 +341,6 @@ class AudioChunker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         duration = item["duration"]
         n_chunks = max(1, int(duration / self.chunk_seconds))
 
@@ -389,13 +368,6 @@ class GPUBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            if self.buffer:
-                batch = self.buffer.copy()
-                self.buffer = []
-                return [{"batch": batch, "batch_size": len(batch)}, "end"]
-            return "end"
-
         self.buffer.append(item)
         if len(self.buffer) >= self.batch_size:
             batch = self.buffer.copy()
@@ -422,9 +394,6 @@ class GPUEncoder:
         time.sleep(0.1)
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         batch = item["batch"]
         total_duration = sum(c.get("chunk_duration", 1.0) for c in batch)
 
@@ -462,22 +431,7 @@ class ResultAggregator:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            results = []
-            for parent_id, data in self.pending.items():
-                results.append({
-                    "id": parent_id,
-                    "complete": False,
-                    "chunks_received": len(data["chunks"]),
-                    "chunks_expected": data["n_chunks"],
-                })
-            self.pending = {}
-            if results:
-                return results + ["end"]
-            return "end"
-
         parent_id = item["parent_id"]
-        chunk_idx = item["chunk_idx"]
         n_chunks = item["n_chunks"]
 
         if parent_id not in self.pending:
@@ -502,6 +456,16 @@ class ResultAggregator:
             }
 
         return None
+
+    def flush(self):
+        for parent_id, data in self.pending.items():
+            yield {
+                "id": parent_id,
+                "complete": False,
+                "chunks_received": len(data["chunks"]),
+                "chunks_expected": data["n_chunks"],
+            }
+        self.pending = {}
 
 
 class VariableWorkGenerator:
@@ -533,8 +497,6 @@ class VariableWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(item["work_ms"] / 1000)
         item["processed"] = True
         return item
@@ -574,8 +536,6 @@ class TensorProcessor:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         tensor = item["tensor"]
         for _ in range(self.iterations):
             tensor = tensor @ tensor.T
@@ -595,11 +555,6 @@ class TensorBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            if self.buffer:
-                batch = self._make_batch()
-                return [batch, "end"]
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.batch_size:
             return self._make_batch()
@@ -611,6 +566,10 @@ class TensorBatcher:
         self.buffer = []
         return {"ids": ids, "batch_tensor": tensors}
 
+    def flush(self):
+        if self.buffer:
+            yield self._make_batch()
+
 
 class BatchTensorProcessor:
     """Processes batched tensors with compute-intensive operations."""
@@ -621,8 +580,6 @@ class BatchTensorProcessor:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         batch_tensor = item["batch_tensor"]
         for _ in range(self.iterations):
             batch_tensor = torch.nn.functional.normalize(batch_tensor, dim=-1)
@@ -637,8 +594,6 @@ class TensorUnbatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         ids = item["ids"]
         batch_tensor = item["batch_tensor"]
         results = []
@@ -680,8 +635,6 @@ class HeavyTensorProcessor:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         tensor = item["tensor"]
         start = time.time()
         while (time.time() - start) * 1000 < self.compute_ms:
