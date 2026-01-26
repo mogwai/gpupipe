@@ -19,9 +19,9 @@ from pipe import Pipe
 
 class Generator:
     def __call__(self):
+        # Generator pattern - yield items, exhaustion signals completion
         for i in range(100):
             yield {"id": i}
-        return "end"
 
 class Worker:
     def load(self):
@@ -29,6 +29,7 @@ class Worker:
         pass
 
     def __call__(self, item):
+        # Workers never see "end" - framework handles it internally
         item["processed"] = True
         return item
 

@@ -9,7 +9,10 @@ from pipe import Pipe
 
 
 class ItemSource:
-    """Source stage: yields items one at a time, returns 'end' when done."""
+    """Source stage: returns items one at a time, returns 'end' when done.
+
+    Root workers can return 'end' or use generators - framework handles both.
+    """
 
     def __init__(self, paths: list[str]):
         self.paths = paths
