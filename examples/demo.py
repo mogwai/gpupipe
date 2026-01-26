@@ -41,8 +41,6 @@ class Downloader:
         print("Downloader ready")
 
     def __call__(self, item):
-        if item == "end":
-            return item
         # Simulate network: 50-150ms (slower to trigger scaling)
         time.sleep(random.uniform(0.05, 0.15))
         item["downloaded"] = True
@@ -55,8 +53,6 @@ class Processor:
         print("Processor ready")
 
     def __call__(self, item):
-        if item == "end":
-            return item
         # Processing time proportional to duration: ~5ms per second of audio
         process_time = item["duration"] * 0.005
         time.sleep(process_time)

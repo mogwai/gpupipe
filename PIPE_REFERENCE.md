@@ -45,10 +45,11 @@ for result in pipe:
 1. Process/thread spawned
 2. `load()` called (if exists) - heavy init here
 3. Worker called repeatedly with items from input queue
-4. On upstream completion: worker called with `"end"` to trigger flush
-5. `flush()` method called (if exists) for any remaining buffered items
-6. Worker exits, increments stage_end_counter
-7. Last worker at a stage sets stage_done Event → signals downstream
+4. On upstream completion: framework calls `flush()` if it exists
+5. Worker exits, increments stage_end_counter
+6. Last worker at a stage sets stage_done Event → signals downstream
+
+**Important:** Middle workers never see the `End` sentinel - the framework handles it internally.
 
 ## Worker Types
 
@@ -160,8 +161,6 @@ class AsyncDownloader:
         return [r for r in results if r is not None]
 
     def __call__(self, item):
-        if item == "end":
-            return self.flush() or None
         self._buffer.append(item)
         if len(self._buffer) >= self._buffer_size:
             return self._flush_buffer()
@@ -327,7 +326,6 @@ pipe.add(ResultWriter(), workers=1, outqn=0)
 ```python
 class Filter:
     def __call__(self, item):
-        if item == "end": return item
         if not valid(item): return None
         return item
 ```
@@ -336,7 +334,6 @@ class Filter:
 ```python
 class Splitter:
     def __call__(self, item):
-        if item == "end": return item
         return [{"chunk": c} for c in split(item)]
 ```
 
@@ -348,7 +345,6 @@ class Writer:
         self.start = time.time()
 
     def __call__(self, item):
-        if item == "end": return self.flush() or None
         self.count += 1
         if self.count % 100 == 0:
             rate = self.count / (time.time() - self.start)
@@ -390,8 +386,6 @@ class AudioDownloader:
         self._buffer = []
 
     def __call__(self, item):
-        if item == "end":
-            return self.flush() or None
         self._buffer.append(item)
         if len(self._buffer) >= self._buffer_size:
             return self._flush_buffer()
@@ -415,8 +409,6 @@ class GPUProcessor:
         self._buffer = []
 
     def __call__(self, item):
-        if item == "end":
-            return self._flush_buffer()
         self._buffer.append(item)
         if len(self._buffer) >= self.batch_size:
             return self._flush_buffer()
@@ -437,8 +429,6 @@ class ResultWriter:
         self._batch = []
 
     def __call__(self, item):
-        if item == "end":
-            return self.flush() or None
         self._batch.append(item)
         if len(self._batch) >= 64:
             return self._flush()
@@ -471,8 +461,8 @@ for result in pipe:
 
 1. **`load()` for heavy init** - models, DB connections, S3 clients, event loops go here (runs after fork in child process)
 2. **`__init__()` must be picklable** - no lambdas, CUDA tensors, open files, boto3 clients
-3. **Always handle "end"** - flush buffers and return remaining items when receiving "end"
-4. **`flush()` method** - framework calls this as safety net after worker("end"), should return list or iterable
+3. **Workers don't handle "end"** - framework handles End sentinel internally, workers never see it
+4. **`flush()` method for batchers** - framework calls this at shutdown to emit remaining buffered items
 5. **thread=True for IO-bound** - downloads, DB queries. Shares memory, no pickle needed, GIL-friendly for IO waits
 6. **pergpu=True** - one worker per GPU, sets CUDA_VISIBLE_DEVICES per worker
 7. **debug=True** - single process, sequential execution, for debugging/testing
