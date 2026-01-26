@@ -62,8 +62,6 @@ class SlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.delay)
         item["processed"] = True
         return item
@@ -75,8 +73,6 @@ class FastWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         item["processed"] = True
         return item
 
@@ -95,8 +91,6 @@ class VerySlowWorker:
     def load(self):
         pass
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(0.1)
         return item
 
@@ -106,8 +100,6 @@ class VariableSlowWorker:
     def load(self):
         pass
     def __call__(self, item):
-        if item == "end":
-            return item
         delay = 0.02 + (item["id"] % 10) * 0.01
         time.sleep(delay)
         return item
@@ -120,8 +112,6 @@ class WorkGeneratingWorker:
     def load(self):
         pass
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(0.02)
         return [{"id": item["id"], "sub": i} for i in range(self.factor)]
 
@@ -134,18 +124,19 @@ class BufferingBatcher:
     def load(self):
         pass
     def __call__(self, item):
-        if item == "end":
-            if self.buffer:
-                result = self.buffer + ["end"]
-                self.buffer = []
-                return result
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer
             self.buffer = []
             return result
         return None
+
+    def flush(self):
+        if self.buffer:
+            result = self.buffer.copy()
+            self.buffer = []
+            for item in result:
+                yield item
 
 
 class BurstGenerator:
@@ -227,8 +218,6 @@ class VariableWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(item["work_ms"] / 1000)
         item["processed"] = True
         return item
@@ -811,8 +800,6 @@ class MediumSlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(0.05)
         item["processed"] = True
         return item
@@ -996,8 +983,6 @@ class VariableProcessTimeWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(item.get("process_time", 0.01))
         item["processed"] = True
         return item
@@ -1164,8 +1149,6 @@ class VerySlowProcessingWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.process_time)
         item["processed"] = True
         return item
@@ -1180,8 +1163,6 @@ class FixedTimeWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.process_time)
         item["processed"] = True
         return item

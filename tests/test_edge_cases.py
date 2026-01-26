@@ -60,8 +60,6 @@ class SlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.delay)
         item["processed"] = True
         return item
@@ -73,8 +71,6 @@ class FastWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         item["processed"] = True
         return item
 

@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import threading
 import time
 from queue import Empty, Full
@@ -11,6 +12,7 @@ from ._monitors import _autoscaler_thread, _health_monitor_thread, _stats_monito
 from ._shm import _cleanup_stale_shm, _item_from_shm
 from ._workers import (
     _check_picklable,
+    _is_end,
     _spawn_additional_worker,
     _threaded_worker_run,
     _worker_run,
@@ -33,9 +35,10 @@ class PipeIterator:
         while True:
             try:
                 item = self.queue.get(timeout=1.0)
-                if item == "end":
+                item = _item_from_shm(item)
+                if _is_end(item):
                     raise StopIteration
-                return _item_from_shm(item)
+                return item
             except Empty:
                 continue
 
@@ -669,11 +672,12 @@ class Pipe:
             try:
                 item = self.queues[-1].get(timeout=0.1)
                 consecutive_empty = 0
+                item = _item_from_shm(item)
 
-                if item == "end":
+                if _is_end(item):
                     continue
 
-                yield _item_from_shm(item)
+                yield item
             except Empty:
                 consecutive_empty += 1
                 if final_done.is_set() and consecutive_empty >= EMPTY_THRESHOLD:
@@ -724,15 +728,33 @@ class Pipe:
 
         while not root_ended or pending_items:
             if not root_ended:
-                root_items = workers[0]()
-                if not isinstance(root_items, list):
-                    root_items = [root_items]
+                root_result = workers[0]()
 
-                for root_item in root_items:
-                    if root_item == "end":
+                # Handle generator from root worker
+                if inspect.isgenerator(root_result):
+                    for root_item in root_result:
+                        if root_item is None or _is_end(root_item):
+                            continue
+                        pending_items.append((1, root_item))
+                    root_ended = True
+                else:
+                    if _is_end(root_result):
                         root_ended = True
-                        break
-                    pending_items.append((1, root_item))
+                    elif not isinstance(root_result, list):
+                        root_result = [root_result]
+                        for root_item in root_result:
+                            if _is_end(root_item):
+                                root_ended = True
+                                break
+                            if root_item is not None:
+                                pending_items.append((1, root_item))
+                    else:
+                        for root_item in root_result:
+                            if _is_end(root_item):
+                                root_ended = True
+                                break
+                            if root_item is not None:
+                                pending_items.append((1, root_item))
 
             if pending_items:
                 stage_idx, item = pending_items.pop(0)
@@ -757,11 +779,55 @@ class Pipe:
 
                 if result is None:
                     continue
-                elif result == "end":
+                # Handle generator from middle worker
+                elif inspect.isgenerator(result):
+                    for res_item in result:
+                        if res_item is None or _is_end(res_item):
+                            continue
+                        pending_items.append((stage_idx + 1, res_item))
+                elif _is_end(result):
                     break
                 elif isinstance(result, list):
                     for res_item in result:
-                        if res_item != "end":
+                        if res_item is not None and not _is_end(res_item):
                             pending_items.append((stage_idx + 1, res_item))
                 else:
                     pending_items.append((stage_idx + 1, result))
+
+        # Flush all workers that have flush() method and process remaining items
+        for stage_idx, worker in enumerate(workers[1:], 1):  # Skip root worker
+            if hasattr(worker, "flush"):
+                for flushed_item in worker.flush():
+                    if flushed_item is not None:
+                        pending_items.append((stage_idx + 1, flushed_item))
+
+        # Process any remaining items from flush
+        while pending_items:
+            stage_idx, item = pending_items.pop(0)
+
+            if stage_idx >= len(workers):
+                yield item
+                continue
+
+            worker = workers[stage_idx]
+            try:
+                result = worker(item)
+            except Exception as e:
+                if self.raise_errors:
+                    raise e
+                continue
+
+            if result is None:
+                continue
+            elif inspect.isgenerator(result):
+                for res_item in result:
+                    if res_item is not None and not _is_end(res_item):
+                        pending_items.append((stage_idx + 1, res_item))
+            elif _is_end(result):
+                continue
+            elif isinstance(result, list):
+                for res_item in result:
+                    if res_item is not None and not _is_end(res_item):
+                        pending_items.append((stage_idx + 1, res_item))
+            else:
+                pending_items.append((stage_idx + 1, result))

@@ -131,9 +131,6 @@ class DownloadSimulator:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         n_bytes = item["n_samples"] * 2
         download_time = n_bytes / self.bytes_per_second
         download_time *= random.uniform(0.8, 1.5)
@@ -153,9 +150,6 @@ class AudioChunker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         duration = item["duration"]
         n_chunks = max(1, int(duration / self.chunk_seconds))
 
@@ -183,13 +177,6 @@ class GPUBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            if self.buffer:
-                batch = self.buffer.copy()
-                self.buffer = []
-                return [{"batch": batch, "batch_size": len(batch)}, "end"]
-            return "end"
-
         self.buffer.append(item)
         if len(self.buffer) >= self.batch_size:
             batch = self.buffer.copy()
@@ -216,9 +203,6 @@ class GPUEncoder:
         time.sleep(0.1)
 
     def __call__(self, item):
-        if item == "end":
-            return item
-
         batch = item["batch"]
         total_duration = sum(c.get("chunk_duration", 1.0) for c in batch)
 
@@ -256,22 +240,7 @@ class ResultAggregator:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            results = []
-            for parent_id, data in self.pending.items():
-                results.append({
-                    "id": parent_id,
-                    "complete": False,
-                    "chunks_received": len(data["chunks"]),
-                    "chunks_expected": data["n_chunks"],
-                })
-            self.pending = {}
-            if results:
-                return results + ["end"]
-            return "end"
-
         parent_id = item["parent_id"]
-        chunk_idx = item["chunk_idx"]
         n_chunks = item["n_chunks"]
 
         if parent_id not in self.pending:
@@ -296,6 +265,16 @@ class ResultAggregator:
             }
 
         return None
+
+    def flush(self):
+        for parent_id, data in self.pending.items():
+            yield {
+                "id": parent_id,
+                "complete": False,
+                "chunks_received": len(data["chunks"]),
+                "chunks_expected": data["n_chunks"],
+            }
+        self.pending = {}
 
 
 # === REALISTIC AUDIO PIPELINE TESTS ===

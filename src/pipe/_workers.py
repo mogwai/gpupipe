@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import os
 import pickle
 import resource
@@ -11,7 +12,13 @@ from queue import Full
 
 import torch
 
+from .types import End
 from ._shm import _item_from_shm, _item_to_shm
+
+
+def _is_end(item):
+    """Check if item is an end signal (End sentinel or legacy 'end' string)."""
+    return item is End or item == "end"
 
 
 def _check_picklable(obj, name: str, is_thread: bool = False) -> None:
@@ -125,7 +132,7 @@ def _worker_run(
     last_fd_check = time.time()
     fd_check_interval = 30
     consecutive_empty = 0
-    EMPTY_THRESHOLD = 10
+    EMPTY_THRESHOLD = 30
 
     def extract_audio_duration(obj):
         if obj is None:
@@ -164,11 +171,45 @@ def _worker_run(
 
                 if result is None:
                     continue
+
+                # Handle generator results - iterate and emit items one by one
+                if inspect.isgenerator(result):
+                    for gen_item in result:
+                        if should_stop.value:
+                            break
+                        if gen_item is None or _is_end(gen_item):
+                            continue
+                        if timing_dict is not None and worker_id is not None:
+                            items_processed += 1
+                            total_audio_duration += extract_audio_duration(gen_item)
+                        if out_queue:
+                            serialized = _item_to_shm(gen_item)
+                            while not should_stop.value:
+                                try:
+                                    out_queue.put(serialized, timeout=0.1)
+                                    break
+                                except Full:
+                                    continue
+                    # Generator exhausted = done
+                    if timing_dict is not None and worker_id is not None:
+                        total_process_time += time.time() - start_time
+                        timing_dict[worker_id] = {
+                            "items": items_processed,
+                            "total_time": total_process_time,
+                            "avg_time": total_process_time / items_processed if items_processed else 0,
+                            "audio_duration": total_audio_duration,
+                            "start_wall_time": worker_start_wall_time,
+                        }
+                    break
+
+                # Handle list/single item results (original behavior)
+                if _is_end(result):
+                    break
                 if not isinstance(result, list):
                     result = [result]
 
-                has_end = "end" in result
-                valid_items = [r for r in result if r is not None and r != "end"]
+                has_end = any(_is_end(r) for r in result)
+                valid_items = [r for r in result if r is not None and not _is_end(r)]
 
                 if timing_dict is not None and worker_id is not None and valid_items:
                     items_processed += len(valid_items)
@@ -218,10 +259,12 @@ def _worker_run(
                     print(f"Worker {worker_id} received stop signal, exiting gracefully")
                     break
 
-                if item == "end":
-                    continue
-
                 item = _item_from_shm(item)
+
+                # Check for End sentinel from upstream - skip it and continue draining
+                # The upstream_done event + empty threshold will signal exit
+                if _is_end(item):
+                    continue
 
                 start_time = time.time()
                 result = worker(item)
@@ -229,10 +272,43 @@ def _worker_run(
 
                 if result is None:
                     continue
+
+                # Handle generator results from middle workers
+                if inspect.isgenerator(result):
+                    gen_count = 0
+                    for gen_item in result:
+                        if should_stop.value:
+                            break
+                        if gen_item is None or _is_end(gen_item):
+                            continue
+                        gen_count += 1
+                        if out_queue:
+                            serialized = _item_to_shm(gen_item)
+                            while not should_stop.value:
+                                try:
+                                    out_queue.put(serialized, timeout=0.1)
+                                    break
+                                except Full:
+                                    continue
+                    if timing_dict is not None and worker_id is not None:
+                        items_processed += 1
+                        total_process_time += time.time() - start_time
+                        total_audio_duration += extract_audio_duration(item)
+                        if items_processed % 10 == 0:
+                            timing_dict[worker_id] = {
+                                "items": items_processed,
+                                "total_time": total_process_time,
+                                "avg_time": total_process_time / items_processed,
+                                "audio_duration": total_audio_duration,
+                                "start_wall_time": worker_start_wall_time,
+                            }
+                    continue
+
+                # Handle list/single item results (original behavior)
                 if not isinstance(result, list):
                     result = [result]
 
-                valid_items = [r for r in result if r is not None and r != "end"]
+                valid_items = [r for r in result if r is not None and not _is_end(r)]
 
                 if timing_dict is not None and worker_id is not None:
                     items_processed += 1
@@ -266,27 +342,7 @@ def _worker_run(
             if raise_errors:
                 raise e
 
-    # Flush buffered items
-    if not is_root and out_queue:
-        try:
-            result = worker("end")
-            if result is not None:
-                if not isinstance(result, list):
-                    result = [result]
-                valid_items = [r for r in result if r is not None and r != "end"]
-                if valid_items:
-                    print(f"Worker {worker_desc} flushing {len(valid_items)} items")
-                    for item in valid_items:
-                        serialized = _item_to_shm(item)
-                        while not should_stop.value:
-                            try:
-                                out_queue.put(serialized, timeout=0.1)
-                                break
-                            except Full:
-                                continue
-        except Exception as e:
-            print(f"Worker {worker_desc} flush error: {e}")
-
+    # Flush buffered items via flush() method - workers don't need to handle End
     if hasattr(worker, "flush") and out_queue:
         try:
             flushed_items = list(worker.flush())
@@ -315,6 +371,14 @@ def _worker_run(
         print(f"Worker {worker_id} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
 
         if finished_workers >= current_worker_count:
+            # Put End sentinel on output queue so downstream knows we're done
+            if out_queue is not None:
+                try:
+                    serialized = _item_to_shm(End)
+                    out_queue.put(serialized, timeout=1.0)
+                    print(f"Put End sentinel on queue for {stage_desc}")
+                except Full:
+                    print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
             if stage_done is not None:
                 stage_done.set()
                 print(f"All workers finished at {stage_desc}, signaling downstream")
@@ -401,7 +465,7 @@ def _threaded_worker_run(
         local_time = 0.0
         local_audio = 0.0
         consecutive_empty = 0
-        EMPTY_THRESHOLD = 10
+        EMPTY_THRESHOLD = 30
 
         while not should_stop.value and not thread_stop.is_set():
             try:
@@ -412,11 +476,40 @@ def _threaded_worker_run(
 
                     if result is None:
                         continue
+
+                    # Handle generator results
+                    if inspect.isgenerator(result):
+                        for gen_item in result:
+                            if should_stop.value or thread_stop.is_set():
+                                break
+                            if gen_item is None or _is_end(gen_item):
+                                continue
+                            if timing_dict is not None and worker_id is not None:
+                                local_items += 1
+                                local_audio += extract_audio_duration(gen_item)
+                            if out_queue:
+                                serialized = _item_to_shm(gen_item)
+                                while not should_stop.value and not thread_stop.is_set():
+                                    try:
+                                        out_queue.put(serialized, timeout=0.1)
+                                        break
+                                    except Full:
+                                        continue
+                        # Generator exhausted = done
+                        if timing_dict is not None and worker_id is not None:
+                            local_time += time.time() - start_time
+                        thread_stop.set()
+                        return
+
+                    # Handle list/single item results (original behavior)
+                    if _is_end(result):
+                        thread_stop.set()
+                        return
                     if not isinstance(result, list):
                         result = [result]
 
-                    has_end = "end" in result
-                    valid_items = [r for r in result if r is not None and r != "end"]
+                    has_end = any(_is_end(r) for r in result)
+                    valid_items = [r for r in result if r is not None and not _is_end(r)]
 
                     if timing_dict is not None and worker_id is not None and valid_items:
                         local_items += len(valid_items)
@@ -462,10 +555,12 @@ def _threaded_worker_run(
                         print(f"Thread {worker_id} received stop signal")
                         return
 
-                    if item == "end":
-                        continue
-
                     item = _item_from_shm(item)
+
+                    # Check for End sentinel from upstream - skip it and continue draining
+                    # The upstream_done event + empty threshold will signal exit
+                    if _is_end(item):
+                        continue
 
                     start_time = time.time()
                     result = worker(item)
@@ -473,10 +568,41 @@ def _threaded_worker_run(
 
                     if result is None:
                         continue
+
+                    # Handle generator results from middle workers
+                    if inspect.isgenerator(result):
+                        for gen_item in result:
+                            if should_stop.value or thread_stop.is_set():
+                                break
+                            if gen_item is None or _is_end(gen_item):
+                                continue
+                            if out_queue:
+                                serialized = _item_to_shm(gen_item)
+                                while not should_stop.value and not thread_stop.is_set():
+                                    try:
+                                        out_queue.put(serialized, timeout=0.1)
+                                        break
+                                    except Full:
+                                        continue
+                        if timing_dict is not None and worker_id is not None:
+                            local_items += 1
+                            local_time += time.time() - start_time
+                            local_audio += extract_audio_duration(item)
+                            if local_items % 10 == 0:
+                                timing_dict[worker_id] = {
+                                    "items": local_items,
+                                    "total_time": local_time,
+                                    "avg_time": local_time / local_items,
+                                    "audio_duration": local_audio,
+                                    "start_wall_time": worker_start_wall_time,
+                                }
+                        continue
+
+                    # Handle list/single item results (original behavior)
                     if not isinstance(result, list):
                         result = [result]
 
-                    valid_items = [r for r in result if r is not None and r != "end"]
+                    valid_items = [r for r in result if r is not None and not _is_end(r)]
 
                     if timing_dict is not None and worker_id is not None:
                         local_items += 1
@@ -545,6 +671,14 @@ def _threaded_worker_run(
             print(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
 
             if finished_workers >= current_worker_count:
+                # Put End sentinel on output queue so downstream knows we're done
+                if out_queue is not None:
+                    try:
+                        serialized = _item_to_shm(End)
+                        out_queue.put(serialized, timeout=1.0)
+                        print(f"Put End sentinel on queue for {stage_name}")
+                    except Full:
+                        print(f"Warning: Could not put End sentinel on queue for {stage_name}")
                 if stage_done is not None:
                     stage_done.set()
                     print(f"All workers finished at {stage_name}, signaling downstream")

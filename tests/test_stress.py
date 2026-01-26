@@ -61,8 +61,6 @@ class SlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.delay)
         item["processed"] = True
         return item
@@ -74,8 +72,6 @@ class FastWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         item["processed"] = True
         return item
 
@@ -90,19 +86,19 @@ class Batcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            result = self.buffer.copy() if self.buffer else []
-            self.buffer = []
-            if result:
-                result.append("end")
-                return result
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer.copy()
             self.buffer = []
             return result
         return None
+
+    def flush(self):
+        if self.buffer:
+            result = self.buffer.copy()
+            self.buffer = []
+            for item in result:
+                yield item
 
 
 class GPUBatcher:
@@ -115,19 +111,18 @@ class GPUBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            if self.buffer:
-                batch = self.buffer.copy()
-                self.buffer = []
-                return [{"batch": batch, "batch_size": len(batch)}, "end"]
-            return "end"
-
         self.buffer.append(item)
         if len(self.buffer) >= self.batch_size:
             batch = self.buffer.copy()
             self.buffer = []
             return {"batch": batch, "batch_size": len(batch)}
         return None
+
+    def flush(self):
+        if self.buffer:
+            batch = self.buffer.copy()
+            self.buffer = []
+            yield {"batch": batch, "batch_size": len(batch)}
 
 
 class Collector:

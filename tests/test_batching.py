@@ -57,8 +57,6 @@ class SlowWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         time.sleep(self.delay)
         item["processed"] = True
         return item
@@ -69,8 +67,6 @@ class FastWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         item["processed"] = True
         return item
 
@@ -83,8 +79,6 @@ class ExpandWorker:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return item
         return [{"id": item["id"], "sub": i, "original_id": item["id"]} for i in range(self.factor)]
 
 
@@ -97,19 +91,19 @@ class Batcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            result = self.buffer.copy() if self.buffer else []
-            self.buffer = []
-            if result:
-                result.append("end")
-                return result
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer.copy()
             self.buffer = []
             return result
         return None
+
+    def flush(self):
+        if self.buffer:
+            result = self.buffer.copy()
+            self.buffer = []
+            for item in result:
+                yield item
 
 
 class FlushingBatcher:
@@ -121,8 +115,6 @@ class FlushingBatcher:
         pass
 
     def __call__(self, item):
-        if item == "end":
-            return "end"
         self.buffer.append(item)
         if len(self.buffer) >= self.size:
             result = self.buffer.copy()
