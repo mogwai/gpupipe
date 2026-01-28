@@ -34,15 +34,17 @@ def _has_tensors(obj):
     return False
 
 
-def _item_to_shm(item):
+def _item_to_shm(item, skip=False):
     """Write an item to /dev/shm. Returns metadata dict for the queue.
 
     File format: [4B header_len][header_json][field_bytes...]
     - Tensors stored as raw bytes at offsets specified in header
     - Non-tensor values pickled and stored at offsets in header
     - Queue only carries {"__shm__": path} (~50 bytes)
+
+    Set PIPE_NO_SHM=1 to disable shm globally. Pass skip=True to skip for this call.
     """
-    if not isinstance(item, dict) or not _has_tensors(item):
+    if skip or os.environ.get("PIPE_NO_SHM") or not isinstance(item, dict) or not _has_tensors(item):
         return item
 
     path = f"/dev/shm/pipe_{os.getpid()}_{uuid.uuid4().hex[:12]}"
