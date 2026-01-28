@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import os
 import threading
 import time
 from queue import Empty, Full
@@ -55,10 +56,22 @@ class Pipe:
         allow_full_restart=True,
         autoscale=False,
         max_workers_per_stage=8,
+        use_shm=True,
+        output_shm=True,
     ):
+        # Set env vars for shm control (inherited by spawned workers)
+        if not use_shm:
+            os.environ["PIPE_NO_SHM"] = "1"
+        elif "PIPE_NO_SHM" in os.environ:
+            del os.environ["PIPE_NO_SHM"]
+        if not output_shm:
+            os.environ["PIPE_NO_SHM_OUTPUT"] = "1"
+        elif "PIPE_NO_SHM_OUTPUT" in os.environ:
+            del os.environ["PIPE_NO_SHM_OUTPUT"]
         _cleanup_stale_shm()
         self.debug = debug
         self.share_tensors = share_tensors
+        self.use_shm = use_shm
         self.raise_errors = raise_errors if raise_errors is not None else debug
         self.health_check_interval = health_check_interval
         self.allow_full_restart = allow_full_restart

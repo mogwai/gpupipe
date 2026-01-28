@@ -16,6 +16,11 @@ from .types import End
 from ._shm import _item_from_shm, _item_to_shm
 
 
+def _skip_shm_for_output(is_final_stage):
+    """Check if shm should be skipped for output queue."""
+    return bool(is_final_stage and os.environ.get("PIPE_NO_SHM_OUTPUT"))
+
+
 def _is_end(item):
     """Check if item is an end signal (End sentinel or legacy 'end' string)."""
     return item is End or item == "end"
@@ -183,7 +188,7 @@ def _worker_run(
                             items_processed += 1
                             total_audio_duration += extract_audio_duration(gen_item)
                         if out_queue:
-                            serialized = _item_to_shm(gen_item)
+                            serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
                             while not should_stop.value:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
@@ -225,7 +230,7 @@ def _worker_run(
 
                 if out_queue:
                     for item in valid_items:
-                        serialized = _item_to_shm(item)
+                        serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
                         while not should_stop.value:
                             try:
                                 out_queue.put(serialized, timeout=0.1)
@@ -283,7 +288,7 @@ def _worker_run(
                             continue
                         gen_count += 1
                         if out_queue:
-                            serialized = _item_to_shm(gen_item)
+                            serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
                             while not should_stop.value:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
@@ -325,7 +330,7 @@ def _worker_run(
 
                 if out_queue:
                     for out_item in valid_items:
-                        serialized = _item_to_shm(out_item)
+                        serialized = _item_to_shm(out_item, skip=_skip_shm_for_output(is_final_stage))
                         while not should_stop.value:
                             try:
                                 out_queue.put(serialized, timeout=0.1)
@@ -350,7 +355,7 @@ def _worker_run(
                 print(f"Worker {worker_desc} flushing {len(flushed_items)} items via flush()")
                 for item in flushed_items:
                     if item is not None:
-                        serialized = _item_to_shm(item)
+                        serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
                         while not should_stop.value:
                             try:
                                 out_queue.put(serialized, timeout=0.1)
@@ -374,7 +379,7 @@ def _worker_run(
             # Put End sentinel on output queue so downstream knows we're done
             if out_queue is not None:
                 try:
-                    serialized = _item_to_shm(End)
+                    serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
                     out_queue.put(serialized, timeout=1.0)
                     print(f"Put End sentinel on queue for {stage_desc}")
                 except Full:
@@ -488,7 +493,7 @@ def _threaded_worker_run(
                                 local_items += 1
                                 local_audio += extract_audio_duration(gen_item)
                             if out_queue:
-                                serialized = _item_to_shm(gen_item)
+                                serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
                                 while not should_stop.value and not thread_stop.is_set():
                                     try:
                                         out_queue.put(serialized, timeout=0.1)
@@ -518,7 +523,7 @@ def _threaded_worker_run(
 
                     if out_queue:
                         for item in valid_items:
-                            serialized = _item_to_shm(item)
+                            serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
                             while not should_stop.value and not thread_stop.is_set():
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
@@ -577,7 +582,7 @@ def _threaded_worker_run(
                             if gen_item is None or _is_end(gen_item):
                                 continue
                             if out_queue:
-                                serialized = _item_to_shm(gen_item)
+                                serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
                                 while not should_stop.value and not thread_stop.is_set():
                                     try:
                                         out_queue.put(serialized, timeout=0.1)
@@ -619,7 +624,7 @@ def _threaded_worker_run(
 
                     if out_queue:
                         for out_item in valid_items:
-                            serialized = _item_to_shm(out_item)
+                            serialized = _item_to_shm(out_item, skip=_skip_shm_for_output(is_final_stage))
                             while not should_stop.value:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
@@ -657,7 +662,7 @@ def _threaded_worker_run(
         if hasattr(worker, "flush") and out_queue:
             try:
                 for item in worker.flush():
-                    serialized = _item_to_shm(item)
+                    serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
                     out_queue.put(serialized, timeout=1)
             except Exception as e:
                 print(f"Threaded worker {worker_desc} flush error: {e}")
@@ -674,7 +679,7 @@ def _threaded_worker_run(
                 # Put End sentinel on output queue so downstream knows we're done
                 if out_queue is not None:
                     try:
-                        serialized = _item_to_shm(End)
+                        serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
                         out_queue.put(serialized, timeout=1.0)
                         print(f"Put End sentinel on queue for {stage_name}")
                     except Full:
