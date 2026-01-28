@@ -79,8 +79,6 @@ except Exception as e:
 
 The re-queued item is the deserialized Python object (already unpacked from shm). When another worker gets it, the wrapper dict doesn't contain `__shm__`, so `_item_from_shm` passes it through. The `__pipe_retry` wrapper is stripped before the worker sees it.
 
-If `share_tensors=True` and the item contains tensors, re-queueing means the tensors stay in RAM of the current process. The item gets pickled through the mp.Queue normally (torch handles tensor sharing). This is fine — retries are rare, and the item is small enough to fit in the queue.
-
 ### Interaction with autoscaler
 
 When workers are sleeping on transient retries, input queue stays full — autoscaler wants to scale up. But more workers won't help (they'll all hit the same error).

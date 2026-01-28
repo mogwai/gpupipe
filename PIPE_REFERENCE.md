@@ -223,7 +223,6 @@ pipe = Pipe(
     max_workers_per_stage=8,  # global autoscale cap
     stats_interval=30,        # print queue sizes + timing every N seconds (0=off)
     health_check_interval=30, # check worker liveness every N seconds (0=off)
-    share_tensors=False,      # auto-serialize PyTorch tensors through queues
     expected_consumers=1,     # for DDP: multiply end signals for N consumers
     raise_errors=False,       # raise exceptions in workers instead of logging
 )

@@ -48,7 +48,6 @@ class Pipe:
     def __init__(
         self,
         debug=False,
-        share_tensors=False,
         raise_errors=None,
         health_check_interval=30,
         expected_consumers=1,
@@ -70,7 +69,6 @@ class Pipe:
             del os.environ["PIPE_NO_SHM_OUTPUT"]
         _cleanup_stale_shm()
         self.debug = debug
-        self.share_tensors = share_tensors
         self.use_shm = use_shm
         self.raise_errors = raise_errors if raise_errors is not None else debug
         self.health_check_interval = health_check_interval
@@ -252,7 +250,6 @@ class Pipe:
                             gpu_id,
                             self.timing_dict,
                             worker_id,
-                            self.share_tensors,
                             self.raise_errors,
                             num_threads,
                             self.stage_end_counters[i],
@@ -289,7 +286,6 @@ class Pipe:
                         None,
                         self.timing_dict,
                         worker_id,
-                        self.share_tensors,
                         self.raise_errors,
                         num_threads,
                         self.stage_end_counters[i],
@@ -334,7 +330,6 @@ class Pipe:
                         gpu_id,
                         self.timing_dict,
                         worker_id,
-                        self.share_tensors,
                         self.raise_errors,
                         self.stage_end_counters[i],
                         self.stage_worker_counts[i],
@@ -512,9 +507,8 @@ class Pipe:
                     old_args[5],
                     self.timing_dict,
                     worker_id,
-                    self.share_tensors,
                     self.raise_errors,
-                    old_args[10],
+                    old_args[9],
                     self.stage_end_counters[stage_idx],
                     self.stage_worker_counts[stage_idx],
                     stage_idx,
@@ -534,7 +528,6 @@ class Pipe:
                     old_args[5],
                     self.timing_dict,
                     worker_id,
-                    self.share_tensors,
                     self.raise_errors,
                     self.stage_end_counters[stage_idx],
                     self.stage_worker_counts[stage_idx],
