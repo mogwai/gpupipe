@@ -95,6 +95,24 @@ def _stats_monitor_thread(
     stop_event,
     interval_seconds=30,
 ):
+    # ANSI colors
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+
+    def queue_color(qsize, qmax):
+        if not qmax:
+            return DIM
+        fill = qsize / qmax
+        if fill > 0.5:
+            return GREEN
+        elif fill > 0.2:
+            return YELLOW
+        return RED
+
     while not stop_event.is_set():
         stop_event.wait(interval_seconds)
         if stop_event.is_set():
@@ -103,39 +121,7 @@ def _stats_monitor_thread(
         if not pipe_instance.timing_dict:
             continue
 
-        total_items = 0
-        final_stage_idx = len(pipe_instance.jobs) - 1
-        for worker_id, stats in dict(pipe_instance.timing_dict).items():
-            match = re.match(r"stage_(\d+)", worker_id)
-            stage_idx = int(match.group(1)) if match else -1
-            if stage_idx == final_stage_idx:
-                total_items += stats.get("items", 0)
-
-        print(f"\n--- Timing & Queue Report (after {total_items} items) ---")
-
-        print("  Queue Status:")
-        for i, queue in enumerate(pipe_instance.queues):
-            try:
-                queue_size = queue.qsize()
-                max_size = queue._maxsize if hasattr(queue, "_maxsize") else "unlimited"
-
-                if i < len(pipe_instance.jobs):
-                    source_func = pipe_instance.jobs[i]["func"]
-                    if hasattr(source_func, "__name__"):
-                        source_name = source_func.__name__
-                    elif hasattr(source_func, "__class__"):
-                        source_name = source_func.__class__.__name__
-                    else:
-                        source_name = str(type(source_func).__name__)
-
-                    print(
-                        f"    stage_{i} ({source_name}): {queue_size} items (max: {max_size})"
-                    )
-                else:
-                    print(f"    stage_{i}: {queue_size} items (max: {max_size})")
-            except Exception as e:
-                print(f"    stage_{i}: unable to read size ({e})")
-
+        # Group workers by stage
         stages = {}
         for worker_id, stats in dict(pipe_instance.timing_dict).items():
             match = re.match(r"stage_(\d+)", worker_id)
@@ -144,55 +130,75 @@ def _stats_monitor_thread(
                 stages[stage_idx] = []
             stages[stage_idx].append((worker_id, stats))
 
-        print("\n  Worker Timing:")
-        for stage_idx in sorted(stages.keys()):
-            workers = stages[stage_idx]
-            if 0 <= stage_idx < len(pipe_instance.jobs):
-                func = pipe_instance.jobs[stage_idx]["func"]
-                if hasattr(func, "__name__"):
-                    stage_name = func.__name__
-                elif hasattr(func, "__class__"):
-                    stage_name = func.__class__.__name__
-                else:
-                    stage_name = type(func).__name__
+        # Get total items from final stage
+        total_items = 0
+        final_stage_idx = len(pipe_instance.jobs) - 1
+        if final_stage_idx in stages:
+            for _, stats in stages[final_stage_idx]:
+                total_items += stats.get("items", 0)
+
+        # Build condensed line
+        parts = []
+        now = time.time()
+
+        for stage_idx in range(len(pipe_instance.jobs)):
+            # Check if stage is done
+            stage_done = pipe_instance.stage_done_events[stage_idx].is_set()
+            if stage_done:
+                continue  # skip completed stages
+
+            job = pipe_instance.jobs[stage_idx]
+            func = job["func"]
+            if hasattr(func, "__class__"):
+                name = func.__class__.__name__[:4]
+            elif hasattr(func, "__name__"):
+                name = func.__name__[:4]
             else:
-                stage_name = f"stage_{stage_idx}"
+                name = type(func).__name__[:4]
 
-            stage_total_items = 0
-            stage_total_time = 0
-            stage_total_audio = 0.0
-            stage_earliest_start = None
-            worker_rtfs = []
-            now = time.time()
+            # Queue stats
+            q = pipe_instance.queues[stage_idx]
+            try:
+                qsize = q.qsize()
+                qmax = q._maxsize if hasattr(q, "_maxsize") else 0
+                # Treat very large maxsize as unbounded
+                if qmax > 1000000:
+                    qmax = 0
+                qc = queue_color(qsize, qmax)
+                q_str = f"{qsize}/{qmax}" if qmax else str(qsize)
+            except Exception:
+                qc = DIM
+                q_str = "?"
 
-            for worker_id, stats in workers:
-                items = stats.get("items", 0)
-                total_time = stats.get("total_time", 0)
-                audio_dur = stats.get("audio_duration", 0)
-                start_wall = stats.get("start_wall_time")
+            # RTF stats
+            stage_rtf = 0
+            avg_worker_rtf = 0
+            if stage_idx in stages:
+                workers = stages[stage_idx]
+                stage_total_audio = 0.0
+                stage_earliest_start = None
+                worker_rtfs = []
 
-                stage_total_items += items
-                stage_total_time += total_time
-                stage_total_audio += audio_dur
+                for _, stats in workers:
+                    audio_dur = stats.get("audio_duration", 0)
+                    start_wall = stats.get("start_wall_time")
+                    stage_total_audio += audio_dur
 
-                if start_wall is not None:
-                    worker_elapsed = now - start_wall
-                    worker_rtf = audio_dur / worker_elapsed if worker_elapsed > 0 else 0
-                    worker_rtfs.append(worker_rtf)
-                    if (
-                        stage_earliest_start is None
-                        or start_wall < stage_earliest_start
-                    ):
-                        stage_earliest_start = start_wall
+                    if start_wall is not None:
+                        worker_elapsed = now - start_wall
+                        if worker_elapsed > 0:
+                            worker_rtfs.append(audio_dur / worker_elapsed)
+                        if stage_earliest_start is None or start_wall < stage_earliest_start:
+                            stage_earliest_start = start_wall
 
-            wall_elapsed = now - stage_earliest_start if stage_earliest_start else 0
-            stage_rtf = stage_total_audio / wall_elapsed if wall_elapsed > 0 else 0
-            avg_worker_rtf = sum(worker_rtfs) / len(worker_rtfs) if worker_rtfs else 0
-            print(
-                f"    {stage_name}: {stage_total_items} items, {stage_total_time:.1f}s, {stage_rtf:.0f}x RTF ({avg_worker_rtf:.0f}x/worker)"
-            )
+                wall_elapsed = now - stage_earliest_start if stage_earliest_start else 0
+                stage_rtf = stage_total_audio / wall_elapsed if wall_elapsed > 0 else 0
+                avg_worker_rtf = sum(worker_rtfs) / len(worker_rtfs) if worker_rtfs else 0
 
-        print("--- End Timing & Queue Report ---\n")
+            parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{stage_rtf:.0f}/{avg_worker_rtf:.0f}x")
+
+        line = f"[{total_items}] " + "▸".join(parts)
+        print(line)
 
     print("Stats monitor shutting down")
 
