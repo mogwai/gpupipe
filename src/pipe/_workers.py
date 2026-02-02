@@ -261,7 +261,11 @@ def _worker_run(
 
                 if item == "worker_stop":
                     print(f"Worker {worker_id} received stop signal, exiting gracefully")
-                    break
+                    # Skip coordination - we were removed from the pool, not finishing normally
+                    # (count was already decremented in _signal_worker_to_stop)
+                    while should_stop is not None and not should_stop.value:
+                        time.sleep(0.1)
+                    return
 
                 item = _item_from_shm(item)
 
@@ -386,6 +390,11 @@ def _worker_run(
             if stage_done is not None:
                 stage_done.set()
                 print(f"All workers finished at {stage_desc}, signaling downstream")
+
+    # Stay alive until pipeline stops - keeps tensor file descriptors valid
+    # Without this, tensors in queues become invalid when worker exits
+    while should_stop is not None and not should_stop.value:
+        time.sleep(0.1)
 
 
 def _threaded_worker_run(
@@ -556,6 +565,8 @@ def _threaded_worker_run(
 
                     if item == "worker_stop":
                         print(f"Thread {worker_id} received stop signal")
+                        # Just exit - coordination is skipped for stopped workers
+                        # (count was already decremented in _signal_worker_to_stop)
                         return
 
                     item = _item_from_shm(item)
@@ -688,6 +699,10 @@ def _threaded_worker_run(
 
         print(f"Threaded worker {worker_desc} shutdown complete")
 
+    # Stay alive until pipeline stops - keeps tensor file descriptors valid
+    while should_stop is not None and not should_stop.value:
+        time.sleep(0.1)
+
 
 def _signal_worker_to_stop(pipe_instance, stage_idx):
     """Signal one worker at a stage to stop after completing current item."""
@@ -695,6 +710,9 @@ def _signal_worker_to_stop(pipe_instance, stage_idx):
     if in_queue:
         try:
             in_queue.put("worker_stop", timeout=0.1)
+            # Decrement worker count so stage completion check works correctly
+            with pipe_instance.stage_worker_counts[stage_idx].get_lock():
+                pipe_instance.stage_worker_counts[stage_idx].value -= 1
             print(f"   Signaled worker at stage {stage_idx} to stop")
         except Exception as e:
             print(f"   Failed to signal worker stop: {e}")

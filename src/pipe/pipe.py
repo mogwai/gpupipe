@@ -1,9 +1,9 @@
 import contextlib
 import inspect
 import os
+from queue import Empty, Full
 import threading
 import time
-from queue import Empty, Full
 
 import torch
 import torch.multiprocessing as mp
@@ -14,7 +14,6 @@ from ._shm import _cleanup_stale_shm, _item_from_shm
 from ._workers import (
     _check_picklable,
     _is_end,
-    _spawn_additional_worker,
     _threaded_worker_run,
     _worker_run,
 )
@@ -55,8 +54,8 @@ class Pipe:
         allow_full_restart=True,
         autoscale=False,
         max_workers_per_stage=8,
-        use_shm=True,
-        output_shm=True,
+        use_shm=False,
+        output_shm=False,
     ):
         # Set env vars for shm control (inherited by spawned workers)
         if not use_shm:
@@ -96,6 +95,7 @@ class Pipe:
 
         if self.stats_interval > 0:
             import multiprocessing
+
             self.manager = multiprocessing.Manager()
             self.timing_dict = self.manager.dict()
         else:
@@ -143,7 +143,9 @@ class Pipe:
         if pergpu:
             if gpu_count > 0:
                 actual_workers = workers * gpu_count
-                print(f"Per-GPU mode: {workers} workers per GPU ({actual_workers} total for {gpu_count} GPUs)")
+                print(
+                    f"Per-GPU mode: {workers} workers per GPU ({actual_workers} total for {gpu_count} GPUs)"
+                )
             else:
                 actual_workers = workers
                 pergpu = False
@@ -237,9 +239,7 @@ class Pipe:
                         num_threads = 1
                         gpu_id = worker_idx % self.gpus
 
-                        worker_id = (
-                            f"stage_{i}_threaded_worker_{worker_idx}_gpu_{gpu_id}"
-                        )
+                        worker_id = f"stage_{i}_threaded_worker_{worker_idx}_gpu_{gpu_id}"
 
                         args = (
                             job["func"],
@@ -352,14 +352,10 @@ class Pipe:
                     p.start()
                     self.processes.append(p)
                     self.worker_info.append((p, worker_id, stage_name))
-                    print(
-                        f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}"
-                    )
+                    print(f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}")
 
         if self.health_check_interval > 0:
-            print(
-                f"Starting health monitor (check interval: {self.health_check_interval}s)"
-            )
+            print(f"Starting health monitor (check interval: {self.health_check_interval}s)")
             self.health_monitor_stop_event.clear()
             self.health_monitor_thread = threading.Thread(
                 target=_health_monitor_thread,
@@ -441,9 +437,7 @@ class Pipe:
         job = self.jobs[stage_idx]
 
         old_out_queue = self.queues[stage_idx]
-        old_out_maxsize = (
-            old_out_queue._maxsize if hasattr(old_out_queue, "_maxsize") else 0
-        )
+        old_out_maxsize = old_out_queue._maxsize if hasattr(old_out_queue, "_maxsize") else 0
 
         drained_items = []
         try:
@@ -487,7 +481,9 @@ class Pipe:
             stage_name = str(type(func).__name__)
 
         is_final_stage = stage_idx == len(self.jobs) - 1
-        next_stage_worker_count = None if is_final_stage else self.stage_worker_counts[stage_idx + 1]
+        next_stage_worker_count = (
+            None if is_final_stage else self.stage_worker_counts[stage_idx + 1]
+        )
 
         for idx, old_proc, worker_id, _ in stage_workers:
             config = self.worker_configs.get(worker_id)
@@ -559,6 +555,7 @@ class Pipe:
 
         if self.stats_interval > 0:
             import multiprocessing
+
             self.manager = multiprocessing.Manager()
             self.timing_dict = self.manager.dict()
 
@@ -571,10 +568,7 @@ class Pipe:
     def _stop(self, force=False):
         self.should_stop.value = 1
 
-        if (
-            self.health_monitor_thread is not None
-            and self.health_monitor_thread.is_alive()
-        ):
+        if self.health_monitor_thread is not None and self.health_monitor_thread.is_alive():
             print("Stopping health monitor...")
             try:
                 self.health_monitor_stop_event.set()
@@ -583,10 +577,7 @@ class Pipe:
                 print(f"Error stopping health monitor: {e}")
             self.health_monitor_thread = None
 
-        if (
-            self.stats_monitor_thread is not None
-            and self.stats_monitor_thread.is_alive()
-        ):
+        if self.stats_monitor_thread is not None and self.stats_monitor_thread.is_alive():
             self.stats_monitor_stop_event.set()
             self.stats_monitor_thread.join(timeout=2)
             self.stats_monitor_thread = None
@@ -778,9 +769,7 @@ class Pipe:
                         print(f"Error in worker at stage {stage_idx}: {e}")
                         raise e
                     else:
-                        print(
-                            f"Error in worker at stage {stage_idx}: {e}, continuing..."
-                        )
+                        print(f"Error in worker at stage {stage_idx}: {e}, continuing...")
                         continue
 
                 if result is None:
