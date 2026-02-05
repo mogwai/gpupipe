@@ -193,6 +193,7 @@ def _worker_run(
                                     out_queue.put(serialized, timeout=0.1)
                                     break
                                 except Full:
+                                    time.sleep(0.01)  # Backoff before retry
                                     continue
                     # Generator exhausted = done
                     if timing_dict is not None and worker_id is not None:
@@ -235,6 +236,7 @@ def _worker_run(
                                 out_queue.put(serialized, timeout=0.1)
                                 break
                             except Full:
+                                time.sleep(0.01)  # Backoff before retry
                                 continue
 
                 if has_end:
@@ -244,7 +246,7 @@ def _worker_run(
                 from queue import Empty
 
                 if out_queue is not None and out_queue.full():
-                    time.sleep(0.001)
+                    time.sleep(0.01)  # 10ms backoff when downstream is full
                     continue
 
                 try:
@@ -297,6 +299,7 @@ def _worker_run(
                                     out_queue.put(serialized, timeout=0.1)
                                     break
                                 except Full:
+                                    time.sleep(0.01)  # Backoff before retry
                                     continue
                     if timing_dict is not None and worker_id is not None:
                         items_processed += 1
@@ -339,6 +342,7 @@ def _worker_run(
                                 out_queue.put(serialized, timeout=0.1)
                                 break
                             except Full:
+                                time.sleep(0.01)  # Backoff before retry
                                 continue
 
         except (ConnectionError, FileNotFoundError):
@@ -364,6 +368,7 @@ def _worker_run(
                                 out_queue.put(serialized, timeout=0.1)
                                 break
                             except Full:
+                                time.sleep(0.01)  # Backoff before retry
                                 continue
         except Exception as e:
             print(f"Worker {worker_desc} flush() error: {e}")
@@ -536,6 +541,7 @@ def _threaded_worker_run(
                                     out_queue.put(serialized, timeout=0.1)
                                     break
                                 except Full:
+                                    time.sleep(0.01)  # Backoff before retry
                                     continue
 
                     if has_end:
@@ -543,7 +549,7 @@ def _threaded_worker_run(
                         return
                 else:
                     if out_queue is not None and out_queue.full():
-                        time.sleep(0.001)
+                        time.sleep(0.01)  # 10ms backoff when downstream is full
                         continue
 
                     try:
@@ -639,6 +645,7 @@ def _threaded_worker_run(
                                     out_queue.put(serialized, timeout=0.1)
                                     break
                                 except Full:
+                                    time.sleep(0.01)  # Backoff before retry
                                     continue
 
             except (ConnectionError, FileNotFoundError):
