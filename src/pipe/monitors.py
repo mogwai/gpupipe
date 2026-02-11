@@ -1,7 +1,13 @@
+import os
 import re
 import time
 
-from ._workers import _signal_worker_to_stop, _spawn_additional_worker
+from .workers import _signal_worker_to_stop, _spawn_additional_worker
+
+
+def _log(msg):
+    if os.environ.get("PIPE_QUIET") != "1":
+        print(msg)
 
 
 def _health_monitor_thread(
@@ -10,7 +16,7 @@ def _health_monitor_thread(
     health_check_interval,
     stop_event,
 ):
-    print("Health monitor starting up")
+    _log("Health monitor starting up")
 
     crash_history = {}
     CRASH_WINDOW = 300
@@ -87,15 +93,151 @@ def _health_monitor_thread(
                     except Exception as e:
                         print(f"   Failed to restart {worker_id}: {e}")
 
-    print("Health monitor shutting down")
+    _log("Health monitor shutting down")
 
 
-def _stats_monitor_thread(
-    pipe_instance,
-    stop_event,
-    interval_seconds=30,
-):
-    # ANSI colors
+def _create_progress(console):
+    from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn
+    from rich.progress_bar import ProgressBar
+    from rich.text import Text
+
+    class QueueBarColumn(ProgressColumn):
+        def __init__(self, width=20):
+            self.bar_width = width
+            super().__init__()
+
+        def render(self, task):
+            if task.total is None or task.total == 0:
+                return Text(f"{int(task.completed):>4}", style="dim")
+            fill = task.completed / task.total if task.total > 0 else 0
+            color = "green" if fill > 0.5 else "yellow" if fill > 0.2 else "red"
+            return ProgressBar(
+                total=max(task.total, 1),
+                completed=min(task.completed, task.total),
+                width=self.bar_width,
+                complete_style=color,
+                finished_style=color,
+            )
+
+    class QueueTextColumn(ProgressColumn):
+        def render(self, task):
+            if task.total is None or task.total == 0:
+                return Text("")
+            return Text(f"{int(task.completed)}/{int(task.total)}")
+
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]{task.description:<16}[/cyan]"),
+        QueueBarColumn(width=20),
+        QueueTextColumn(),
+        TextColumn("{task.fields[info]}"),
+        console=console,
+    )
+
+
+def _collect_stats(pipe_instance):
+    stages = {}
+    for worker_id, stats in dict(pipe_instance.timing_dict).items():
+        match = re.match(r"stage_(\d+)", worker_id)
+        stage_idx = int(match.group(1)) if match else -1
+        if stage_idx not in stages:
+            stages[stage_idx] = []
+        stages[stage_idx].append((worker_id, stats))
+
+    now = time.time()
+    result = []
+
+    for stage_idx in range(len(pipe_instance.jobs)):
+        done = pipe_instance.stage_done_events[stage_idx].is_set()
+
+        q = pipe_instance.queues[stage_idx]
+        try:
+            qsize = q.qsize()
+            qmax = q._maxsize if hasattr(q, "_maxsize") else 0
+            if qmax > 1000000:
+                qmax = 0
+        except Exception:
+            qsize = 0
+            qmax = 0
+
+        stage_items = 0
+        stage_rtf = 0.0
+        avg_worker_rtf = 0.0
+        has_audio = False
+
+        if stage_idx in stages:
+            stage_earliest_start = None
+            worker_rtfs = []
+            stage_total_audio = 0.0
+
+            for _, stats in stages[stage_idx]:
+                stage_items += stats.get("items", 0)
+                audio_dur = stats.get("audio_duration", 0)
+                start_wall = stats.get("start_wall_time")
+                stage_total_audio += audio_dur
+
+                if start_wall is not None:
+                    worker_elapsed = now - start_wall
+                    if worker_elapsed > 0:
+                        worker_rtfs.append(audio_dur / worker_elapsed)
+                    if stage_earliest_start is None or start_wall < stage_earliest_start:
+                        stage_earliest_start = start_wall
+
+            wall_elapsed = now - stage_earliest_start if stage_earliest_start else 0
+            stage_rtf = stage_total_audio / wall_elapsed if wall_elapsed > 0 else 0
+            avg_worker_rtf = sum(worker_rtfs) / len(worker_rtfs) if worker_rtfs else 0
+            has_audio = stage_total_audio > 0
+
+        total_workers = pipe_instance.stage_worker_counts[stage_idx].value
+        finished = pipe_instance.stage_end_counters[stage_idx].value
+        active = total_workers - finished
+
+        result.append({
+            "stage_idx": stage_idx,
+            "done": done,
+            "qsize": qsize,
+            "qmax": qmax,
+            "items": stage_items,
+            "active": active,
+            "total_workers": total_workers,
+            "stage_rtf": stage_rtf,
+            "avg_worker_rtf": avg_worker_rtf,
+            "has_audio": has_audio,
+        })
+
+    return result
+
+
+def _stats_monitor_thread(pipe_instance, stop_event, interval_seconds=30):
+    progress = pipe_instance.progress
+
+    while not stop_event.is_set():
+        stop_event.wait(interval_seconds)
+        if stop_event.is_set():
+            break
+
+        if not pipe_instance.timing_dict:
+            continue
+
+        for s in _collect_stats(pipe_instance):
+            task_id = pipe_instance._stage_task_ids.get(s["stage_idx"])
+            if task_id is None:
+                continue
+
+            info_parts = [f"{s['items']} items", f"{s['active']}/{s['total_workers']} wkrs"]
+            if s["has_audio"]:
+                info_parts.append(f"{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
+
+            progress.update(
+                task_id,
+                completed=s["qsize"],
+                total=s["qmax"] if s["qmax"] > 0 else None,
+                info="  ".join(info_parts),
+                visible=not s["done"],
+            )
+
+
+def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
     RESET = "\033[0m"
     DIM = "\033[2m"
     RED = "\033[31m"
@@ -121,86 +263,26 @@ def _stats_monitor_thread(
         if not pipe_instance.timing_dict:
             continue
 
-        # Group workers by stage
-        stages = {}
-        for worker_id, stats in dict(pipe_instance.timing_dict).items():
-            match = re.match(r"stage_(\d+)", worker_id)
-            stage_idx = int(match.group(1)) if match else -1
-            if stage_idx not in stages:
-                stages[stage_idx] = []
-            stages[stage_idx].append((worker_id, stats))
+        all_stats = _collect_stats(pipe_instance)
 
-        # Get total items from final stage
         total_items = 0
-        final_stage_idx = len(pipe_instance.jobs) - 1
-        if final_stage_idx in stages:
-            for _, stats in stages[final_stage_idx]:
-                total_items += stats.get("items", 0)
+        final_idx = len(pipe_instance.jobs) - 1
+        for s in all_stats:
+            if s["stage_idx"] == final_idx:
+                total_items = s["items"]
 
-        # Build condensed line
         parts = []
-        now = time.time()
+        for s in all_stats:
+            if s["done"]:
+                continue
+            name = pipe_instance.jobs[s["stage_idx"]]["name"][:4]
+            qc = queue_color(s["qsize"], s["qmax"])
+            q_str = f"{s['qsize']}/{s['qmax']}" if s["qmax"] else str(s["qsize"])
+            parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
 
-        for stage_idx in range(len(pipe_instance.jobs)):
-            # Check if stage is done
-            stage_done = pipe_instance.stage_done_events[stage_idx].is_set()
-            if stage_done:
-                continue  # skip completed stages
+        print(f"[{total_items}] " + "\u25b8".join(parts))
 
-            job = pipe_instance.jobs[stage_idx]
-            func = job["func"]
-            if hasattr(func, "__class__"):
-                name = func.__class__.__name__[:4]
-            elif hasattr(func, "__name__"):
-                name = func.__name__[:4]
-            else:
-                name = type(func).__name__[:4]
-
-            # Queue stats
-            q = pipe_instance.queues[stage_idx]
-            try:
-                qsize = q.qsize()
-                qmax = q._maxsize if hasattr(q, "_maxsize") else 0
-                # Treat very large maxsize as unbounded
-                if qmax > 1000000:
-                    qmax = 0
-                qc = queue_color(qsize, qmax)
-                q_str = f"{qsize}/{qmax}" if qmax else str(qsize)
-            except Exception:
-                qc = DIM
-                q_str = "?"
-
-            # RTF stats
-            stage_rtf = 0
-            avg_worker_rtf = 0
-            if stage_idx in stages:
-                workers = stages[stage_idx]
-                stage_total_audio = 0.0
-                stage_earliest_start = None
-                worker_rtfs = []
-
-                for _, stats in workers:
-                    audio_dur = stats.get("audio_duration", 0)
-                    start_wall = stats.get("start_wall_time")
-                    stage_total_audio += audio_dur
-
-                    if start_wall is not None:
-                        worker_elapsed = now - start_wall
-                        if worker_elapsed > 0:
-                            worker_rtfs.append(audio_dur / worker_elapsed)
-                        if stage_earliest_start is None or start_wall < stage_earliest_start:
-                            stage_earliest_start = start_wall
-
-                wall_elapsed = now - stage_earliest_start if stage_earliest_start else 0
-                stage_rtf = stage_total_audio / wall_elapsed if wall_elapsed > 0 else 0
-                avg_worker_rtf = sum(worker_rtfs) / len(worker_rtfs) if worker_rtfs else 0
-
-            parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{stage_rtf:.0f}/{avg_worker_rtf:.0f}x")
-
-        line = f"[{total_items}] " + "▸".join(parts)
-        print(line)
-
-    print("Stats monitor shutting down")
+    _log("Stats monitor shutting down")
 
 
 def _get_cpu_usage():
@@ -227,7 +309,7 @@ def _autoscaler_thread(
     cooldown_seconds=3.0,
     cpu_limit=0.85,
 ):
-    print("Autoscaler started")
+    _log("Autoscaler started")
 
     high_pressure_counts = {}
     low_pressure_counts = {}
@@ -332,4 +414,4 @@ def _autoscaler_thread(
                 import traceback
                 print(f"Autoscaler error at stage {stage_idx}: {e}\n{traceback.format_exc()}")
 
-    print("Autoscaler stopped")
+    _log("Autoscaler stopped")

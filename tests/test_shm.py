@@ -13,7 +13,7 @@ import pytest
 
 import torch
 
-from pipe._shm import _item_to_shm, _item_from_shm, _cleanup_stale_shm, _has_tensors
+from pipe.shm import _item_to_shm, _item_from_shm, _cleanup_stale_shm, _has_tensors
 from pipe import Pipe
 
 
