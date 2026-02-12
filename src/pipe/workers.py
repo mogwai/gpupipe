@@ -138,6 +138,23 @@ def _worker_run(
     consecutive_empty = 0
     EMPTY_THRESHOLD = 30
 
+    _is_pull_mode = hasattr(worker, 'run')
+    if _is_pull_mode:
+        def _serialize(item):
+            return _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
+
+        worker.run(
+            in_queue=in_queue,
+            out_queue=out_queue,
+            should_stop=should_stop,
+            upstream_done=upstream_done,
+            serialize=_serialize,
+            deserialize=_item_from_shm,
+            timing_dict=timing_dict,
+            worker_id=worker_id,
+            worker_start_wall_time=worker_start_wall_time,
+        )
+
     def extract_audio_duration(obj):
         if obj is None:
             return 0.0
@@ -156,7 +173,7 @@ def _worker_run(
             return sum(extract_audio_duration(x) for x in obj if x != "end")
         return 0.0
 
-    while not should_stop.value:
+    while not should_stop.value and not _is_pull_mode:
         now = time.time()
         if now - last_fd_check > fd_check_interval:
             fd_info = _get_fd_info()
@@ -355,7 +372,7 @@ def _worker_run(
                 raise e
 
     # Flush buffered items via flush() method - workers don't need to handle End
-    if hasattr(worker, "flush") and out_queue:
+    if not _is_pull_mode and hasattr(worker, "flush") and out_queue:
         try:
             flushed_items = list(worker.flush())
             if flushed_items:
