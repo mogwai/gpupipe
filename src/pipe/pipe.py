@@ -56,7 +56,7 @@ class Pipe:
         health_check_interval=30,
         expected_consumers=1,
         stats_interval=0.2,
-        stats_mode="rich",
+        stats_mode="text",
         allow_full_restart=True,
         autoscale=False,
         max_workers_per_stage=8,
