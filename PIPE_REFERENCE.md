@@ -221,12 +221,46 @@ pipe = Pipe(
     debug=False,              # sequential single-process mode (no multiprocessing)
     autoscale=True,           # global autoscale enable
     max_workers_per_stage=8,  # global autoscale cap
-    stats_interval=30,        # print queue sizes + timing every N seconds (0=off)
+    stats_interval=30,        # stats collection interval in seconds (0=off)
+    stats_mode="rich",        # "rich" (default, standalone progress bar),
+                              # "text" (ANSI one-liners to stdout),
+                              # "external" (no display, poll with get_stats())
     health_check_interval=30, # check worker liveness every N seconds (0=off)
     expected_consumers=1,     # for DDP: multiply end signals for N consumers
     raise_errors=False,       # raise exceptions in workers instead of logging
 )
 ```
+
+### Stats Modes
+
+| Mode | Display | Thread | Use case |
+|------|---------|--------|----------|
+| `"rich"` | Rich Progress bar (standalone Live) | Yes | Standalone scripts |
+| `"text"` | ANSI one-liners to stdout | Yes | Non-interactive / logging |
+| `"external"` | None (caller polls `get_stats()`) | No | Embedded in another UI (e.g. training loop) |
+
+### Polling stats externally
+
+When `stats_mode="external"`, no background display thread runs. The caller polls stats from the main thread:
+
+```python
+pipe = Pipe(stats_mode="external")
+pipe.add(Source(), outqn=50)
+pipe.add(Processor(), workers=4, outqn=50)
+
+for item in pipe:
+    stats = pipe.get_stats()  # list of dicts, one per stage
+    for s in stats:
+        print(f"Stage {s['stage_idx']}: {s['qsize']}/{s['qmax']} queued, "
+              f"{s['items']} items, {s['active']}/{s['total_workers']} workers"
+              + (f", {s['stage_rtf']:.0f}x RTF" if s['has_audio'] else ""))
+    process(item)
+```
+
+`get_stats()` returns a list of dicts per stage:
+- `stage_idx`, `done`, `qsize`, `qmax` — queue fill level
+- `items`, `active`, `total_workers` — worker activity
+- `stage_rtf`, `avg_worker_rtf`, `has_audio` — real-time factor (audio pipelines)
 
 ## Autoscaling Details
 
@@ -468,6 +502,10 @@ for result in pipe:
 8. **Queue full = backpressure** - workers block on put when downstream slow. This is intentional.
 9. **outqn=None for GPU stages** - GPU has variable latency, unlimited queue prevents blocking fast stages
 10. **Workers are independent** - no shared state between workers at same stage (use DB/S3 for coordination)
+
+## Suppressing output
+
+Set `PIPE_QUIET=1` to suppress informational prints from pipe workers (startup messages, worker lifecycle). Useful when embedding pipe in a UI that manages its own display. Stats display is controlled separately via `stats_mode`.
 
 ## Common Pitfalls
 
