@@ -9,7 +9,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
-from .monitors import _autoscaler_thread, _create_progress, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
+from .monitors import _autoscaler_thread, _collect_stats, _create_progress, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
 from .shm import _cleanup_stale_shm, _item_from_shm
 
 
@@ -411,6 +411,11 @@ class Pipe:
             self.autoscaler_thread.start()
 
         return self
+
+    def get_stats(self):
+        if not self.timing_dict:
+            return []
+        return _collect_stats(self)
 
     def _restart_worker(self, worker_idx, worker_id):
         if worker_id not in self.worker_configs:
