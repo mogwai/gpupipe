@@ -503,9 +503,9 @@ for result in pipe:
 9. **outqn=None for GPU stages** - GPU has variable latency, unlimited queue prevents blocking fast stages
 10. **Workers are independent** - no shared state between workers at same stage (use DB/S3 for coordination)
 
-## Suppressing output
+## Verbose output
 
-Set `PIPE_QUIET=1` to suppress informational prints from pipe workers (startup messages, worker lifecycle). Useful when embedding pipe in a UI that manages its own display. Stats display is controlled separately via `stats_mode`.
+Pipe is quiet by default. Set `PIPE_VERBOSE=1` to enable informational prints (startup messages, worker lifecycle, signal handling). Errors and warnings always print regardless. Stats display is controlled separately via `stats_mode`.
 
 ## Common Pitfalls
 

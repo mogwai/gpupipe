@@ -14,7 +14,7 @@ from .shm import _cleanup_stale_shm, _item_from_shm
 
 
 def _log(msg):
-    if os.environ.get("PIPE_QUIET") != "1":
+    if os.environ.get("PIPE_VERBOSE") == "1":
         print(msg)
 from .workers import (
     _check_picklable,
@@ -432,10 +432,10 @@ class Pipe:
                 self.processes[i] = p
                 break
 
-        print(f"Worker {worker_id} restarted with PID {p.pid}")
+        _log(f"Worker {worker_id} restarted with PID {p.pid}")
 
     def _restart_stage(self, stage_idx):
-        print(f"   Restarting stage {stage_idx}...")
+        _log(f"   Restarting stage {stage_idx}...")
 
         stage_workers = []
         for idx, (proc, worker_id, stage_name) in enumerate(self.worker_info):
@@ -482,7 +482,7 @@ class Pipe:
             except Full:
                 break
 
-        print(
+        _log(
             f"   Recreated output queue for stage {stage_idx} (recovered {len(drained_items)} items)"
         )
 
@@ -565,9 +565,9 @@ class Pipe:
                     self.processes[i] = p
                     break
 
-            print(f"   Restarted {worker_id} with PID {p.pid}")
+            _log(f"   Restarted {worker_id} with PID {p.pid}")
 
-        print(f"   Stage {stage_idx} restart complete")
+        _log(f"   Stage {stage_idx} restart complete")
 
     def restart(self, reason="ConnectionError"):
         self._stop(force=True)
@@ -579,7 +579,7 @@ class Pipe:
             self.timing_dict = self.manager.dict()
 
         self.start()
-        print(f"Pipeline restarted due to {reason}")
+        _log(f"Pipeline restarted due to {reason}")
 
     def stop(self, force=False):
         self._stop(force=force)
@@ -684,7 +684,7 @@ class Pipe:
 
         while True:
             if self.should_stop.value == 2:
-                print("\nWorker encountered connection error - restarting pipeline...")
+                _log("Worker encountered connection error - restarting pipeline...")
                 self.restart(reason="Worker connection error")
                 consecutive_empty = 0
                 continue
@@ -708,7 +708,7 @@ class Pipe:
                 self.restart()
                 consecutive_empty = 0
             except KeyboardInterrupt:
-                print("Ctrl+C detected - force stopping pipeline")
+                _log("Ctrl+C detected - force stopping pipeline")
                 self._stop(force=True)
                 return
 
