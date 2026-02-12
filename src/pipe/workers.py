@@ -13,7 +13,7 @@ from queue import Full
 import torch
 
 from .types import End
-from ._shm import _item_from_shm, _item_to_shm
+from .shm import _item_from_shm, _item_to_shm
 
 
 def _skip_shm_for_output(is_final_stage):
