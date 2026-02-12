@@ -9,7 +9,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
-from .monitors import _autoscaler_thread, _health_monitor_thread, _stats_monitor_thread
+from .monitors import _autoscaler_thread, _create_progress, _health_monitor_thread, _stats_monitor_thread
 from .shm import _cleanup_stale_shm, _item_from_shm
 from .workers import (
     _check_picklable,
@@ -371,6 +371,14 @@ class Pipe:
             print("Health monitor thread started")
 
         if self.stats_interval > 0:
+            from rich.console import Console
+            console = Console()
+            self.progress = _create_progress(console)
+            self._stage_task_ids = {}
+            for idx, job in enumerate(self.jobs):
+                task_id = self.progress.add_task(job["name"], total=None, info="")
+                self._stage_task_ids[idx] = task_id
+            self.progress.start()
             self.stats_monitor_thread = threading.Thread(
                 target=_stats_monitor_thread,
                 args=(self, self.stats_monitor_stop_event, self.stats_interval),
@@ -581,6 +589,9 @@ class Pipe:
             self.stats_monitor_stop_event.set()
             self.stats_monitor_thread.join(timeout=2)
             self.stats_monitor_thread = None
+        if hasattr(self, "progress") and self.progress is not None:
+            self.progress.stop()
+            self.progress = None
 
         if force:
             print("Force stopping all processes...")
