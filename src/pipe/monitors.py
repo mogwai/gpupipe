@@ -6,7 +6,7 @@ from .workers import _signal_worker_to_stop, _spawn_additional_worker
 
 
 def _log(msg):
-    if os.environ.get("PIPE_QUIET") != "1":
+    if os.environ.get("PIPE_VERBOSE") == "1":
         print(msg)
 
 
@@ -280,7 +280,7 @@ def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
             q_str = f"{s['qsize']}/{s['qmax']}" if s["qmax"] else str(s["qsize"])
             parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
 
-        print(f"[{total_items}] " + "\u25b8".join(parts))
+        _log(f"[{total_items}] " + "\u25b8".join(parts))
 
     _log("Stats monitor shutting down")
 
@@ -394,7 +394,7 @@ def _autoscaler_thread(
                     if high_pressure_counts[stage_idx] >= scale_up_samples:
                         high_pressure_counts[stage_idx] = 0
                         last_scale_time[stage_idx] = current_time
-                        print(f"   Autoscale UP: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers + 1} workers")
+                        _log(f"   Autoscale UP: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers + 1} workers")
                         _spawn_additional_worker(pipe_instance, stage_idx, job)
 
                 elif active_workers > min_workers and in_fill <= scale_down_threshold:
@@ -404,7 +404,7 @@ def _autoscaler_thread(
                     if low_pressure_counts[stage_idx] >= scale_down_samples:
                         low_pressure_counts[stage_idx] = 0
                         last_scale_time[stage_idx] = current_time
-                        print(f"   Autoscale DOWN: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers - 1} workers")
+                        _log(f"   Autoscale DOWN: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers - 1} workers")
                         _signal_worker_to_stop(pipe_instance, stage_idx)
                 else:
                     high_pressure_counts[stage_idx] = 0
