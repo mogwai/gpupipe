@@ -16,6 +16,11 @@ from .types import End
 from .shm import _item_from_shm, _item_to_shm
 
 
+def _log(msg):
+    if os.environ.get("PIPE_QUIET") != "1":
+        print(msg)
+
+
 def _skip_shm_for_output(is_final_stage):
     """Check if shm should be skipped for output queue."""
     return bool(is_final_stage and os.environ.get("PIPE_NO_SHM_OUTPUT"))
@@ -126,7 +131,7 @@ def _worker_run(
     signal.signal(signal.SIGINT, handle_signal)
 
     if hasattr(worker, "load"):
-        print(f"Worker {worker_desc} calling load()")
+        _log(f"Worker {worker_desc} calling load()")
         worker.load()
 
     items_processed = 0
@@ -398,7 +403,7 @@ def _worker_run(
 
         current_worker_count = stage_worker_count.value
         stage_desc = f"{stage_name}" if stage_name else f"stage_{stage_idx}"
-        print(f"Worker {worker_id} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
+        _log(f"Worker {worker_id} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
 
         if finished_workers >= current_worker_count:
             # Put End sentinel on output queue so downstream knows we're done
@@ -406,12 +411,12 @@ def _worker_run(
                 try:
                     serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
                     out_queue.put(serialized, timeout=1.0)
-                    print(f"Put End sentinel on queue for {stage_desc}")
+                    _log(f"Put End sentinel on queue for {stage_desc}")
                 except Full:
                     print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
             if stage_done is not None:
                 stage_done.set()
-                print(f"All workers finished at {stage_desc}, signaling downstream")
+                _log(f"All workers finished at {stage_desc}, signaling downstream")
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
     # Without this, tensors in queues become invalid when worker exits
@@ -469,7 +474,7 @@ def _threaded_worker_run(
     signal.signal(signal.SIGINT, handle_signal)
 
     if hasattr(worker, "load"):
-        print(f"Threaded worker {worker_desc} calling load()")
+        _log(f"Threaded worker {worker_desc} calling load()")
         worker.load()
 
     worker_start_wall_time = time.time()
@@ -706,7 +711,7 @@ def _threaded_worker_run(
                 finished_workers = stage_end_counter.value
 
             current_worker_count = stage_worker_count.value
-            print(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
+            _log(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
 
             if finished_workers >= current_worker_count:
                 # Put End sentinel on output queue so downstream knows we're done
@@ -714,14 +719,14 @@ def _threaded_worker_run(
                     try:
                         serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
                         out_queue.put(serialized, timeout=1.0)
-                        print(f"Put End sentinel on queue for {stage_name}")
+                        _log(f"Put End sentinel on queue for {stage_name}")
                     except Full:
                         print(f"Warning: Could not put End sentinel on queue for {stage_name}")
                 if stage_done is not None:
                     stage_done.set()
-                    print(f"All workers finished at {stage_name}, signaling downstream")
+                    _log(f"All workers finished at {stage_name}, signaling downstream")
 
-        print(f"Threaded worker {worker_desc} shutdown complete")
+        _log(f"Threaded worker {worker_desc} shutdown complete")
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
     while should_stop is not None and not should_stop.value:
