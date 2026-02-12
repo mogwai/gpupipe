@@ -9,9 +9,9 @@ import torch
 import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
-from ._monitors import _autoscaler_thread, _health_monitor_thread, _stats_monitor_thread
-from ._shm import _cleanup_stale_shm, _item_from_shm
-from ._workers import (
+from .monitors import _autoscaler_thread, _health_monitor_thread, _stats_monitor_thread
+from .shm import _cleanup_stale_shm, _item_from_shm
+from .workers import (
     _check_picklable,
     _is_end,
     _threaded_worker_run,
