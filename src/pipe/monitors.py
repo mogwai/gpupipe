@@ -280,7 +280,7 @@ def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
             q_str = f"{s['qsize']}/{s['qmax']}" if s["qmax"] else str(s["qsize"])
             parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
 
-        _log(f"[{total_items}] " + "\u25b8".join(parts))
+        print(f"[{total_items}] " + "\u25b8".join(parts))
 
     _log("Stats monitor shutting down")
 
