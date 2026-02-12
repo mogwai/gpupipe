@@ -100,14 +100,9 @@ class Pipe:
         self.gpus = self._get_gpu_count()
         self.expected_consumers = expected_consumers
 
-        if self.stats_interval > 0:
-            import multiprocessing
-
-            self.manager = multiprocessing.Manager()
-            self.timing_dict = self.manager.dict()
-        else:
-            self.manager = None
-            self.timing_dict = None
+        import multiprocessing
+        self.manager = multiprocessing.Manager()
+        self.timing_dict = self.manager.dict()
 
         self.stage_end_counters = []
         self.stage_worker_counts = []
@@ -377,7 +372,7 @@ class Pipe:
             self.health_monitor_thread.start()
             _log("Health monitor thread started")
 
-        if self.stats_interval > 0:
+        if self.stats_interval > 0 and self.stats_mode != "external":
             if self.stats_mode == "text":
                 self.progress = None
                 monitor_fn = _stats_monitor_thread_text
@@ -413,8 +408,6 @@ class Pipe:
         return self
 
     def get_stats(self):
-        if not self.timing_dict:
-            return []
         return _collect_stats(self)
 
     def _restart_worker(self, worker_idx, worker_id):
