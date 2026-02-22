@@ -107,68 +107,84 @@ class Splitter:
             yield {"chunk": chunk, "parent_id": item["id"]}
 ```
 
-### Batcher (accumulate then flush)
+### Framework Batching (batch=N)
 
-Buffer items, emit when batch full. Implement `flush()` to return remaining items at shutdown:
+Use `batch=N` on `pipe.add()` to have the framework collect items into batches. Worker receives a list:
 
 ```python
-class Batcher:
+class GPUInference:
     def load(self):
-        self._buf = []
+        self.model = load_model("cuda")
 
-    def __call__(self, item):
-        self._buf.append(item)
-        if len(self._buf) >= 32:
-            return self._flush()
-        return None  # don't emit yet
+    def __call__(self, batch):
+        # batch is a list of up to 16 items
+        tensors = torch.stack([item["audio"] for item in batch])
+        results = self.model(tensors)
+        return [{"result": r, **item} for r, item in zip(results, batch)]
 
-    def _flush(self):
-        out = self._buf
-        self._buf = []
-        return out  # list = multiple items downstream
-
-    def flush(self):
-        # called by framework at shutdown
-        if self._buf:
-            return self._flush()
+pipe.add(GPUInference(), pergpu=True, batch=16, outqn=50)
 ```
+
+The framework collects up to N items greedily (drains queue without blocking), then calls `__call__` with whatever's available. Partial batches are normal — no need to wait for a full batch.
+
+At shutdown, the framework calls `flush()` if it exists to emit remaining buffered items.
 
 ### Async IO Worker (batched async downloads)
 
+Use `batch=N` to let the framework collect items, then download them all concurrently:
+
 ```python
 class AsyncDownloader:
-    def __init__(self, buffer_size: int = 32, max_concurrent: int = 128):
-        self._buffer_size = buffer_size
+    def __init__(self, max_concurrent: int = 128):
         self._max_concurrent = max_concurrent
 
     def load(self):
         self._loop = asyncio.new_event_loop()
-        self._semaphore = asyncio.Semaphore(self._max_concurrent)
-        self._buffer = []
+        self._sem = asyncio.Semaphore(self._max_concurrent)
 
     async def _fetch_batch(self, items):
         async def fetch_one(item):
-            async with self._semaphore:
+            async with self._sem:
                 return await download(item["url"])
         return await asyncio.gather(*[fetch_one(i) for i in items])
 
-    def _flush_buffer(self):
-        if not self._buffer:
-            return []
-        items = self._buffer
-        self._buffer = []
-        results = self._loop.run_until_complete(self._fetch_batch(items))
+    def __call__(self, batch):
+        results = self._loop.run_until_complete(self._fetch_batch(batch))
         return [r for r in results if r is not None]
 
-    def __call__(self, item):
-        self._buffer.append(item)
-        if len(self._buffer) >= self._buffer_size:
-            return self._flush_buffer()
-        return None
-
-    def flush(self):
-        return self._flush_buffer()
+pipe.add(AsyncDownloader(), workers=4, thread=True, batch=64, outqn=200)
 ```
+
+No manual buffer, no `flush()`, no `None` returns. The framework drains up to 64 items from the queue and passes them as a list. Partial batches just work.
+
+### Worker with run() + pull/put
+
+For workers that need dynamic control over how many items to pull each iteration (e.g. filling variable GPU slots), define a `run()` method. The framework injects `self.pull(n)` and `self.put(item)`:
+
+```python
+class StreamingTranscriber:
+    def load(self):
+        self.model = load_model("cuda")
+        self.max_batch = 8
+
+    def run(self):
+        while True:
+            items = self.pull(self.max_batch)
+            if not items:
+                break
+            results = self.model.transcribe([i["audio"] for i in items])
+            for item, result in zip(items, results):
+                item["text"] = result
+                self.put(item)
+
+pipe.add(StreamingTranscriber(), pergpu=True, batch=8, outqn=50)
+```
+
+- `self.pull(n)` returns up to n items (non-blocking, returns what's available)
+- `self.put(item)` sends to the output queue (blocks if full, respects backpressure)
+- `pull()` returns `[]` when upstream is done and queue is empty — use this to break
+- Works in both multiprocessing and sequential mode
+- Triggered automatically when a non-root worker defines `run()`
 
 ## Return Value Semantics
 
@@ -202,6 +218,7 @@ pipe.add(worker,
     thread=True,        # use threads instead of processes (IO-bound, no pickle needed)
     pergpu=True,        # spawn one worker per available GPU (sets CUDA_VISIBLE_DEVICES)
     gpu_id=0,           # pin all workers to specific GPU
+    batch=16,           # framework collects up to N items, __call__ receives a list
     autoscale=True,     # enable autoscaling for this stage
     min_workers=1,      # autoscale floor (won't scale below)
     max_workers=8,      # autoscale ceiling (won't scale above)
@@ -218,7 +235,8 @@ pipe.add(worker,
 
 ```python
 pipe = Pipe(
-    debug=False,              # sequential single-process mode (no multiprocessing)
+    sequential=False,         # sequential single-process mode (no multiprocessing)
+    debug=False,              # track per-queue transit latency stats
     autoscale=True,           # global autoscale enable
     max_workers_per_stage=8,  # global autoscale cap
     stats_interval=30,        # print queue sizes + timing every N seconds (0=off)
@@ -356,7 +374,7 @@ class Writer:
 Audio alignment pipeline: DB → S3 download → GPU alignment → S3 upload + DB write
 
 ```python
-from pipe import Pipe
+from pipe import Pipe, End
 
 class BatchLoader:
     def load(self):
@@ -367,7 +385,7 @@ class BatchLoader:
 
     def __call__(self):
         if self.idx >= len(self.items):
-            return "end"
+            return End
         item = self.items[self.idx]
         self.idx += 1
         return item
@@ -460,14 +478,15 @@ for result in pipe:
 
 1. **`load()` for heavy init** - models, DB connections, S3 clients, event loops go here (runs after fork in child process)
 2. **`__init__()` must be picklable** - no lambdas, CUDA tensors, open files, boto3 clients
-3. **Workers don't handle "end"** - framework handles End sentinel internally, workers never see it
+3. **Workers never see End** - framework handles End sentinel internally, workers never receive it
 4. **`flush()` method for batchers** - framework calls this at shutdown to emit remaining buffered items
 5. **thread=True for IO-bound** - downloads, DB queries. Shares memory, no pickle needed, GIL-friendly for IO waits
 6. **pergpu=True** - one worker per GPU, sets CUDA_VISIBLE_DEVICES per worker
-7. **debug=True** - single process, sequential execution, for debugging/testing
-8. **Queue full = backpressure** - workers block on put when downstream slow. This is intentional.
-9. **outqn=None for GPU stages** - GPU has variable latency, unlimited queue prevents blocking fast stages
-10. **Workers are independent** - no shared state between workers at same stage (use DB/S3 for coordination)
+7. **sequential=True** - single process, sequential execution, for debugging/testing
+8. **debug=True** - wraps queues with InstrumentedQueue, shows per-queue transit latency in stats
+9. **Queue full = backpressure** - workers block on put when downstream slow. This is intentional.
+10. **outqn=None for GPU stages** - GPU has variable latency, unlimited queue prevents blocking fast stages
+11. **Workers are independent** - no shared state between workers at same stage (use DB/S3 for coordination)
 
 ## Common Pitfalls
 

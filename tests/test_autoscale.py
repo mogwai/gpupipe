@@ -6,7 +6,7 @@ import time
 import random
 import pytest
 
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 class Generator:
@@ -21,13 +21,13 @@ class Generator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         if self.delay:
             time.sleep(self.delay)
         item = {"id": self._idx}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -43,13 +43,13 @@ class BatchGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         items = []
         for _ in range(min(self.batch_size, self.n_items - self._idx)):
             items.append({"id": self._idx})
             self._idx += 1
         if self._idx >= self.n_items:
-            items.append("end")
+            items.append(End)
         return items
 
 
@@ -153,7 +153,7 @@ class BurstGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         if self._in_burst >= self.burst_size:
             time.sleep(self.pause)
@@ -164,7 +164,7 @@ class BurstGenerator:
         self._in_burst += 1
 
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -179,13 +179,13 @@ class SporadicGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         if self._idx > 0 and self._idx % 10 == 0:
             time.sleep(0.3)
         item = {"id": self._idx}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -201,7 +201,7 @@ class VariableWorkGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         work_ms = random.expovariate(1 / 30)
         work_ms = max(1, min(200, work_ms))
@@ -209,7 +209,7 @@ class VariableWorkGenerator:
         item = {"id": self._idx, "work_ms": work_ms}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -780,7 +780,7 @@ class ScaleDownRaceGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         item = {"id": self._idx}
         self._idx += 1
@@ -790,7 +790,7 @@ class ScaleDownRaceGenerator:
             time.sleep(self.pause_after_burst)
 
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -868,7 +868,7 @@ class RapidBurstGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         # Every burst_size items, pause briefly
         if self._idx > 0 and self._idx % self.burst_size == 0:
@@ -878,7 +878,7 @@ class RapidBurstGenerator:
         self._idx += 1
 
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -968,12 +968,12 @@ class SlowStartGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         process_time = 0.1 if self._idx < self.slow_count else 0.01
         item = {"id": self._idx, "process_time": process_time}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -1086,7 +1086,7 @@ class BurstThenPauseGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         # After burst, pause to trigger autoscaler scale-down
         if self._idx == self.burst_size:
@@ -1096,7 +1096,7 @@ class BurstThenPauseGenerator:
         self._idx += 1
 
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -1123,7 +1123,7 @@ class ScaleDownTriggerGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         # After pause_after items, wait long enough to trigger scale-down (5+ seconds)
         if self._idx == self.pause_after and not self._paused:
@@ -1136,7 +1136,7 @@ class ScaleDownTriggerGenerator:
         self._idx += 1
 
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 

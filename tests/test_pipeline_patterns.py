@@ -21,7 +21,7 @@ from conftest import (
     Collector,
     run_pipeline,
 )
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 # === DEEP PIPELINE TESTS ===
@@ -102,7 +102,7 @@ class AudioSegmentGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         duration = random.expovariate(1 / 60)
         duration = max(self.min_duration, min(self.max_duration, duration))
@@ -118,7 +118,7 @@ class AudioSegmentGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 

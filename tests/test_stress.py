@@ -5,7 +5,7 @@ Run with: pytest tests/test_stress.py -n auto
 import time
 import pytest
 
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 class Generator:
@@ -20,13 +20,13 @@ class Generator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         if self.delay:
             time.sleep(self.delay)
         item = {"id": self._idx}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -42,13 +42,13 @@ class BatchGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         items = []
         for _ in range(min(self.batch_size, self.n_items - self._idx)):
             items.append({"id": self._idx})
             self._idx += 1
         if self._idx >= self.n_items:
-            items.append("end")
+            items.append(End)
         return items
 
 

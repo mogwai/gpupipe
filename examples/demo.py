@@ -4,7 +4,7 @@ import hashlib
 import random
 import time
 
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 class AudioGenerator:
@@ -20,7 +20,7 @@ class AudioGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         # Random duration 5s to 120s (biased shorter)
         duration = random.expovariate(1 / 20)
@@ -33,7 +33,7 @@ class AudioGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 

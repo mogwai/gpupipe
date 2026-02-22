@@ -24,6 +24,9 @@ _STR_TO_TORCH = {
 }
 
 
+_SHM_BYTES_THRESHOLD = 256 * 1024  # 256KB
+
+
 def _has_tensors(obj):
     if torch.is_tensor(obj):
         return True
@@ -31,6 +34,16 @@ def _has_tensors(obj):
         return any(_has_tensors(v) for v in obj.values())
     if isinstance(obj, (list, tuple)):
         return any(_has_tensors(v) for v in obj)
+    return False
+
+
+def _has_large_bytes(obj):
+    if isinstance(obj, (bytes, bytearray)) and len(obj) >= _SHM_BYTES_THRESHOLD:
+        return True
+    if isinstance(obj, dict):
+        return any(_has_large_bytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_large_bytes(v) for v in obj)
     return False
 
 
@@ -44,7 +57,9 @@ def _item_to_shm(item, skip=False):
 
     Set PIPE_NO_SHM=1 to disable shm globally. Pass skip=True to skip for this call.
     """
-    if skip or os.environ.get("PIPE_NO_SHM") or not isinstance(item, dict) or not _has_tensors(item):
+    if skip or os.environ.get("PIPE_NO_SHM") or not isinstance(item, dict):
+        return item
+    if not _has_tensors(item) and not _has_large_bytes(item):
         return item
 
     path = f"/dev/shm/pipe_{os.getpid()}_{uuid.uuid4().hex[:12]}"
@@ -68,6 +83,10 @@ def _item_to_shm(item, skip=False):
             }
             chunks.append(raw)
             offset += len(raw)
+        elif isinstance(val, (bytes, bytearray)) and len(val) >= _SHM_BYTES_THRESHOLD:
+            header[key] = {"t": "B", "o": offset, "n": len(val)}
+            chunks.append(val)
+            offset += len(val)
         else:
             raw = pickle.dumps(val, protocol=pickle.HIGHEST_PROTOCOL)
             header[key] = {"t": "P", "o": offset, "n": len(raw)}
@@ -120,6 +139,8 @@ def _item_from_shm(item):
                     result[key] = torch.from_numpy(arr).view(torch.bfloat16).reshape(meta["s"])
                 else:
                     result[key] = torch.from_numpy(arr).reshape(meta["s"])
+            elif meta["t"] == "B":
+                result[key] = bytes(raw)
             else:
                 result[key] = pickle.loads(raw)
     finally:
