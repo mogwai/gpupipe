@@ -13,7 +13,12 @@ from queue import Empty, Full
 import torch
 
 from .types import End
-from ._shm import _item_from_shm, _item_to_shm
+from .shm import _item_from_shm, _item_to_shm
+
+
+def _log(msg):
+    if os.environ.get("PIPE_VERBOSE") == "1":
+        print(msg)
 
 
 def _skip_shm_for_output(is_final_stage):
@@ -119,7 +124,7 @@ def _worker_run(
             print(f"Failed to set GPU {gpu_id}: {e}")
 
     def handle_signal(signum, frame):
-        print(f"Worker {worker_desc} received signal {signum}, stopping gracefully")
+        _log(f"Worker {worker_desc} received signal {signum}, stopping gracefully")
         should_stop.value = 1
 
     signal.signal(signal.SIGTERM, handle_signal)
@@ -165,7 +170,7 @@ def _worker_run(
         worker.put = _put
 
     if hasattr(worker, "load"):
-        print(f"Worker {worker_desc} calling load()")
+        _log(f"Worker {worker_desc} calling load()")
         worker.load()
 
     if _has_custom_run:
@@ -316,7 +321,7 @@ def _worker_run(
                     break
 
                 if item == "worker_stop":
-                    print(f"Worker {worker_id} received stop signal, exiting gracefully")
+                    _log(f"Worker {worker_id} received stop signal, exiting gracefully")
                     # Skip coordination - we were removed from the pool, not finishing normally
                     # (count was already decremented in _signal_worker_to_stop)
                     while should_stop is not None and not should_stop.value:
@@ -430,12 +435,11 @@ def _worker_run(
             if raise_errors:
                 raise e
 
-    # Flush buffered items via flush() method (skip if worker used custom run)
     if not _has_custom_run and hasattr(worker, "flush") and out_queue:
         try:
             flushed_items = list(worker.flush())
             if flushed_items:
-                print(f"Worker {worker_desc} flushing {len(flushed_items)} items via flush()")
+                _log(f"Worker {worker_desc} flushing {len(flushed_items)} items via flush()")
                 for item in flushed_items:
                     if item is not None:
                         serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
@@ -457,7 +461,7 @@ def _worker_run(
 
         current_worker_count = stage_worker_count.value
         stage_desc = f"{stage_name}" if stage_name else f"stage_{stage_idx}"
-        print(f"Worker {worker_id} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
+        _log(f"Worker {worker_id} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
 
         if finished_workers >= current_worker_count:
             # Put End sentinel on output queue so downstream knows we're done
@@ -465,12 +469,12 @@ def _worker_run(
                 try:
                     serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
                     out_queue.put(serialized, timeout=1.0)
-                    print(f"Put End sentinel on queue for {stage_desc}")
+                    _log(f"Put End sentinel on queue for {stage_desc}")
                 except Full:
                     print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
             if stage_done is not None:
                 stage_done.set()
-                print(f"All workers finished at {stage_desc}, signaling downstream")
+                _log(f"All workers finished at {stage_desc}, signaling downstream")
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
     # Without this, tensors in queues become invalid when worker exits
@@ -521,7 +525,7 @@ def _threaded_worker_run(
     thread_stop = threading.Event()
 
     def handle_signal(signum, frame):
-        print(f"Threaded worker {worker_desc} received signal {signum}, stopping")
+        _log(f"Threaded worker {worker_desc} received signal {signum}, stopping")
         should_stop.value = 1
         thread_stop.set()
 
@@ -568,7 +572,7 @@ def _threaded_worker_run(
         worker.put = _put
 
     if hasattr(worker, "load"):
-        print(f"Threaded worker {worker_desc} calling load()")
+        _log(f"Threaded worker {worker_desc} calling load()")
         worker.load()
 
     # Delegate to custom run() if worker defines it
@@ -720,7 +724,7 @@ def _threaded_worker_run(
                         return
 
                     if item == "worker_stop":
-                        print(f"Thread {worker_id} received stop signal")
+                        _log(f"Thread {worker_id} received stop signal")
                         # Just exit - coordination is skipped for stopped workers
                         # (count was already decremented in _signal_worker_to_stop)
                         return
@@ -838,7 +842,7 @@ def _threaded_worker_run(
                 break
             time.sleep(0.01)
     except KeyboardInterrupt:
-        print(f"Threaded worker {worker_desc} received KeyboardInterrupt")
+        _log(f"Threaded worker {worker_desc} received KeyboardInterrupt")
         thread_stop.set()
     finally:
         thread_stop.set()
@@ -861,7 +865,7 @@ def _threaded_worker_run(
                 finished_workers = stage_end_counter.value
 
             current_worker_count = stage_worker_count.value
-            print(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
+            _log(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
 
             if finished_workers >= current_worker_count:
                 # Put End sentinel on output queue so downstream knows we're done
@@ -869,14 +873,14 @@ def _threaded_worker_run(
                     try:
                         serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
                         out_queue.put(serialized, timeout=1.0)
-                        print(f"Put End sentinel on queue for {stage_name}")
+                        _log(f"Put End sentinel on queue for {stage_name}")
                     except Full:
                         print(f"Warning: Could not put End sentinel on queue for {stage_name}")
                 if stage_done is not None:
                     stage_done.set()
-                    print(f"All workers finished at {stage_name}, signaling downstream")
+                    _log(f"All workers finished at {stage_name}, signaling downstream")
 
-        print(f"Threaded worker {worker_desc} shutdown complete")
+        _log(f"Threaded worker {worker_desc} shutdown complete")
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
     while should_stop is not None and not should_stop.value:
@@ -892,9 +896,9 @@ def _signal_worker_to_stop(pipe_instance, stage_idx):
             # Decrement worker count so stage completion check works correctly
             with pipe_instance.stage_worker_counts[stage_idx].get_lock():
                 pipe_instance.stage_worker_counts[stage_idx].value -= 1
-            print(f"   Signaled worker at stage {stage_idx} to stop")
+            _log(f"   Signaled worker at stage {stage_idx} to stop")
         except Exception as e:
-            print(f"   Failed to signal worker stop: {e}")
+            _log(f"   Failed to signal worker stop: {e}")
 
 
 def _spawn_additional_worker(pipe_instance, stage_idx, job):
@@ -915,7 +919,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
     new_worker_idx = current_count
     worker_id = f"stage_{stage_idx}_worker_{new_worker_idx}"
 
-    print(f"Autoscaling: Adding worker {new_worker_idx + 1} to {stage_name} (stage {stage_idx})")
+    _log(f"Autoscaling: Adding worker {new_worker_idx + 1} to {stage_name} (stage {stage_idx})")
 
     in_queue = pipe_instance.queues[stage_idx - 1] if stage_idx > 0 else None
     out_queue = pipe_instance.queues[stage_idx] if stage_idx < len(pipe_instance.queues) else None
@@ -976,7 +980,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
         proc = Process(target=_worker_run, args=args, daemon=True)
 
     proc.start()
-    print(f"   Worker {worker_id} started with PID {proc.pid}")
+    _log(f"   Worker {worker_id} started with PID {proc.pid}")
 
     pipe_instance.processes.append(proc)
     pipe_instance.worker_info.append((proc, worker_id, stage_name))

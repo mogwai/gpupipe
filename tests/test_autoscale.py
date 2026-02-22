@@ -699,7 +699,7 @@ def test_cpu_metric_accuracy():
     """Test that _get_cpu_usage accurately reflects actual CPU load."""
     import subprocess
     import os
-    from pipe._monitors import _get_cpu_usage
+    from pipe.monitors import _get_cpu_usage
 
     idle1, total1 = _get_cpu_usage()
     time.sleep(0.3)
