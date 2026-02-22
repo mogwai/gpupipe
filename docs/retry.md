@@ -133,14 +133,14 @@ pipe.add(worker,
 ## Verification
 
 ```python
-from pipe import Pipe
+from pipe import Pipe, End
 
 class Source:
     def __init__(self):
         self.i = 0
     def __call__(self):
         if self.i >= 20:
-            return "end"
+            return End
         self.i += 1
         return {"n": self.i}
 

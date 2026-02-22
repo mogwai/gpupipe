@@ -15,6 +15,7 @@ import torch
 
 from pipe._shm import _item_to_shm, _item_from_shm, _cleanup_stale_shm, _has_tensors
 from pipe import Pipe
+from pipe import End
 
 
 class TensorGenerator:
@@ -28,7 +29,7 @@ class TensorGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         item = {
             "id": self._idx,
             "tensor": torch.randn(self.size),
@@ -36,7 +37,7 @@ class TensorGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -68,18 +69,23 @@ class MixedGenerator:
 
     def __call__(self):
         if self._idx >= self.n:
-            return "end"
+            return End
         if self._idx % 2 == 0:
             item = {"id": self._idx, "tensor": torch.randn(16), "has_tensor": True}
         else:
             item = {"id": self._idx, "data": "no tensor", "has_tensor": False}
         self._idx += 1
         if self._idx >= self.n:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
 # === Unit tests for _item_to_shm / _item_from_shm ===
+
+@pytest.fixture(autouse=True)
+def clear_shm_env(monkeypatch):
+    monkeypatch.delenv("PIPE_NO_SHM", raising=False)
+    monkeypatch.delenv("PIPE_NO_SHM_OUTPUT", raising=False)
 
 
 def test_shm_roundtrip_basic():
@@ -174,9 +180,9 @@ def test_shm_no_tensors_passthrough():
 
 def test_shm_non_dict_passthrough():
     """Non-dict items pass through unchanged."""
-    assert _item_to_shm("end") == "end"
+    assert _item_to_shm("hello") == "hello"
     assert _item_to_shm(42) == 42
-    assert _item_from_shm("end") == "end"
+    assert _item_from_shm("hello") == "hello"
     assert _item_from_shm({"id": 1}) == {"id": 1}
 
 
@@ -309,9 +315,9 @@ def test_pipeline_multi_stage_tensor():
     assert all(torch.is_tensor(r["tensor"]) for r in results)
 
 
-def test_pipeline_debug_mode():
-    """Debug mode (sequential) works without shm."""
-    pipe = Pipe(debug=True, stats_interval=0, health_check_interval=0)
+def test_pipeline_sequential_mode():
+    """Sequential mode works without shm."""
+    pipe = Pipe(sequential=True, stats_interval=0, health_check_interval=0)
     pipe.add(TensorGenerator(10, size=(16, 16)), outqn=10)
     pipe.add(TensorModifier(), workers=1, outqn=0)
 

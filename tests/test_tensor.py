@@ -15,7 +15,7 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
 
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 class Collector:
@@ -38,7 +38,7 @@ class TensorGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         tensor = torch.randn(self.tensor_size)
 
@@ -48,7 +48,7 @@ class TensorGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -156,7 +156,7 @@ class NestedTensorGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         item = {
             "id": self._idx,
@@ -172,7 +172,7 @@ class NestedTensorGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -204,7 +204,7 @@ class MultipleTensorGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         item = {
             "id": self._idx,
@@ -215,7 +215,7 @@ class MultipleTensorGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -250,7 +250,7 @@ class DtypeGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         item = {
             "id": self._idx,
@@ -263,7 +263,7 @@ class DtypeGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -298,7 +298,7 @@ class MixedGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         if self._idx % 2 == 0:
             item = {"id": self._idx, "tensor": torch.randn(16, 16), "has_tensor": True}
@@ -307,7 +307,7 @@ class MixedGenerator:
 
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -342,7 +342,7 @@ class EdgeCaseGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         base = torch.randn(32, 32)
 
@@ -355,7 +355,7 @@ class EdgeCaseGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 

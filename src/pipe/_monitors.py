@@ -170,6 +170,14 @@ def _stats_monitor_thread(
                 qc = DIM
                 q_str = "?"
 
+            # Transit latency from InstrumentedQueue
+            transit_str = ""
+            if hasattr(q, "total_transit"):
+                got = q.items_got.value
+                if got > 0:
+                    avg_ms = (q.total_transit.value / got) * 1000
+                    transit_str = f"|{avg_ms:.0f}ms"
+
             # RTF stats
             stage_rtf = 0
             avg_worker_rtf = 0
@@ -195,7 +203,7 @@ def _stats_monitor_thread(
                 stage_rtf = stage_total_audio / wall_elapsed if wall_elapsed > 0 else 0
                 avg_worker_rtf = sum(worker_rtfs) / len(worker_rtfs) if worker_rtfs else 0
 
-            parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{stage_rtf:.0f}/{avg_worker_rtf:.0f}x")
+            parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{stage_rtf:.0f}/{avg_worker_rtf:.0f}x{transit_str}")
 
         line = f"[{total_items}] " + "▸".join(parts)
         print(line)

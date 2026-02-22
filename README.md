@@ -29,7 +29,6 @@ class Worker:
         pass
 
     def __call__(self, item):
-        # Workers never see "end" - framework handles it internally
         item["processed"] = True
         return item
 
@@ -107,4 +106,5 @@ pytest tests/test_pipe.py::test_autoscale_global -v
 - Autoscaling with CPU awareness
 - Health monitoring and worker restart
 - Graceful shutdown with no data loss
-- Debug mode for sequential execution
+- Sequential mode for single-process execution
+- Debug mode for queue transit latency stats

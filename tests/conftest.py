@@ -11,7 +11,7 @@ except ImportError:
     HAS_TORCH = False
     torch = None
 
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 # === BASIC WORKER CLASSES ===
@@ -28,13 +28,13 @@ class Generator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         if self.delay:
             time.sleep(self.delay)
         item = {"id": self._idx}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -50,13 +50,13 @@ class BatchGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         items = []
         for _ in range(min(self.batch_size, self.n_items - self._idx)):
             items.append({"id": self._idx})
             self._idx += 1
         if self._idx >= self.n_items:
-            items.append("end")
+            items.append(End)
         return items
 
 
@@ -108,7 +108,7 @@ class ExpandWorker:
 
 
 class Batcher:
-    """Batches items, with flush support. Workers don't handle 'end' - use flush()."""
+    """Batches items, with flush support."""
     def __init__(self, size: int):
         self.size = size
         self.buffer = []
@@ -133,7 +133,7 @@ class Batcher:
 
 
 class FlushingBatcher:
-    """Batcher that uses flush() mechanism. No 'end' handling needed."""
+    """Batcher that uses flush() mechanism."""
     def __init__(self, size: int):
         self.size = size
         self.buffer = []
@@ -241,7 +241,7 @@ class BurstGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         if self._in_burst >= self.burst_size:
             time.sleep(self.pause)
@@ -252,7 +252,7 @@ class BurstGenerator:
         self._in_burst += 1
 
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -267,13 +267,13 @@ class SporadicGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         if self._idx > 0 and self._idx % 10 == 0:
             time.sleep(0.3)
         item = {"id": self._idx}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -293,7 +293,7 @@ class AudioSegmentGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         duration = random.expovariate(1 / 60)
         duration = max(self.min_duration, min(self.max_duration, duration))
@@ -309,7 +309,7 @@ class AudioSegmentGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -480,7 +480,7 @@ class VariableWorkGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
 
         work_ms = random.expovariate(1 / 30)
         work_ms = max(1, min(200, work_ms))
@@ -488,7 +488,7 @@ class VariableWorkGenerator:
         item = {"id": self._idx, "work_ms": work_ms}
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -516,14 +516,14 @@ class TensorGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         item = {
             "id": self._idx,
             "tensor": torch.randn(self.tensor_size),
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 
@@ -614,7 +614,7 @@ class LargeTensorGenerator:
 
     def __call__(self):
         if self._idx >= self.n_items:
-            return "end"
+            return End
         item = {
             "id": self._idx,
             "tensor": torch.randn(self.tensor_size),
@@ -622,7 +622,7 @@ class LargeTensorGenerator:
         }
         self._idx += 1
         if self._idx >= self.n_items:
-            return [item, "end"]
+            return [item, End]
         return item
 
 

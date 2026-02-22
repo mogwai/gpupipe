@@ -1,6 +1,8 @@
 import random
 import time
 
+from .types import End
+
 
 class Batcher:
     def __init__(self, size, collate_fn=None):
@@ -59,7 +61,7 @@ class RetrieveSQL:
         if self.skip_count:
             items = query(self.query)
             if len(items) == 0:
-                return "end"
+                return End
             return items
 
         if "ORDER BY" in self.query.upper():
@@ -78,7 +80,7 @@ class RetrieveSQL:
                 self.count = updated_count
                 self.offset = 0
                 return items if len(items) > 0 else []
-            return "end"
+            return End
 
         return items
 

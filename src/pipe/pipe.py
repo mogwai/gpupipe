@@ -9,8 +9,66 @@ import torch
 import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
+
+class InstrumentedQueue:
+    """Wraps a mp.Queue to track per-item transit latency."""
+
+    def __init__(self, queue):
+        self._queue = queue
+        self.items_put = Value('l', 0)
+        self.items_got = Value('l', 0)
+        self.total_transit = Value('d', 0.0)
+
+    def put(self, item, **kwargs):
+        self._queue.put((item, time.time()), **kwargs)
+        with self.items_put.get_lock():
+            self.items_put.value += 1
+
+    def get(self, **kwargs):
+        item, put_time = self._queue.get(**kwargs)
+        transit = time.time() - put_time
+        with self.total_transit.get_lock():
+            self.total_transit.value += transit
+        with self.items_got.get_lock():
+            self.items_got.value += 1
+        return item
+
+    def get_nowait(self):
+        item, put_time = self._queue.get_nowait()
+        transit = time.time() - put_time
+        with self.total_transit.get_lock():
+            self.total_transit.value += transit
+        with self.items_got.get_lock():
+            self.items_got.value += 1
+        return item
+
+    def put_nowait(self, item):
+        self._queue.put_nowait((item, time.time()))
+        with self.items_put.get_lock():
+            self.items_put.value += 1
+
+    def qsize(self):
+        return self._queue.qsize()
+
+    def full(self):
+        return self._queue.full()
+
+    def empty(self):
+        return self._queue.empty()
+
+    def close(self):
+        return self._queue.close()
+
+    def cancel_join_thread(self):
+        return self._queue.cancel_join_thread()
+
+    @property
+    def _maxsize(self):
+        return self._queue._maxsize
+
 from ._monitors import _autoscaler_thread, _health_monitor_thread, _stats_monitor_thread
 from ._shm import _cleanup_stale_shm, _item_from_shm
+from .types import End
 from ._workers import (
     _check_picklable,
     _is_end,
@@ -46,6 +104,7 @@ class PipeIterator:
 class Pipe:
     def __init__(
         self,
+        sequential=False,
         debug=False,
         raise_errors=None,
         health_check_interval=30,
@@ -67,9 +126,10 @@ class Pipe:
         elif "PIPE_NO_SHM_OUTPUT" in os.environ:
             del os.environ["PIPE_NO_SHM_OUTPUT"]
         _cleanup_stale_shm()
+        self.sequential = sequential
         self.debug = debug
         self.use_shm = use_shm
-        self.raise_errors = raise_errors if raise_errors is not None else debug
+        self.raise_errors = raise_errors if raise_errors is not None else sequential
         self.health_check_interval = health_check_interval
         self.allow_full_restart = allow_full_restart
         self.autoscale = autoscale
@@ -127,6 +187,7 @@ class Pipe:
         autoscale=None,
         min_workers=None,
         max_workers=None,
+        batch=0,
     ):
         if hasattr(func, "__name__"):
             stage_name = func.__name__
@@ -189,6 +250,7 @@ class Pipe:
                 "autoscale": stage_autoscale,
                 "max_workers": effective_max,
                 "min_workers": min_workers if min_workers is not None else 1,
+                "batch": batch,
             }
         )
 
@@ -199,15 +261,16 @@ class Pipe:
         if not self.jobs:
             raise ValueError("No workers added to pipeline")
 
-        if self.debug:
-            print("Debug mode - skipping multiprocessing setup")
+        if self.sequential:
+            print("Sequential mode - skipping multiprocessing setup")
             return self
 
         print("Setting up multiprocessing...")
 
         for i, job in enumerate(self.jobs):
             outq_size = job.get("outqn") or 0
-            self.queues.append(Queue(maxsize=outq_size))
+            q = Queue(maxsize=outq_size)
+            self.queues.append(InstrumentedQueue(q) if self.debug else q)
             self.stage_end_counters.append(Value("i", 0))
             self.stage_done_events.append(Event())
 
@@ -260,7 +323,8 @@ class Pipe:
                             self.expected_consumers,
                             upstream_done,
                             stage_done,
-                            self.debug,
+                            self.sequential,
+                            job.get("batch", 0),
                         )
 
                         self.worker_configs[worker_id] = {
@@ -296,7 +360,8 @@ class Pipe:
                         self.expected_consumers,
                         upstream_done,
                         stage_done,
-                        self.debug,
+                        self.sequential,
+                        job.get("batch", 0),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -339,7 +404,8 @@ class Pipe:
                         self.expected_consumers,
                         upstream_done,
                         stage_done,
-                        self.debug,
+                        self.sequential,
+                        job.get("batch", 0),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -443,7 +509,7 @@ class Pipe:
         try:
             while True:
                 item = old_out_queue.get_nowait()
-                if item != "end":
+                if not _is_end(item):
                     drained_items.append(item)
         except Empty:
             pass
@@ -481,9 +547,8 @@ class Pipe:
             stage_name = str(type(func).__name__)
 
         is_final_stage = stage_idx == len(self.jobs) - 1
-        next_stage_worker_count = (
-            None if is_final_stage else self.stage_worker_counts[stage_idx + 1]
-        )
+        upstream_done = self.stage_done_events[stage_idx - 1] if stage_idx > 0 else None
+        stage_done = self.stage_done_events[stage_idx]
 
         for idx, old_proc, worker_id, _ in stage_workers:
             config = self.worker_configs.get(worker_id)
@@ -511,8 +576,10 @@ class Pipe:
                     stage_name,
                     is_final_stage,
                     self.expected_consumers,
-                    next_stage_worker_count,
-                    self.debug,
+                    upstream_done,
+                    stage_done,
+                    self.sequential,
+                    job.get("batch", 0),
                 )
             else:
                 new_args = (
@@ -531,8 +598,10 @@ class Pipe:
                     stage_name,
                     is_final_stage,
                     self.expected_consumers,
-                    next_stage_worker_count,
-                    self.debug,
+                    upstream_done,
+                    stage_done,
+                    self.sequential,
+                    job.get("batch", 0),
                 )
 
             config["args"] = new_args
@@ -600,7 +669,7 @@ class Pipe:
         else:
             for q in self.queues:
                 with contextlib.suppress(Full):
-                    q.put("end", timeout=1)
+                    q.put(End, timeout=1)
 
             for p in self.processes:
                 try:
@@ -651,8 +720,8 @@ class Pipe:
         if not self.started:
             self.start()
 
-        if self.debug:
-            yield from self._debug_sequential_run()
+        if self.sequential:
+            yield from self._sequential_run()
             return
 
         final_done = self.stage_done_events[-1]
@@ -685,9 +754,12 @@ class Pipe:
                 self.restart()
                 consecutive_empty = 0
             except KeyboardInterrupt:
-                print("Ctrl+C detected - force stopping pipeline")
-                self._stop(force=True)
-                return
+                if self.should_stop.value:
+                    print("\nForce stopping pipeline")
+                    self._stop(force=True)
+                    return
+                print("\nStopping after current items... (Ctrl+C again to force quit)")
+                self.should_stop.value = 1
 
     def run(self):
         count = 0
@@ -702,19 +774,18 @@ class Pipe:
         except Exception:
             pass
 
-    def _debug_sequential_run(self):
-        print("Running in debug mode - sequential execution")
+    def _sequential_run(self):
+        print("Running in sequential mode")
 
         if not self.jobs:
             return
 
-        workers = []
-        for job in self.jobs:
-            worker_func = job["func"]
-            if callable(worker_func) and not hasattr(worker_func, "__name__"):
-                workers.append(worker_func)
-            else:
-                workers.append(worker_func)
+        workers = [job["func"] for job in self.jobs]
+
+        run_stages = set()
+        for i, (w, job) in enumerate(zip(workers, self.jobs)):
+            if hasattr(w, "run") and i > 0:
+                run_stages.add(i)
 
         for worker in workers:
             if hasattr(worker, "load"):
@@ -723,35 +794,58 @@ class Pipe:
         pending_items = []
         root_ended = False
 
+        def _add_result(result, next_stage):
+            if result is None:
+                return
+            if inspect.isgenerator(result):
+                for res_item in result:
+                    if res_item is not None and not _is_end(res_item):
+                        pending_items.append((next_stage, res_item))
+            elif _is_end(result):
+                return
+            elif isinstance(result, list):
+                for res_item in result:
+                    if res_item is not None and not _is_end(res_item):
+                        pending_items.append((next_stage, res_item))
+            else:
+                pending_items.append((next_stage, result))
+
+        def _process_callable(worker, stage_idx, item):
+            job = self.jobs[stage_idx]
+            batch_sz = job.get("batch", 0)
+
+            if batch_sz > 0:
+                batch = [item]
+                while len(batch) < batch_sz and pending_items and pending_items[0][0] == stage_idx:
+                    _, next_item = pending_items.pop(0)
+                    batch.append(next_item)
+                result = worker(batch)
+            else:
+                result = worker(item)
+            _add_result(result, stage_idx + 1)
+
         while not root_ended or pending_items:
             if not root_ended:
                 root_result = workers[0]()
 
-                # Handle generator from root worker
                 if inspect.isgenerator(root_result):
                     for root_item in root_result:
-                        if root_item is None or _is_end(root_item):
-                            continue
-                        pending_items.append((1, root_item))
+                        if root_item is not None and not _is_end(root_item):
+                            pending_items.append((1, root_item))
                     root_ended = True
+                elif root_result is None:
+                    pass
+                elif _is_end(root_result):
+                    root_ended = True
+                elif isinstance(root_result, list):
+                    for root_item in root_result:
+                        if _is_end(root_item):
+                            root_ended = True
+                            break
+                        if root_item is not None:
+                            pending_items.append((1, root_item))
                 else:
-                    if _is_end(root_result):
-                        root_ended = True
-                    elif not isinstance(root_result, list):
-                        root_result = [root_result]
-                        for root_item in root_result:
-                            if _is_end(root_item):
-                                root_ended = True
-                                break
-                            if root_item is not None:
-                                pending_items.append((1, root_item))
-                    else:
-                        for root_item in root_result:
-                            if _is_end(root_item):
-                                root_ended = True
-                                break
-                            if root_item is not None:
-                                pending_items.append((1, root_item))
+                    pending_items.append((1, root_result))
 
             if pending_items:
                 stage_idx, item = pending_items.pop(0)
@@ -762,41 +856,59 @@ class Pipe:
 
                 worker = workers[stage_idx]
 
+                if stage_idx in run_stages:
+                    # Collect all currently pending items for this stage
+                    buffer = [item]
+                    remaining = []
+                    for si, it in pending_items:
+                        if si == stage_idx:
+                            buffer.append(it)
+                        else:
+                            remaining.append((si, it))
+                    pending_items[:] = remaining
+
+                    batch_sz = self.jobs[stage_idx].get("batch", 1) or 1
+
+                    def _make_pull(buf, bs):
+                        def _pull(n=bs):
+                            items = buf[:n]
+                            del buf[:n]
+                            return items
+                        return _pull
+
+                    def _make_put(pi, next_stage):
+                        def _put(item):
+                            if item is not None:
+                                pi.append((next_stage, item))
+                        return _put
+
+                    worker.pull = _make_pull(buffer, batch_sz)
+                    worker.put = _make_put(pending_items, stage_idx + 1)
+                    try:
+                        worker.run()
+                    except Exception as e:
+                        if self.raise_errors:
+                            raise
+                        print(f"Error in run() worker at stage {stage_idx}: {e}")
+                    continue
+
                 try:
-                    result = worker(item)
+                    _process_callable(worker, stage_idx, item)
                 except Exception as e:
                     if self.raise_errors:
-                        print(f"Error in worker at stage {stage_idx}: {e}")
-                        raise e
-                    else:
-                        print(f"Error in worker at stage {stage_idx}: {e}, continuing...")
-                        continue
+                        raise
+                    print(f"Error in worker at stage {stage_idx}: {e}, continuing...")
 
-                if result is None:
-                    continue
-                # Handle generator from middle worker
-                elif inspect.isgenerator(result):
-                    for res_item in result:
-                        if res_item is None or _is_end(res_item):
-                            continue
-                        pending_items.append((stage_idx + 1, res_item))
-                elif _is_end(result):
-                    break
-                elif isinstance(result, list):
-                    for res_item in result:
-                        if res_item is not None and not _is_end(res_item):
-                            pending_items.append((stage_idx + 1, res_item))
-                else:
-                    pending_items.append((stage_idx + 1, result))
-
-        # Flush all workers that have flush() method and process remaining items
-        for stage_idx, worker in enumerate(workers[1:], 1):  # Skip root worker
+        # Flush callable workers (run() workers manage their own flushing)
+        for stage_idx, worker in enumerate(workers[1:], 1):
+            if stage_idx in run_stages:
+                continue
             if hasattr(worker, "flush"):
                 for flushed_item in worker.flush():
                     if flushed_item is not None:
                         pending_items.append((stage_idx + 1, flushed_item))
 
-        # Process any remaining items from flush
+        # Process remaining items from flush
         while pending_items:
             stage_idx, item = pending_items.pop(0)
 
@@ -806,23 +918,8 @@ class Pipe:
 
             worker = workers[stage_idx]
             try:
-                result = worker(item)
+                _process_callable(worker, stage_idx, item)
             except Exception as e:
                 if self.raise_errors:
-                    raise e
+                    raise
                 continue
-
-            if result is None:
-                continue
-            elif inspect.isgenerator(result):
-                for res_item in result:
-                    if res_item is not None and not _is_end(res_item):
-                        pending_items.append((stage_idx + 1, res_item))
-            elif _is_end(result):
-                continue
-            elif isinstance(result, list):
-                for res_item in result:
-                    if res_item is not None and not _is_end(res_item):
-                        pending_items.append((stage_idx + 1, res_item))
-            else:
-                pending_items.append((stage_idx + 1, result))

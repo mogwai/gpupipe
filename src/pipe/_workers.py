@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from queue import Full
+from queue import Empty, Full
 
 import torch
 
@@ -22,8 +22,7 @@ def _skip_shm_for_output(is_final_stage):
 
 
 def _is_end(item):
-    """Check if item is an end signal (End sentinel or legacy 'end' string)."""
-    return item is End or item == "end"
+    return item is End
 
 
 def _check_picklable(obj, name: str, is_thread: bool = False) -> None:
@@ -98,7 +97,8 @@ def _worker_run(
     expected_consumers=1,
     upstream_done=None,
     stage_done=None,
-    debug=False,
+    sequential=False,
+    batch_size=0,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -125,9 +125,65 @@ def _worker_run(
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    _has_custom_run = hasattr(worker, "run") and not is_root
+
+    # Inject pull/put for workers with run()
+    if _has_custom_run and in_queue is not None:
+        def _pull(n=batch_size or 1):
+            items = []
+            while len(items) < n and not should_stop.value:
+                try:
+                    raw = in_queue.get_nowait()
+                except Empty:
+                    if items:
+                        break  # got partial batch, return it
+                    if upstream_done is not None and upstream_done.is_set():
+                        return []  # truly done
+                    time.sleep(0.01)
+                    continue
+                if raw == "worker_stop":
+                    in_queue.put("worker_stop")
+                    break
+                raw = _item_from_shm(raw)
+                if _is_end(raw):
+                    continue
+                items.append(raw)
+            return items
+        worker.pull = _pull
+
+    if _has_custom_run and out_queue is not None:
+        def _put(item):
+            if item is None:
+                return
+            serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
+            while not should_stop.value:
+                try:
+                    out_queue.put(serialized, timeout=0.1)
+                    return
+                except Full:
+                    time.sleep(0.01)
+        worker.put = _put
+
     if hasattr(worker, "load"):
         print(f"Worker {worker_desc} calling load()")
         worker.load()
+
+    if _has_custom_run:
+        print(f"Worker {worker_desc} using custom run()")
+        if hasattr(worker, "pull"):
+            worker.run()
+        else:
+            worker.run(
+                in_queue=in_queue,
+                out_queue=out_queue,
+                should_stop=should_stop,
+                upstream_done=upstream_done,
+                serialize=lambda item: _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage)),
+                deserialize=lambda raw: None if _is_end(v := _item_from_shm(raw)) else v,
+                timing_dict=timing_dict,
+                worker_id=worker_id,
+                worker_start_wall_time=time.time(),
+            )
 
     items_processed = 0
     total_process_time = 0.0
@@ -153,14 +209,14 @@ def _worker_run(
                 return sum(s.get("duration", 0.0) for s in obj["segments"])
             return 0.0
         if isinstance(obj, list):
-            return sum(extract_audio_duration(x) for x in obj if x != "end")
+            return sum(extract_audio_duration(x) for x in obj)
         return 0.0
 
-    while not should_stop.value:
+    while not should_stop.value and not _has_custom_run:
         now = time.time()
         if now - last_fd_check > fd_check_interval:
             fd_info = _get_fd_info()
-            if debug:
+            if sequential:
                 print(f"Worker {worker_desc} FD check: {fd_info['fd_count']}/{fd_info['soft_limit']} (items: {items_processed})")
             last_fd_check = now
 
@@ -243,8 +299,6 @@ def _worker_run(
                     break
 
             else:
-                from queue import Empty
-
                 if out_queue is not None and out_queue.full():
                     time.sleep(0.01)  # 10ms backoff when downstream is full
                     continue
@@ -276,9 +330,31 @@ def _worker_run(
                 if _is_end(item):
                     continue
 
-                start_time = time.time()
-                result = worker(item)
-                process_time = time.time() - start_time
+                if batch_size > 0:
+                    batch = [item]
+                    while len(batch) < batch_size:
+                        try:
+                            raw = in_queue.get_nowait()
+                        except Empty:
+                            break
+                        if raw == "worker_stop":
+                            in_queue.put("worker_stop")
+                            break
+                        raw = _item_from_shm(raw)
+                        if _is_end(raw):
+                            continue
+                        batch.append(raw)
+                    start_time = time.time()
+                    result = worker(batch)
+                    process_time = time.time() - start_time
+                    n_items = len(batch)
+                    input_audio = sum(extract_audio_duration(b) for b in batch)
+                else:
+                    start_time = time.time()
+                    result = worker(item)
+                    process_time = time.time() - start_time
+                    n_items = 1
+                    input_audio = extract_audio_duration(item)
 
                 if result is None:
                     continue
@@ -302,9 +378,9 @@ def _worker_run(
                                     time.sleep(0.01)  # Backoff before retry
                                     continue
                     if timing_dict is not None and worker_id is not None:
-                        items_processed += 1
+                        items_processed += n_items
                         total_process_time += time.time() - start_time
-                        total_audio_duration += extract_audio_duration(item)
+                        total_audio_duration += input_audio
                         if items_processed % 10 == 0:
                             timing_dict[worker_id] = {
                                 "items": items_processed,
@@ -315,16 +391,16 @@ def _worker_run(
                             }
                     continue
 
-                # Handle list/single item results (original behavior)
+                # Handle list/single item results
                 if not isinstance(result, list):
                     result = [result]
 
                 valid_items = [r for r in result if r is not None and not _is_end(r)]
 
                 if timing_dict is not None and worker_id is not None:
-                    items_processed += 1
+                    items_processed += n_items
                     total_process_time += process_time
-                    total_audio_duration += extract_audio_duration(result) or extract_audio_duration(item)
+                    total_audio_duration += extract_audio_duration(result) or input_audio
                     if items_processed % 10 == 0:
                         timing_dict[worker_id] = {
                             "items": items_processed,
@@ -354,8 +430,8 @@ def _worker_run(
             if raise_errors:
                 raise e
 
-    # Flush buffered items via flush() method - workers don't need to handle End
-    if hasattr(worker, "flush") and out_queue:
+    # Flush buffered items via flush() method (skip if worker used custom run)
+    if not _has_custom_run and hasattr(worker, "flush") and out_queue:
         try:
             flushed_items = list(worker.flush())
             if flushed_items:
@@ -421,7 +497,8 @@ def _threaded_worker_run(
     expected_consumers=1,
     upstream_done=None,
     stage_done=None,
-    debug=False,
+    sequential=False,
+    batch_size=0,
 ):
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -451,9 +528,84 @@ def _threaded_worker_run(
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    _has_custom_run = hasattr(worker, "run") and not is_root
+
+    # Inject pull/put for workers with run()
+    if _has_custom_run and in_queue is not None:
+        def _pull(n=batch_size or 1):
+            items = []
+            while len(items) < n and not should_stop.value and not thread_stop.is_set():
+                try:
+                    raw = in_queue.get_nowait()
+                except Empty:
+                    if items:
+                        break  # got partial batch, return it
+                    if upstream_done is not None and upstream_done.is_set():
+                        return []  # truly done
+                    time.sleep(0.01)
+                    continue
+                if raw == "worker_stop":
+                    in_queue.put("worker_stop")
+                    break
+                raw = _item_from_shm(raw)
+                if _is_end(raw):
+                    continue
+                items.append(raw)
+            return items
+        worker.pull = _pull
+
+    if _has_custom_run and out_queue is not None:
+        def _put(item):
+            if item is None:
+                return
+            serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
+            while not should_stop.value and not thread_stop.is_set():
+                try:
+                    out_queue.put(serialized, timeout=0.1)
+                    return
+                except Full:
+                    time.sleep(0.01)
+        worker.put = _put
+
     if hasattr(worker, "load"):
         print(f"Threaded worker {worker_desc} calling load()")
         worker.load()
+
+    # Delegate to custom run() if worker defines it
+    if _has_custom_run:
+        print(f"Threaded worker {worker_desc} using custom run()")
+        if hasattr(worker, "pull"):
+            worker.run()
+        else:
+            worker.run(
+                in_queue=in_queue,
+                out_queue=out_queue,
+                should_stop=should_stop,
+                upstream_done=upstream_done,
+                serialize=lambda item: _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage)),
+                deserialize=lambda raw: None if _is_end(v := _item_from_shm(raw)) else v,
+                timing_dict=timing_dict,
+                worker_id=worker_id,
+                worker_start_wall_time=time.time(),
+            )
+        if stage_end_counter is not None and stage_worker_count is not None:
+            with stage_end_counter.get_lock():
+                stage_end_counter.value += 1
+                finished_workers = stage_end_counter.value
+            current_worker_count = stage_worker_count.value
+            print(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
+            if finished_workers >= current_worker_count:
+                if out_queue is not None:
+                    with contextlib.suppress(Full):
+                        serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
+                        out_queue.put(serialized, timeout=1.0)
+                        print(f"Put End sentinel on queue for {stage_name}")
+                if stage_done is not None:
+                    stage_done.set()
+                    print(f"All workers finished at {stage_name}, signaling downstream")
+        while should_stop is not None and not should_stop.value:
+            time.sleep(0.1)
+        return
 
     worker_start_wall_time = time.time()
 
@@ -472,12 +624,10 @@ def _threaded_worker_run(
                 return sum(s.get("duration", 0.0) for s in obj["segments"])
             return 0.0
         if isinstance(obj, list):
-            return sum(extract_audio_duration(x) for x in obj if x != "end")
+            return sum(extract_audio_duration(x) for x in obj)
         return 0.0
 
     def thread_fn():
-        from queue import Empty
-
         local_items = 0
         local_time = 0.0
         local_audio = 0.0
@@ -582,9 +732,31 @@ def _threaded_worker_run(
                     if _is_end(item):
                         continue
 
-                    start_time = time.time()
-                    result = worker(item)
-                    process_time = time.time() - start_time
+                    if batch_size > 0:
+                        batch = [item]
+                        while len(batch) < batch_size:
+                            try:
+                                raw = in_queue.get_nowait()
+                            except Empty:
+                                break
+                            if raw == "worker_stop":
+                                in_queue.put("worker_stop")
+                                break
+                            raw = _item_from_shm(raw)
+                            if _is_end(raw):
+                                continue
+                            batch.append(raw)
+                        start_time = time.time()
+                        result = worker(batch)
+                        process_time = time.time() - start_time
+                        n_items = len(batch)
+                        input_audio = sum(extract_audio_duration(b) for b in batch)
+                    else:
+                        start_time = time.time()
+                        result = worker(item)
+                        process_time = time.time() - start_time
+                        n_items = 1
+                        input_audio = extract_audio_duration(item)
 
                     if result is None:
                         continue
@@ -605,9 +777,9 @@ def _threaded_worker_run(
                                     except Full:
                                         continue
                         if timing_dict is not None and worker_id is not None:
-                            local_items += 1
+                            local_items += n_items
                             local_time += time.time() - start_time
-                            local_audio += extract_audio_duration(item)
+                            local_audio += input_audio
                             if local_items % 10 == 0:
                                 timing_dict[worker_id] = {
                                     "items": local_items,
@@ -618,16 +790,16 @@ def _threaded_worker_run(
                                 }
                         continue
 
-                    # Handle list/single item results (original behavior)
+                    # Handle list/single item results
                     if not isinstance(result, list):
                         result = [result]
 
                     valid_items = [r for r in result if r is not None and not _is_end(r)]
 
                     if timing_dict is not None and worker_id is not None:
-                        local_items += 1
+                        local_items += n_items
                         local_time += process_time
-                        local_audio += extract_audio_duration(result) or extract_audio_duration(item)
+                        local_audio += extract_audio_duration(result) or input_audio
                         if local_items % 10 == 0:
                             timing_dict[worker_id] = {
                                 "items": local_items,
@@ -775,7 +947,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             pipe_instance.expected_consumers,
             upstream_done,
             stage_done,
-            pipe_instance.debug,
+            pipe_instance.sequential,
+            job.get("batch", 0),
         )
         proc = Process(target=_threaded_worker_run, args=args, daemon=True)
     else:
@@ -797,7 +970,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             pipe_instance.expected_consumers,
             upstream_done,
             stage_done,
-            pipe_instance.debug,
+            pipe_instance.sequential,
+            job.get("batch", 0),
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 

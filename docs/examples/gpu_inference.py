@@ -4,13 +4,13 @@ Pattern: source -> download -> batch -> GPU inference -> save
 """
 
 import torch
-from pipe import Pipe
+from pipe import Pipe, End
 
 
 class ItemSource:
-    """Source stage: returns items one at a time, returns 'end' when done.
+    """Source stage: returns items one at a time, returns End when done.
 
-    Root workers can return 'end' or use generators - framework handles both.
+    Root workers can return End or use generators - framework handles both.
     """
 
     def __init__(self, paths: list[str]):
@@ -19,7 +19,7 @@ class ItemSource:
 
     def __call__(self):
         if self.idx >= len(self.paths):
-            return "end"
+            return End
         item = {"path": self.paths[self.idx], "idx": self.idx}
         self.idx += 1
         return item
