@@ -10,9 +10,8 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
 
-class InstrumentedQueue:
-    """Wraps a mp.Queue to track per-item transit latency."""
 
+class InstrumentedQueue:
     def __init__(self, queue):
         self._queue = queue
         self.items_put = Value('l', 0)
@@ -66,10 +65,15 @@ class InstrumentedQueue:
     def _maxsize(self):
         return self._queue._maxsize
 
-from ._monitors import _autoscaler_thread, _health_monitor_thread, _stats_monitor_thread
-from ._shm import _cleanup_stale_shm, _item_from_shm
+
+def _log(msg):
+    if os.environ.get("PIPE_VERBOSE") == "1":
+        print(msg)
+
+from .monitors import _autoscaler_thread, _collect_stats, _create_progress, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
+from .shm import _cleanup_stale_shm, _item_from_shm
 from .types import End
-from ._workers import (
+from .workers import (
     _check_picklable,
     _is_end,
     _threaded_worker_run,
@@ -109,7 +113,8 @@ class Pipe:
         raise_errors=None,
         health_check_interval=30,
         expected_consumers=1,
-        stats_interval=30,
+        stats_interval=0.2,
+        stats_mode="text",
         allow_full_restart=True,
         autoscale=False,
         max_workers_per_stage=8,
@@ -148,19 +153,15 @@ class Pipe:
         self.stats_monitor_thread = None
         self.stats_monitor_stop_event = threading.Event()
         self.stats_interval = stats_interval
+        self.stats_mode = stats_mode
         self.autoscaler_thread = None
         self.autoscaler_stop_event = threading.Event()
         self.gpus = self._get_gpu_count()
         self.expected_consumers = expected_consumers
 
-        if self.stats_interval > 0:
-            import multiprocessing
-
-            self.manager = multiprocessing.Manager()
-            self.timing_dict = self.manager.dict()
-        else:
-            self.manager = None
-            self.timing_dict = None
+        import multiprocessing
+        self.manager = multiprocessing.Manager()
+        self.timing_dict = self.manager.dict()
 
         self.stage_end_counters = []
         self.stage_worker_counts = []
@@ -170,7 +171,7 @@ class Pipe:
         try:
             if torch.cuda.is_available():
                 return torch.cuda.device_count()
-            print("CUDA not available, pergpu flag will be ignored")
+            _log("CUDA not available, pergpu flag will be ignored")
             return 0
         except Exception as e:
             print(f"Error detecting GPUs: {e}")
@@ -204,14 +205,14 @@ class Pipe:
         if pergpu:
             if gpu_count > 0:
                 actual_workers = workers * gpu_count
-                print(
+                _log(
                     f"Per-GPU mode: {workers} workers per GPU ({actual_workers} total for {gpu_count} GPUs)"
                 )
             else:
                 actual_workers = workers
                 pergpu = False
                 is_gpu_stage = False
-                print(f"No GPUs available, falling back to {workers} CPU workers")
+                _log(f"No GPUs available, falling back to {workers} CPU workers")
         else:
             actual_workers = workers
 
@@ -223,7 +224,7 @@ class Pipe:
         if is_gpu_stage and gpu_count > 0:
             effective_max = min(default_max, gpu_count)
             if effective_max < default_max:
-                print(f"  {stage_name}: max_workers capped at {effective_max} (GPU count)")
+                _log(f"  {stage_name}: max_workers capped at {effective_max} (GPU count)")
         else:
             effective_max = default_max
 
@@ -255,17 +256,17 @@ class Pipe:
         )
 
     def start(self):
-        print(f"Starting pipeline with {len(self.jobs)} jobs")
+        _log(f"Starting pipeline with {len(self.jobs)} jobs")
         self.started = True
 
         if not self.jobs:
             raise ValueError("No workers added to pipeline")
 
         if self.sequential:
-            print("Sequential mode - skipping multiprocessing setup")
+            _log("Sequential mode - skipping multiprocessing setup")
             return self
 
-        print("Setting up multiprocessing...")
+        _log("Setting up multiprocessing...")
 
         for i, job in enumerate(self.jobs):
             outq_size = job.get("outqn") or 0
@@ -384,7 +385,7 @@ class Pipe:
                     if gpu_id is not None:
                         worker_id += f"_gpu_{gpu_id}"
 
-                    print(f"Starting worker process: {stage_name} ({worker_id})")
+                    _log(f"Starting worker process: {stage_name} ({worker_id})")
 
                     args = (
                         job["func"],
@@ -418,10 +419,10 @@ class Pipe:
                     p.start()
                     self.processes.append(p)
                     self.worker_info.append((p, worker_id, stage_name))
-                    print(f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}")
+                    _log(f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}")
 
         if self.health_check_interval > 0:
-            print(f"Starting health monitor (check interval: {self.health_check_interval}s)")
+            _log(f"Starting health monitor (check interval: {self.health_check_interval}s)")
             self.health_monitor_stop_event.clear()
             self.health_monitor_thread = threading.Thread(
                 target=_health_monitor_thread,
@@ -434,11 +435,25 @@ class Pipe:
                 daemon=True,
             )
             self.health_monitor_thread.start()
-            print("Health monitor thread started")
+            _log("Health monitor thread started")
 
-        if self.stats_interval > 0:
+        if self.stats_interval > 0 and self.stats_mode != "external":
+            if self.stats_mode == "text":
+                self.progress = None
+                monitor_fn = _stats_monitor_thread_text
+            else:
+                from rich.console import Console
+                console = Console() if self.stats_mode == "rich" else None
+                self.progress = _create_progress(console)
+                self._stage_task_ids = {}
+                for idx, job in enumerate(self.jobs):
+                    task_id = self.progress.add_task(job["name"], total=None, info="")
+                    self._stage_task_ids[idx] = task_id
+                if self.stats_mode == "rich":
+                    self.progress.start()
+                monitor_fn = _stats_monitor_thread
             self.stats_monitor_thread = threading.Thread(
-                target=_stats_monitor_thread,
+                target=monitor_fn,
                 args=(self, self.stats_monitor_stop_event, self.stats_interval),
                 daemon=True,
             )
@@ -446,7 +461,7 @@ class Pipe:
 
         has_autoscale = any(job.get("autoscale") for job in self.jobs)
         if has_autoscale:
-            print("Starting autoscaler (monitoring queue pressure)")
+            _log("Starting autoscaler (monitoring queue pressure)")
             self.autoscaler_stop_event.clear()
             self.autoscaler_thread = threading.Thread(
                 target=_autoscaler_thread,
@@ -456,6 +471,9 @@ class Pipe:
             self.autoscaler_thread.start()
 
         return self
+
+    def get_stats(self):
+        return _collect_stats(self)
 
     def _restart_worker(self, worker_idx, worker_id):
         if worker_id not in self.worker_configs:
@@ -479,10 +497,10 @@ class Pipe:
                 self.processes[i] = p
                 break
 
-        print(f"Worker {worker_id} restarted with PID {p.pid}")
+        _log(f"Worker {worker_id} restarted with PID {p.pid}")
 
     def _restart_stage(self, stage_idx):
-        print(f"   Restarting stage {stage_idx}...")
+        _log(f"   Restarting stage {stage_idx}...")
 
         stage_workers = []
         for idx, (proc, worker_id, stage_name) in enumerate(self.worker_info):
@@ -529,7 +547,7 @@ class Pipe:
             except Full:
                 break
 
-        print(
+        _log(
             f"   Recreated output queue for stage {stage_idx} (recovered {len(drained_items)} items)"
         )
 
@@ -615,9 +633,9 @@ class Pipe:
                     self.processes[i] = p
                     break
 
-            print(f"   Restarted {worker_id} with PID {p.pid}")
+            _log(f"   Restarted {worker_id} with PID {p.pid}")
 
-        print(f"   Stage {stage_idx} restart complete")
+        _log(f"   Stage {stage_idx} restart complete")
 
     def restart(self, reason="ConnectionError"):
         self._stop(force=True)
@@ -629,7 +647,7 @@ class Pipe:
             self.timing_dict = self.manager.dict()
 
         self.start()
-        print(f"Pipeline restarted due to {reason}")
+        _log(f"Pipeline restarted due to {reason}")
 
     def stop(self, force=False):
         self._stop(force=force)
@@ -638,7 +656,7 @@ class Pipe:
         self.should_stop.value = 1
 
         if self.health_monitor_thread is not None and self.health_monitor_thread.is_alive():
-            print("Stopping health monitor...")
+            _log("Stopping health monitor...")
             try:
                 self.health_monitor_stop_event.set()
                 self.health_monitor_thread.join(timeout=2)
@@ -650,9 +668,13 @@ class Pipe:
             self.stats_monitor_stop_event.set()
             self.stats_monitor_thread.join(timeout=2)
             self.stats_monitor_thread = None
+        if hasattr(self, "progress") and self.progress is not None:
+            if getattr(self, "stats_mode", "rich") == "rich":
+                self.progress.stop()
+            self.progress = None
 
         if force:
-            print("Force stopping all processes...")
+            _log("Force stopping all processes...")
 
             for p in self.processes:
                 if p.is_alive():
@@ -730,7 +752,7 @@ class Pipe:
 
         while True:
             if self.should_stop.value == 2:
-                print("\nWorker encountered connection error - restarting pipeline...")
+                _log("Worker encountered connection error - restarting pipeline...")
                 self.restart(reason="Worker connection error")
                 consecutive_empty = 0
                 continue
@@ -747,7 +769,7 @@ class Pipe:
             except Empty:
                 consecutive_empty += 1
                 if final_done.is_set() and consecutive_empty >= EMPTY_THRESHOLD:
-                    print("Iterator: pipeline complete")
+                    _log("Iterator: pipeline complete")
                     self._stop()
                     return
             except (ConnectionError, FileNotFoundError):
@@ -755,10 +777,10 @@ class Pipe:
                 consecutive_empty = 0
             except KeyboardInterrupt:
                 if self.should_stop.value:
-                    print("\nForce stopping pipeline")
+                    _log("Force stopping pipeline")
                     self._stop(force=True)
                     return
-                print("\nStopping after current items... (Ctrl+C again to force quit)")
+                _log("Stopping after current items... (Ctrl+C again to force quit)")
                 self.should_stop.value = 1
 
     def run(self):
@@ -775,7 +797,7 @@ class Pipe:
             pass
 
     def _sequential_run(self):
-        print("Running in sequential mode")
+        _log("Running in sequential mode")
 
         if not self.jobs:
             return
