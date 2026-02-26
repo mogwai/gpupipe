@@ -96,43 +96,19 @@ def _health_monitor_thread(
     _log("Health monitor shutting down")
 
 
-def _create_progress(console):
-    from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn
-    from rich.progress_bar import ProgressBar
-    from rich.text import Text
-
-    class QueueBarColumn(ProgressColumn):
-        def __init__(self, width=20):
-            self.bar_width = width
-            super().__init__()
-
-        def render(self, task):
-            if task.total is None or task.total == 0:
-                return Text(f"{int(task.completed):>4}", style="dim")
-            fill = task.completed / task.total if task.total > 0 else 0
-            color = "green" if fill > 0.5 else "yellow" if fill > 0.2 else "red"
-            return ProgressBar(
-                total=max(task.total, 1),
-                completed=min(task.completed, task.total),
-                width=self.bar_width,
-                complete_style=color,
-                finished_style=color,
-            )
-
-    class QueueTextColumn(ProgressColumn):
-        def render(self, task):
-            if task.total is None or task.total == 0:
-                return Text("")
-            return Text(f"{int(task.completed)}/{int(task.total)}")
-
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[cyan]{task.description:<16}[/cyan]"),
-        QueueBarColumn(width=20),
-        QueueTextColumn(),
-        TextColumn("{task.fields[info]}"),
-        console=console,
-    )
+def _queue_bar(qsize, qmax, width=10):
+    if not qmax:
+        return ""
+    fill = qsize / qmax if qmax > 0 else 0
+    filled = int(fill * width)
+    bar = "|" * filled + " " * (width - filled)
+    if fill >= 0.8:
+        color = "red"
+    elif fill >= 0.5:
+        color = "yellow"
+    else:
+        color = "green"
+    return f"[{color}]\\[{bar}][/{color}] {qsize}/{qmax}"
 
 
 def _collect_stats(pipe_instance):
@@ -209,32 +185,67 @@ def _collect_stats(pipe_instance):
 
 
 def _stats_monitor_thread(pipe_instance, stop_event, interval_seconds=30):
-    progress = pipe_instance.progress
+    from rich.live import Live
+    from rich.table import Table
 
-    while not stop_event.is_set():
-        stop_event.wait(interval_seconds)
-        if stop_event.is_set():
-            break
+    console = pipe_instance._rich_console
+    prev_snapshot = {}
+    rates = {}
+    EMA_ALPHA = 0.3
 
-        if not pipe_instance.timing_dict:
-            continue
+    def build_table():
+        all_stats = _collect_stats(pipe_instance)
+        now = time.time()
+        any_audio = any(s["has_audio"] for s in all_stats)
 
-        for s in _collect_stats(pipe_instance):
-            task_id = pipe_instance._stage_task_ids.get(s["stage_idx"])
-            if task_id is None:
+        table = Table(show_header=True, show_edge=False, pad_edge=False, box=None)
+        table.add_column("Stage", style="cyan", min_width=14)
+        table.add_column("Items", justify="right", min_width=8)
+        table.add_column("Rate", justify="right", min_width=8)
+        table.add_column("Queue", min_width=18)
+        table.add_column("Wkrs", justify="right", min_width=6)
+        if any_audio:
+            table.add_column("RTF", justify="right", min_width=10)
+
+        for s in all_stats:
+            if s["done"]:
                 continue
+            idx = s["stage_idx"]
+            items = s["items"]
 
-            info_parts = [f"{s['items']} items", f"{s['active']}/{s['total_workers']} wkrs"]
-            if s["has_audio"]:
-                info_parts.append(f"{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
+            prev_time, prev_items = prev_snapshot.get(idx, (now, items))
+            dt = now - prev_time
+            if dt > 0 and prev_time != now:
+                instant_rate = (items - prev_items) / dt
+                old_rate = rates.get(idx, instant_rate)
+                rates[idx] = EMA_ALPHA * instant_rate + (1 - EMA_ALPHA) * old_rate
+            prev_snapshot[idx] = (now, items)
 
-            progress.update(
-                task_id,
-                completed=s["qsize"],
-                total=s["qmax"] if s["qmax"] > 0 else None,
-                info="  ".join(info_parts),
-                visible=not s["done"],
-            )
+            rate = rates.get(idx, 0)
+            name = pipe_instance.jobs[idx]["name"]
+            items_str = f"{items:,}"
+            rate_str = f"{rate:,.0f}/s" if rate > 0 else ""
+            queue_str = _queue_bar(s["qsize"], s["qmax"])
+            wkrs_str = f"{s['active']}/{s['total_workers']}"
+
+            row = [name, items_str, rate_str, queue_str, wkrs_str]
+            if any_audio:
+                if s["has_audio"]:
+                    row.append(f"{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
+                else:
+                    row.append("")
+            table.add_row(*row)
+
+        return table
+
+    with Live(build_table(), console=console, refresh_per_second=4) as live:
+        while not stop_event.is_set():
+            stop_event.wait(interval_seconds)
+            if stop_event.is_set():
+                break
+            if not pipe_instance.timing_dict:
+                continue
+            live.update(build_table())
 
 
 def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
