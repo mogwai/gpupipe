@@ -71,6 +71,7 @@ def _log(msg):
         print(msg)
 
 from .monitors import _autoscaler_thread, _collect_stats, _create_progress, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
+from .profiling import _profile_dir, _profiled_worker, print_profile_summary
 from .shm import _cleanup_stale_shm, _item_from_shm
 from .types import End
 from .workers import (
@@ -120,6 +121,7 @@ class Pipe:
         max_workers_per_stage=8,
         use_shm=False,
         output_shm=False,
+        profile=False,
     ):
         # Set env vars for shm control (inherited by spawned workers)
         if not use_shm:
@@ -156,6 +158,9 @@ class Pipe:
         self.stats_mode = stats_mode
         self.autoscaler_thread = None
         self.autoscaler_stop_event = threading.Event()
+        self.profile = profile
+        self.profile_dir = None
+        self.profile_rss = {}
         self.gpus = self._get_gpu_count()
         self.expected_consumers = expected_consumers
 
@@ -255,6 +260,20 @@ class Pipe:
             }
         )
 
+    def _spawn(self, target, args, worker_id):
+        if self.profile:
+            from multiprocessing import Value as MpValue
+            rss_val = MpValue("l", 0)
+            self.profile_rss[worker_id] = rss_val
+            p = mp.Process(
+                target=_profiled_worker,
+                args=(target, args, self.profile_dir, worker_id, rss_val),
+            )
+        else:
+            p = mp.Process(target=target, args=args)
+        p.start()
+        return p
+
     def start(self):
         _log(f"Starting pipeline with {len(self.jobs)} jobs")
         self.started = True
@@ -265,6 +284,10 @@ class Pipe:
         if self.sequential:
             _log("Sequential mode - skipping multiprocessing setup")
             return self
+
+        if self.profile:
+            self.profile_dir = _profile_dir()
+            print(f"Profiling enabled, saving to {self.profile_dir}")
 
         _log("Setting up multiprocessing...")
 
@@ -334,8 +357,7 @@ class Pipe:
                             "stage_name": stage_name,
                         }
 
-                        p = mp.Process(target=_threaded_worker_run, args=args)
-                        p.start()
+                        p = self._spawn(_threaded_worker_run, args, worker_id)
                         self.processes.append(p)
                         self.worker_info.append((p, worker_id, stage_name))
                 else:
@@ -371,8 +393,7 @@ class Pipe:
                         "stage_name": stage_name,
                     }
 
-                    p = mp.Process(target=_threaded_worker_run, args=args)
-                    p.start()
+                    p = self._spawn(_threaded_worker_run, args, worker_id)
                     self.processes.append(p)
                     self.worker_info.append((p, worker_id, stage_name))
             else:
@@ -415,8 +436,7 @@ class Pipe:
                         "stage_name": stage_name,
                     }
 
-                    p = mp.Process(target=_worker_run, args=args)
-                    p.start()
+                    p = self._spawn(_worker_run, args, worker_id)
                     self.processes.append(p)
                     self.worker_info.append((p, worker_id, stage_name))
                     _log(f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}")
@@ -725,10 +745,17 @@ class Pipe:
             except Exception as e:
                 print(f"Error closing queue: {e}")
 
+        if self.profile and self.profile_dir and self.worker_info:
+            rss_resolved = {}
+            for wid, val in self.profile_rss.items():
+                rss_resolved[wid] = val.value
+            print_profile_summary(self.profile_dir, rss_resolved, self.worker_info)
+
         self.processes = []
         self.queues = []
         self.worker_info = []
         self.worker_configs = {}
+        self.profile_rss = {}
         self.working.value = 0
         self.should_stop.value = 0
         self.restart_needed.value = 0
