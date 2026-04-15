@@ -304,10 +304,6 @@ def _worker_run(
                     break
 
             else:
-                if out_queue is not None and out_queue.full():
-                    time.sleep(0.01)  # 10ms backoff when downstream is full
-                    continue
-
                 try:
                     item = in_queue.get(timeout=0.1)
                     consecutive_empty = 0
@@ -337,11 +333,17 @@ def _worker_run(
 
                 if batch_size > 0:
                     batch = [item]
+                    deadline = time.monotonic() + 0.05
                     while len(batch) < batch_size:
-                        try:
-                            raw = in_queue.get_nowait()
-                        except Empty:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
                             break
+                        try:
+                            raw = in_queue.get(timeout=min(remaining, 0.01))
+                        except Empty:
+                            if time.monotonic() >= deadline:
+                                break
+                            continue
                         if raw == "worker_stop":
                             in_queue.put("worker_stop")
                             break
@@ -702,10 +704,6 @@ def _threaded_worker_run(
                         thread_stop.set()
                         return
                 else:
-                    if out_queue is not None and out_queue.full():
-                        time.sleep(0.01)  # 10ms backoff when downstream is full
-                        continue
-
                     try:
                         item = in_queue.get(timeout=0.1)
                         consecutive_empty = 0
@@ -738,11 +736,17 @@ def _threaded_worker_run(
 
                     if batch_size > 0:
                         batch = [item]
+                        deadline = time.monotonic() + 0.05
                         while len(batch) < batch_size:
-                            try:
-                                raw = in_queue.get_nowait()
-                            except Empty:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
                                 break
+                            try:
+                                raw = in_queue.get(timeout=min(remaining, 0.01))
+                            except Empty:
+                                if time.monotonic() >= deadline:
+                                    break
+                                continue
                             if raw == "worker_stop":
                                 in_queue.put("worker_stop")
                                 break
