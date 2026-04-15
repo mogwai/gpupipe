@@ -4,7 +4,7 @@ import hashlib
 import random
 import time
 
-from pipe import Pipe, End
+from pipe import End, Pipe
 
 
 class AudioGenerator:
@@ -87,6 +87,7 @@ if __name__ == "__main__":
     pipe = Pipe(
         debug=False,
         stats_interval=0.2,
+        stats_mode="rich",
         health_check_interval=0,
         autoscale=True,
         max_workers_per_stage=6,

@@ -70,7 +70,7 @@ def _log(msg):
     if os.environ.get("PIPE_VERBOSE") == "1":
         print(msg)
 
-from .monitors import _autoscaler_thread, _collect_stats, _create_progress, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
+from .monitors import _autoscaler_thread, _collect_stats, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
 from .profiling import _profile_dir, _profiled_worker, print_profile_summary
 from .shm import _cleanup_stale_shm, _item_from_shm
 from .types import End
@@ -463,14 +463,8 @@ class Pipe:
                 monitor_fn = _stats_monitor_thread_text
             else:
                 from rich.console import Console
-                console = Console() if self.stats_mode == "rich" else None
-                self.progress = _create_progress(console)
-                self._stage_task_ids = {}
-                for idx, job in enumerate(self.jobs):
-                    task_id = self.progress.add_task(job["name"], total=None, info="")
-                    self._stage_task_ids[idx] = task_id
-                if self.stats_mode == "rich":
-                    self.progress.start()
+                self._rich_console = Console()
+                self.progress = None
                 monitor_fn = _stats_monitor_thread
             self.stats_monitor_thread = threading.Thread(
                 target=monitor_fn,
@@ -688,10 +682,7 @@ class Pipe:
             self.stats_monitor_stop_event.set()
             self.stats_monitor_thread.join(timeout=2)
             self.stats_monitor_thread = None
-        if hasattr(self, "progress") and self.progress is not None:
-            if getattr(self, "stats_mode", "rich") == "rich":
-                self.progress.stop()
-            self.progress = None
+        self.progress = None
 
         if force:
             _log("Force stopping all processes...")
