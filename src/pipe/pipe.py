@@ -150,6 +150,7 @@ class Pipe:
         self.working = Value("i", 0)
         self.should_stop = Value("i", 0)
         self.restart_needed = Value("i", 0)
+        self.drain_event = Event()
         self.health_monitor_thread = None
         self.health_monitor_stop_event = threading.Event()
         self.stats_monitor_thread = None
@@ -349,6 +350,7 @@ class Pipe:
                             stage_done,
                             self.sequential,
                             job.get("batch", 0),
+                            self.drain_event,
                         )
 
                         self.worker_configs[worker_id] = {
@@ -385,6 +387,7 @@ class Pipe:
                         stage_done,
                         self.sequential,
                         job.get("batch", 0),
+                        self.drain_event,
                     )
 
                     self.worker_configs[worker_id] = {
@@ -428,6 +431,7 @@ class Pipe:
                         stage_done,
                         self.sequential,
                         job.get("batch", 0),
+                        self.drain_event,
                     )
 
                     self.worker_configs[worker_id] = {
@@ -612,6 +616,7 @@ class Pipe:
                     stage_done,
                     self.sequential,
                     job.get("batch", 0),
+                    self.drain_event,
                 )
             else:
                 new_args = (
@@ -634,6 +639,7 @@ class Pipe:
                     stage_done,
                     self.sequential,
                     job.get("batch", 0),
+                    self.drain_event,
                 )
 
             config["args"] = new_args
@@ -750,6 +756,7 @@ class Pipe:
         self.working.value = 0
         self.should_stop.value = 0
         self.restart_needed.value = 0
+        self.drain_event.clear()
 
         for counter in self.stage_end_counters:
             counter.value = 0
@@ -794,12 +801,12 @@ class Pipe:
                 self.restart()
                 consecutive_empty = 0
             except KeyboardInterrupt:
-                if self.should_stop.value:
+                if self.drain_event.is_set():
                     _log("Force stopping pipeline")
                     self._stop(force=True)
                     return
-                _log("Stopping after current items... (Ctrl+C again to force quit)")
-                self.should_stop.value = 1
+                _log("Draining pipeline... (Ctrl+C again to force quit)")
+                self.drain_event.set()
 
     def run(self):
         count = 0
