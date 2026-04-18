@@ -104,6 +104,7 @@ def _worker_run(
     stage_done=None,
     sequential=False,
     batch_size=0,
+    drain_event=None,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -128,7 +129,7 @@ def _worker_run(
         should_stop.value = 1
 
     signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     _has_custom_run = hasattr(worker, "run") and not is_root
 
@@ -229,6 +230,9 @@ def _worker_run(
             if should_stop.value == 1:
                 break
 
+            if is_root and drain_event is not None and drain_event.is_set():
+                break
+
             if is_root:
                 start_time = time.time()
                 result = worker()
@@ -240,7 +244,7 @@ def _worker_run(
                 # Handle generator results - iterate and emit items one by one
                 if inspect.isgenerator(result):
                     for gen_item in result:
-                        if should_stop.value:
+                        if should_stop.value or (drain_event is not None and drain_event.is_set()):
                             break
                         if gen_item is None or _is_end(gen_item):
                             continue
@@ -505,6 +509,7 @@ def _threaded_worker_run(
     stage_done=None,
     sequential=False,
     batch_size=0,
+    drain_event=None,
 ):
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -532,7 +537,7 @@ def _threaded_worker_run(
         thread_stop.set()
 
     signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     _has_custom_run = hasattr(worker, "run") and not is_root
 
@@ -642,6 +647,8 @@ def _threaded_worker_run(
 
         while not should_stop.value and not thread_stop.is_set():
             try:
+                if is_root and drain_event is not None and drain_event.is_set():
+                    return
                 if is_root:
                     start_time = time.time()
                     result = worker()
@@ -653,7 +660,7 @@ def _threaded_worker_run(
                     # Handle generator results
                     if inspect.isgenerator(result):
                         for gen_item in result:
-                            if should_stop.value or thread_stop.is_set():
+                            if should_stop.value or thread_stop.is_set() or (drain_event is not None and drain_event.is_set()):
                                 break
                             if gen_item is None or _is_end(gen_item):
                                 continue
@@ -957,6 +964,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             stage_done,
             pipe_instance.sequential,
             job.get("batch", 0),
+            pipe_instance.drain_event,
         )
         proc = Process(target=_threaded_worker_run, args=args, daemon=True)
     else:
@@ -980,6 +988,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             stage_done,
             pipe_instance.sequential,
             job.get("batch", 0),
+            pipe_instance.drain_event,
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 
