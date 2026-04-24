@@ -805,7 +805,7 @@ class Pipe:
                     _log("Force stopping pipeline")
                     self._stop(force=True)
                     return
-                _log("Draining pipeline... (Ctrl+C again to force quit)")
+                _log("Starting to drain... (Ctrl+C again to force stop)")
                 self.drain_event.set()
 
     def run(self):
