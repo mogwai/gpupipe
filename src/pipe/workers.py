@@ -162,7 +162,7 @@ def _worker_run(
             if item is None:
                 return
             serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-            while not should_stop.value:
+            while True:
                 try:
                     out_queue.put(serialized, timeout=0.1)
                     return
@@ -253,7 +253,7 @@ def _worker_run(
                             total_audio_duration += extract_audio_duration(gen_item)
                         if out_queue:
                             serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                            while not should_stop.value:
+                            while True:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
                                     break
@@ -296,7 +296,7 @@ def _worker_run(
                 if out_queue:
                     for item in valid_items:
                         serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                        while not should_stop.value:
+                        while True:
                             try:
                                 out_queue.put(serialized, timeout=0.1)
                                 break
@@ -381,7 +381,7 @@ def _worker_run(
                         gen_count += 1
                         if out_queue:
                             serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                            while not should_stop.value:
+                            while True:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
                                     break
@@ -424,7 +424,7 @@ def _worker_run(
                 if out_queue:
                     for out_item in valid_items:
                         serialized = _item_to_shm(out_item, skip=_skip_shm_for_output(is_final_stage))
-                        while not should_stop.value:
+                        while True:
                             try:
                                 out_queue.put(serialized, timeout=0.1)
                                 break
@@ -449,7 +449,7 @@ def _worker_run(
                 for item in flushed_items:
                     if item is not None:
                         serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                        while not should_stop.value:
+                        while True:
                             try:
                                 out_queue.put(serialized, timeout=0.1)
                                 break
@@ -570,7 +570,7 @@ def _threaded_worker_run(
             if item is None:
                 return
             serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-            while not should_stop.value and not thread_stop.is_set():
+            while True:
                 try:
                     out_queue.put(serialized, timeout=0.1)
                     return
@@ -669,7 +669,7 @@ def _threaded_worker_run(
                                 local_audio += extract_audio_duration(gen_item)
                             if out_queue:
                                 serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                                while not should_stop.value and not thread_stop.is_set():
+                                while True:
                                     try:
                                         out_queue.put(serialized, timeout=0.1)
                                         break
@@ -699,7 +699,7 @@ def _threaded_worker_run(
                     if out_queue:
                         for item in valid_items:
                             serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                            while not should_stop.value and not thread_stop.is_set():
+                            while True:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
                                     break
@@ -785,7 +785,7 @@ def _threaded_worker_run(
                                 continue
                             if out_queue:
                                 serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                                while not should_stop.value and not thread_stop.is_set():
+                                while True:
                                     try:
                                         out_queue.put(serialized, timeout=0.1)
                                         break
@@ -827,7 +827,7 @@ def _threaded_worker_run(
                     if out_queue:
                         for out_item in valid_items:
                             serialized = _item_to_shm(out_item, skip=_skip_shm_for_output(is_final_stage))
-                            while not should_stop.value:
+                            while True:
                                 try:
                                     out_queue.put(serialized, timeout=0.1)
                                     break

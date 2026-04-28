@@ -1,5 +1,6 @@
 """Test drain mode: first Ctrl+C drains queues, second force-stops."""
 import time
+from queue import Empty
 from pipe import Pipe, End
 
 
@@ -19,6 +20,28 @@ class SlowRoot:
 class Double:
     def __call__(self, x):
         return x * 2
+
+
+class FastSeqRoot:
+    """Emits sequential ints 1..n so we can detect missing items."""
+    def __init__(self, n=80):
+        self.i = 0
+        self.n = n
+
+    def __call__(self):
+        self.i += 1
+        if self.i > self.n:
+            return End
+        return self.i
+
+
+class SlowSink:
+    def __init__(self, delay=0.03):
+        self.delay = delay
+
+    def __call__(self, x):
+        time.sleep(self.delay)
+        return x
 
 
 def test_drain_stops_root_but_drains_queue():
@@ -64,5 +87,67 @@ def test_normal_completion_still_works():
     assert len(results) == 30, f"Expected 30, got {len(results)}"
     assert all(r % 2 == 0 for r in results)
     print("PASS: normal completion works")
+
+
+def test_should_stop_does_not_drop_inflight_put():
+    """Regression: a worker mid out_queue.put retry must commit its item when
+    should_stop=1 is set, not silently drop it.
+
+    Setup: single root stage with tiny outqn=2 and NO consumer. After start,
+    the root emits 2 items (queue fills) and blocks in the put-retry loop on
+    item 3. We set should_stop=1, wait long enough for the put timeout (0.1s)
+    to fire and the loop to re-check should_stop, then drain the queue.
+
+    With the bug: item 3 is dropped (we get only [1, 2]).
+    With the fix: item 3 stays in the put loop until we drain item 1 or 2,
+    then lands in the queue (we get [1, 2, 3]).
+    """
+    from pipe.shm import _item_from_shm
+
+    p = Pipe(sequential=False, stats_interval=0, health_check_interval=0)
+    p.add(FastSeqRoot(n=20), workers=1, outqn=2)
+    p.start()
+
+    # Wait for spawn (~2s) and root to fill its queue + block in put-retry on item 3.
+    time.sleep(3.0)
+
+    # Signal graceful stop. Without the fix, the put-retry loop will exit on
+    # its next iteration (after the 0.1s put timeout) and drop the in-flight item.
+    p.should_stop.value = 1
+
+    # Wait LONGER than the put timeout (0.1s) so the buggy loop has time to
+    # observe should_stop and drop. With the fix, the loop keeps retrying.
+    time.sleep(0.5)
+
+    # Now drain the queue. As we pull, free space lets the (still-blocked-with-fix)
+    # put loop deliver its in-flight item.
+    results = []
+    raws = []
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            raw = p.queues[-1].get(timeout=0.3)
+        except Empty:
+            if all(not proc.is_alive() for proc in p.processes):
+                break
+            continue
+        raws.append(repr(raw)[:80])
+        item = _item_from_shm(raw)
+        if item is End or item is None:
+            continue
+        results.append(item)
+        if len(results) >= 3:
+            # We only need to verify item 3 made it through.
+            break
+    alive_after = [p.is_alive() for p in p.processes]
+    p._stop(force=True)
+
+    ids = sorted(r for r in results if isinstance(r, int))
+    assert ids, f"no items delivered. raws={raws}, alive_after={alive_after}"
+    # With outqn=2 the queue will have held items 1 and 2; item 3 was the one
+    # blocked in put-retry. If 3 is missing, the in-flight item was dropped.
+    assert 1 in ids and 2 in ids, f"queue should have held items 1,2; got {ids}"
+    assert 3 in ids, f"in-flight item 3 was dropped from put-retry; got {ids}"
+    print(f"PASS: items {ids} delivered, in-flight item 3 not dropped")
 
 
