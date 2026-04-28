@@ -2,6 +2,7 @@ import contextlib
 import inspect
 import os
 from queue import Empty, Full
+import signal
 import threading
 import time
 
@@ -771,42 +772,58 @@ class Pipe:
             yield from self._sequential_run()
             return
 
-        final_done = self.stage_done_events[-1]
-        consecutive_empty = 0
-        EMPTY_THRESHOLD = 5
+        # Catch the first Ctrl+C at the OS level so it drains regardless of
+        # whether Python is currently in pipe code or in the user's loop body.
+        # The default handler is restored after one hit, so a second Ctrl+C
+        # raises KeyboardInterrupt as usual and the iterator force-stops below.
+        prev_handler = None
+        is_main_thread = threading.current_thread() is threading.main_thread()
+        if is_main_thread:
+            def _drain_on_sigint(signum, frame):
+                signal.signal(signal.SIGINT, prev_handler if prev_handler is not None else signal.SIG_DFL)
+                self.drain_event.set()
+                print("Starting to drain... (Ctrl+C again to force stop)", flush=True)
+            prev_handler = signal.signal(signal.SIGINT, _drain_on_sigint)
 
-        while True:
-            if self.should_stop.value == 2:
-                _log("Worker encountered connection error - restarting pipeline...")
-                self.restart(reason="Worker connection error")
-                consecutive_empty = 0
-                continue
+        try:
+            final_done = self.stage_done_events[-1]
+            consecutive_empty = 0
+            EMPTY_THRESHOLD = 5
 
-            try:
-                item = self.queues[-1].get(timeout=0.1)
-                consecutive_empty = 0
-                item = _item_from_shm(item)
-
-                if _is_end(item):
+            while True:
+                if self.should_stop.value == 2:
+                    _log("Worker encountered connection error - restarting pipeline...")
+                    self.restart(reason="Worker connection error")
+                    consecutive_empty = 0
                     continue
 
-                yield item
-            except Empty:
-                consecutive_empty += 1
-                if final_done.is_set() and consecutive_empty >= EMPTY_THRESHOLD:
-                    _log("Iterator: pipeline complete")
-                    self._stop()
-                    return
-            except (ConnectionError, FileNotFoundError):
-                self.restart()
-                consecutive_empty = 0
-            except KeyboardInterrupt:
-                if self.drain_event.is_set():
+                try:
+                    item = self.queues[-1].get(timeout=0.1)
+                    consecutive_empty = 0
+                    item = _item_from_shm(item)
+
+                    if _is_end(item):
+                        continue
+
+                    yield item
+                except Empty:
+                    consecutive_empty += 1
+                    if final_done.is_set() and consecutive_empty >= EMPTY_THRESHOLD:
+                        _log("Iterator: pipeline complete")
+                        self._stop()
+                        return
+                except (ConnectionError, FileNotFoundError):
+                    self.restart()
+                    consecutive_empty = 0
+                except KeyboardInterrupt:
+                    # Second Ctrl+C: default handler restored, KeyboardInterrupt fired.
                     _log("Force stopping pipeline")
                     self._stop(force=True)
                     return
-                _log("Starting to drain... (Ctrl+C again to force stop)")
-                self.drain_event.set()
+        finally:
+            if is_main_thread and prev_handler is not None:
+                with contextlib.suppress(Exception):
+                    signal.signal(signal.SIGINT, prev_handler)
 
     def run(self):
         count = 0
