@@ -89,6 +89,67 @@ def test_normal_completion_still_works():
     print("PASS: normal completion works")
 
 
+def test_drain_param_rejects_gap():
+    """drain=False stages must form a contiguous prefix from stage 0."""
+    p = Pipe(sequential=False, stats_interval=0, health_check_interval=0)
+    p.add(SlowRoot(n=10))                  # auto drain=False (stage 0)
+    p.add(Double(), drain=True)            # stage 1
+    p.add(Double(), drain=True)            # stage 2
+    p.add(Double(), drain=False)           # stage 3 — gap, should reject
+
+    raised = False
+    try:
+        p.start()
+    except ValueError as e:
+        raised = True
+        assert "contiguous prefix" in str(e), f"unexpected msg: {e}"
+    finally:
+        try: p._stop(force=True)
+        except Exception: pass
+    assert raised, "expected ValueError for non-contiguous drain=False prefix"
+    print("PASS: drain=False gap rejected")
+
+
+def test_drain_param_accepts_contiguous_prefix():
+    """drain=False on stages 0,1,2 then drain=True after is allowed."""
+    p = Pipe(sequential=False, stats_interval=0, health_check_interval=0)
+    p.add(SlowRoot(n=5))                   # stage 0 auto False
+    p.add(Double(), drain=False)           # stage 1
+    p.add(Double(), drain=False)           # stage 2
+    p.add(Double(), drain=True)            # stage 3
+
+    results = list(p)
+    # 5 items, doubled 3 times = original * 8
+    assert len(results) == 5, f"expected 5, got {len(results)}"
+    assert sorted(results) == [8, 16, 24, 32, 40], f"got {sorted(results)}"
+    print("PASS: contiguous prefix accepted, normal run completes")
+
+
+def test_drain_false_middle_stops_on_drain():
+    """When drain triggers, drain=False middle stages stop reading new items.
+    Items already past those stages should still complete via the drain=True tail.
+    """
+    p = Pipe(sequential=False, stats_interval=0, health_check_interval=0)
+    p.add(SlowRoot(n=200), workers=1, outqn=50)
+    p.add(Double(), workers=1, outqn=50, drain=False)  # stage 1: stops on drain
+    p.add(SlowSink(delay=0.01), workers=2, outqn=50)   # stage 2: drains in-flight
+    p.start()
+
+    results = []
+    for item in p:
+        results.append(item)
+        if len(results) == 3:
+            p.drain_event.set()
+
+    # Stage 1 stops shortly after drain. Stage 2 finishes whatever stage 1 already
+    # delivered. So we should have a small number of items, well under 200.
+    assert len(results) >= 3, f"got only {len(results)}"
+    assert len(results) < 200, f"drain didn't stop stage 1: got {len(results)}"
+    for r in results:
+        assert r % 2 == 0
+    print(f"PASS: drain=False middle stage stopped, got {len(results)} items")
+
+
 def test_should_stop_does_not_drop_inflight_put():
     """Regression: a worker mid out_queue.put retry must commit its item when
     should_stop=1 is set, not silently drop it.

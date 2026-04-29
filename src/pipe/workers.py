@@ -105,6 +105,7 @@ def _worker_run(
     sequential=False,
     batch_size=0,
     drain_event=None,
+    drain=True,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -230,7 +231,7 @@ def _worker_run(
             if should_stop.value == 1:
                 break
 
-            if is_root and drain_event is not None and drain_event.is_set():
+            if (not drain) and drain_event is not None and drain_event.is_set():
                 break
 
             if is_root:
@@ -510,6 +511,7 @@ def _threaded_worker_run(
     sequential=False,
     batch_size=0,
     drain_event=None,
+    drain=True,
 ):
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -647,7 +649,7 @@ def _threaded_worker_run(
 
         while not should_stop.value and not thread_stop.is_set():
             try:
-                if is_root and drain_event is not None and drain_event.is_set():
+                if (not drain) and drain_event is not None and drain_event.is_set():
                     return
                 if is_root:
                     start_time = time.time()
@@ -965,6 +967,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             pipe_instance.sequential,
             job.get("batch", 0),
             pipe_instance.drain_event,
+            job.get("drain", True),
         )
         proc = Process(target=_threaded_worker_run, args=args, daemon=True)
     else:
@@ -989,6 +992,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             pipe_instance.sequential,
             job.get("batch", 0),
             pipe_instance.drain_event,
+            job.get("drain", True),
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 

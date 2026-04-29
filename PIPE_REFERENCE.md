@@ -222,6 +222,8 @@ pipe.add(worker,
     autoscale=True,     # enable autoscaling for this stage
     min_workers=1,      # autoscale floor (won't scale below)
     max_workers=8,      # autoscale ceiling (won't scale above)
+    drain=True,         # on Ctrl+C: True=finish in-flight items, False=stop immediately
+                        # (drain=False stages must form a contiguous prefix from stage 0)
 )
 ```
 

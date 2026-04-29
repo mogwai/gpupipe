@@ -196,6 +196,7 @@ class Pipe:
         min_workers=None,
         max_workers=None,
         batch=0,
+        drain=True,
     ):
         if hasattr(func, "__name__"):
             stage_name = func.__name__
@@ -259,6 +260,7 @@ class Pipe:
                 "max_workers": effective_max,
                 "min_workers": min_workers if min_workers is not None else 1,
                 "batch": batch,
+                "drain": drain,
             }
         )
 
@@ -282,6 +284,19 @@ class Pipe:
 
         if not self.jobs:
             raise ValueError("No workers added to pipeline")
+
+        # Stage 0 has no input queue, so it always stops on drain.
+        self.jobs[0]["drain"] = False
+        # drain=False stages must form a contiguous prefix (e.g. 0,1,2 — not 0,3).
+        seen_drain = False
+        for i, job in enumerate(self.jobs):
+            if job["drain"]:
+                seen_drain = True
+            elif seen_drain:
+                raise ValueError(
+                    f"Stage {i} ({job['name']}) has drain=False but an earlier stage has drain=True. "
+                    "drain=False stages must form a contiguous prefix from stage 0."
+                )
 
         if self.sequential:
             _log("Sequential mode - skipping multiprocessing setup")
@@ -352,6 +367,7 @@ class Pipe:
                             self.sequential,
                             job.get("batch", 0),
                             self.drain_event,
+                            job.get("drain", True),
                         )
 
                         self.worker_configs[worker_id] = {
@@ -389,6 +405,7 @@ class Pipe:
                         self.sequential,
                         job.get("batch", 0),
                         self.drain_event,
+                        job.get("drain", True),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -433,6 +450,7 @@ class Pipe:
                         self.sequential,
                         job.get("batch", 0),
                         self.drain_event,
+                        job.get("drain", True),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -618,6 +636,7 @@ class Pipe:
                     self.sequential,
                     job.get("batch", 0),
                     self.drain_event,
+                    job.get("drain", True),
                 )
             else:
                 new_args = (
@@ -641,6 +660,7 @@ class Pipe:
                     self.sequential,
                     job.get("batch", 0),
                     self.drain_event,
+                    job.get("drain", True),
                 )
 
             config["args"] = new_args
@@ -782,7 +802,15 @@ class Pipe:
             def _drain_on_sigint(signum, frame):
                 signal.signal(signal.SIGINT, prev_handler if prev_handler is not None else signal.SIG_DFL)
                 self.drain_event.set()
-                print("Starting to drain... (Ctrl+C again to force stop)", flush=True)
+                stopped = [j["name"] for j in self.jobs if not j.get("drain", True)]
+                stopped_str = ", ".join(stopped) if stopped else "root"
+                in_flight = sum(q.qsize() for q in self.queues)
+                print(
+                    f"Starting to drain... {stopped_str} stopped (their inputs are not drained); "
+                    f"finishing ~{in_flight} items already in the pipeline. "
+                    "(Ctrl+C again to force stop)",
+                    flush=True,
+                )
             prev_handler = signal.signal(signal.SIGINT, _drain_on_sigint)
 
         try:
