@@ -915,8 +915,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
     else:
         stage_name = str(type(func).__name__)
 
-    current_count = pipe_instance.stage_worker_counts[stage_idx].value
-    new_worker_idx = current_count
+    new_worker_idx = pipe_instance.stage_spawn_counts[stage_idx]
+    pipe_instance.stage_spawn_counts[stage_idx] += 1
     worker_id = f"stage_{stage_idx}_worker_{new_worker_idx}"
 
     _log(f"Autoscaling: Adding worker {new_worker_idx + 1} to {stage_name} (stage {stage_idx})")

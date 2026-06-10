@@ -199,6 +199,17 @@ class Pipe:
 
         _check_picklable(func, stage_name, is_thread=thread)
 
+        is_root_stage = len(self.jobs) == 0
+        if is_root_stage and (workers > 1 or pergpu):
+            print(
+                f"WARNING: root stage '{stage_name}' requested multiple workers "
+                f"(workers={workers}, pergpu={pergpu}); clamping to 1. Each root worker "
+                f"runs the source independently and would duplicate the entire stream. "
+                f"Parallelize a downstream stage instead, or shard the source externally."
+            )
+            workers = 1
+            pergpu = False
+
         gpu_count = self.gpus
         is_gpu_stage = pergpu or gpu_id is not None
 
@@ -230,12 +241,19 @@ class Pipe:
 
         if is_gpu_stage:
             stage_autoscale = False
+        elif thread:
+            # The autoscaler scales by spawning whole processes; a threaded stage is
+            # one process running N threads, so that model doesn't apply. Threaded
+            # stages already parallelize internally via their thread pool.
+            if autoscale:
+                _log(f"  {stage_name}: autoscale disabled for threaded stage")
+            stage_autoscale = False
         elif autoscale is not None:
             stage_autoscale = autoscale
         else:
             stage_autoscale = self.autoscale
 
-        if max_workers is None and self.autoscale and not is_gpu_stage:
+        if max_workers is None and stage_autoscale and not is_gpu_stage:
             effective_max = self.max_workers_per_stage
 
         self.jobs.append(
@@ -267,6 +285,11 @@ class Pipe:
             return self
 
         _log("Setting up multiprocessing...")
+
+        # Monotonic per-stage id allocator for autoscaled workers. Never reuses an
+        # index (unlike the live stage_worker_counts, which is decremented on
+        # scale-down) so spawned workers can't collide with a still-live worker id.
+        self.stage_spawn_counts = [job["num_workers"] for job in self.jobs]
 
         for i, job in enumerate(self.jobs):
             outq_size = job.get("outqn") or 0

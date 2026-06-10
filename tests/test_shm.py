@@ -351,3 +351,24 @@ def test_shm_queue_payload_tiny():
 
     # With old approach, queue payload would be ~tensor_bytes + overhead
     # With shm, it's always just the path string (~50 bytes)
+
+
+def test_shm_noncontiguous_and_grad():
+    """Non-contiguous + requires_grad tensors must round-trip (detach/cpu/contiguous)."""
+    os.environ.pop("PIPE_NO_SHM", None)
+    t = torch.randn(4, 5, requires_grad=True).T  # transpose -> non-contiguous
+    ref = _item_to_shm({"t": t})
+    assert "__shm__" in ref
+    back = _item_from_shm(ref)
+    assert torch.equal(back["t"], t.detach())
+
+
+def test_shm_moves_tensors_to_cpu():
+    """Regression guard: _item_to_shm must .cpu() before .numpy().
+
+    A CUDA tensor's .numpy() raises TypeError unless moved to CPU first. No GPU is
+    available in CI, so assert the .cpu() call is present (CPU correctness is covered
+    by test_shm_roundtrip_dtypes).
+    """
+    import inspect
+    assert ".cpu()" in inspect.getsource(_item_to_shm)

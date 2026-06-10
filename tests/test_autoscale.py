@@ -593,7 +593,11 @@ def test_autoscale_min_workers_respected():
 
     pipe = Pipe(debug=False, stats_interval=0, health_check_interval=0)
     pipe.add(Generator(n_items, delay=0.05), outqn=10)
-    pipe.add(FastWorker(), workers=initial_workers, outqn=20, autoscale=True, max_workers=6)
+    # min_workers defaults to 1, so without setting it the autoscaler may legitimately
+    # scale below the initial count once it's idle long enough. Pin the floor to verify
+    # min_workers is honoured (otherwise this only passed by finishing before scale-down).
+    pipe.add(FastWorker(), workers=initial_workers, outqn=20, autoscale=True,
+             min_workers=initial_workers, max_workers=6)
 
     min_seen = initial_workers
     results = []
@@ -706,6 +710,9 @@ def test_cpu_metric_accuracy():
     idle2, total2 = _get_cpu_usage()
     baseline = 1.0 - ((idle2 - idle1) / (total2 - total1))
     print(f"Baseline CPU: {baseline:.1%}")
+
+    if baseline > 0.7:
+        pytest.skip(f"host CPU already saturated ({baseline:.0%}); cannot measure load delta")
 
     n_burners = min(os.cpu_count(), 8)
     procs = []
@@ -1229,3 +1236,52 @@ def test_scale_down_race_condition():
     )
     assert {r["id"] for r in results} == set(range(n_items))
     print(f"Scale-down race test: {len(results)} items, final workers={pipe.stage_worker_counts[1].value}")
+
+
+# === regression tests for autoscaling bugs found in review ===
+
+def test_per_stage_autoscale_uses_global_max_default():
+    """Per-stage autoscale opt-in (global off) should still use max_workers_per_stage."""
+    pipe = Pipe(autoscale=False, max_workers_per_stage=7, stats_interval=0)
+    pipe.add(Generator(1), outqn=10)
+    pipe.add(FastWorker(), workers=1, autoscale=True, outqn=10)  # opt-in, no max_workers
+    pipe.add(Collector(), workers=1, outqn=0)
+    assert pipe.jobs[1]["autoscale"] is True
+    assert pipe.jobs[1]["max_workers"] == 7    # not actual_workers*4 == 4
+
+
+def test_threaded_stage_autoscale_disabled():
+    """Threaded stages can't be autoscaled by spawning processes; must be disabled."""
+    pipe = Pipe(autoscale=True, stats_interval=0)
+    pipe.add(Generator(1), outqn=10)
+    pipe.add(FastWorker(), workers=2, thread=True, autoscale=True, outqn=10)
+    pipe.add(Collector(), workers=1, outqn=0)
+    assert pipe.jobs[1]["autoscale"] is False
+
+
+def test_autoscale_no_worker_id_collision_after_down_up():
+    """After a scale-down, scale-up must not reuse a still-live worker id."""
+    from pipe.workers import _spawn_additional_worker
+
+    pipe = Pipe(stats_interval=0, health_check_interval=0)
+    pipe.add(Generator(5), outqn=10)
+    pipe.add(FastWorker(), workers=2, outqn=10)   # stage 1: worker_0, worker_1
+    pipe.add(Collector(), workers=1, outqn=0)
+    pipe.start()
+    try:
+        def stage1_ids():
+            return [wid for _, wid, _ in pipe.worker_info if wid.startswith("stage_1_worker")]
+
+        assert sorted(stage1_ids()) == ["stage_1_worker_0", "stage_1_worker_1"]
+
+        # simulate the autoscaler: scale-down decrements only the live count...
+        with pipe.stage_worker_counts[1].get_lock():
+            pipe.stage_worker_counts[1].value -= 1
+        # ...then scale-up must allocate a fresh id, not reuse live worker_1
+        _spawn_additional_worker(pipe, 1, pipe.jobs[1])
+
+        ids = stage1_ids()
+        assert len(ids) == len(set(ids)), f"duplicate worker ids: {ids}"
+        assert "stage_1_worker_2" in ids
+    finally:
+        pipe.stop(force=True)

@@ -8,20 +8,29 @@ class Batcher:
     def __init__(self, size, collate_fn=None):
         self.size = size
         self.collate = collate_fn
-        self.current = size * [None]
-        self.idx = 0
+        self.buffer = []
 
     def __call__(self, item):
-        self.current[self.idx] = item
-        self.idx += 1
-
-        if self.idx == self.size:
-            out = self.current
-            self.idx = 0
-            if self.collate is not None:
-                out = self.collate(out)
-            return out
+        self.buffer.append(item)
+        if len(self.buffer) >= self.size:
+            return self._emit()
         return None
+
+    def _emit(self):
+        out = self.buffer
+        self.buffer = []
+        if self.collate is not None:
+            return self.collate(out)
+        return out
+
+    def flush(self):
+        if not self.buffer:
+            return
+        out = self._emit()
+        if self.collate is not None:
+            yield out
+        else:
+            yield from out
 
 
 class BufferAndShuffle:
@@ -44,6 +53,13 @@ class BufferAndShuffle:
             self.buffer = []
             return out
         return None
+
+    def flush(self):
+        if self.buffer:
+            random.shuffle(self.buffer)
+            out = self.buffer
+            self.buffer = []
+            yield from out
 
 
 class RetrieveSQL:
