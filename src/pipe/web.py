@@ -19,6 +19,7 @@ import io
 import time
 import traceback
 from contextlib import asynccontextmanager, suppress
+from queue import Empty
 from typing import Any
 
 import torch
@@ -30,6 +31,8 @@ except ImportError:
     HAS_LZ4 = False
 
 from .pipe import Pipe
+from .shm import _item_from_shm
+from .types import End
 
 
 class SerializerWorker:
@@ -115,7 +118,16 @@ class PipeServer:
         @app.get("/next")
         async def get_next():
             try:
-                item = self.pipe.queues[-1].get(timeout=self.timeout)
+                deadline = time.time() + self.timeout
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise Empty
+                    raw = self.pipe.queues[-1].get(timeout=remaining)
+                    item = _item_from_shm(raw)
+                    if item is End:
+                        continue  # skip completion sentinel, keep waiting for a real item
+                    break
 
                 if self.pre_serialized:
                     if not isinstance(item, dict) or "data" not in item:
@@ -145,8 +157,7 @@ class PipeServer:
                         "X-Size-Bytes": str(size_bytes),
                     },
                 )
-            except TimeoutError:
-                self.errors += 1
+            except (Empty, TimeoutError):
                 return JSONResponse(
                     status_code=503,
                     content={"error": "Pipe timeout", "message": f"No item available within {self.timeout}s"},

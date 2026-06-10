@@ -69,7 +69,7 @@ def _item_to_shm(item, skip=False):
 
     for key, val in item.items():
         if torch.is_tensor(val):
-            val = val.contiguous().detach()
+            val = val.detach().cpu().contiguous()
             if val.dtype == torch.bfloat16:
                 raw = val.view(torch.uint16).numpy().tobytes()
             else:

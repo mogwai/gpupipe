@@ -219,7 +219,7 @@ pipe.add(worker,
     pergpu=True,        # spawn one worker per available GPU (sets CUDA_VISIBLE_DEVICES)
     gpu_id=0,           # pin all workers to specific GPU
     batch=16,           # framework collects up to N items, __call__ receives a list
-    autoscale=True,     # enable autoscaling for this stage
+    autoscale=True,     # enable autoscaling for this stage (disabled for GPU stages)
     min_workers=1,      # autoscale floor (won't scale below)
     max_workers=8,      # autoscale ceiling (won't scale above)
 )
@@ -235,17 +235,20 @@ pipe.add(worker,
 
 ```python
 pipe = Pipe(
-    sequential=False,         # sequential single-process mode (no multiprocessing)
-    debug=False,              # track per-queue transit latency stats
-    autoscale=True,           # global autoscale enable
-    max_workers_per_stage=8,  # global autoscale cap
-    stats_interval=30,        # stats collection interval in seconds (0=off)
-    stats_mode="rich",        # "rich" (default, standalone progress bar),
-                              # "text" (ANSI one-liners to stdout),
-                              # "external" (no display, poll with get_stats())
-    health_check_interval=30, # check worker liveness every N seconds (0=off)
-    expected_consumers=1,     # for DDP: multiply end signals for N consumers
-    raise_errors=False,       # raise exceptions in workers instead of logging
+    sequential=False,           # sequential single-process mode (no multiprocessing)
+    debug=False,                # wrap queues with InstrumentedQueue, track per-queue transit latency
+    autoscale=False,            # global autoscale enable (disabled by default)
+    max_workers_per_stage=8,    # global autoscale cap
+    stats_interval=0.2,         # stats collection interval in seconds (0=off)
+    stats_mode="text",          # "text" (ANSI one-liners to stdout, default),
+                                # "rich" (Rich Progress bar, standalone Live),
+                                # "external" (no display, poll with get_stats())
+    health_check_interval=30,   # check worker liveness every N seconds (0=off)
+    expected_consumers=1,       # for DDP: multiply end signals for N consumers
+    raise_errors=None,          # if None, defaults to sequential mode; True raises exceptions
+    allow_full_restart=True,    # allow restarting entire pipeline on repeated crashes
+    use_shm=False,              # use shared memory for tensor serialization
+    output_shm=False,           # output items use shared memory encoding
 )
 ```
 
@@ -253,9 +256,9 @@ pipe = Pipe(
 
 | Mode | Display | Thread | Use case |
 |------|---------|--------|----------|
-| `"rich"` | Rich Progress bar (standalone Live) | Yes | Standalone scripts |
-| `"text"` | ANSI one-liners to stdout | Yes | Non-interactive / logging |
-| `"external"` | None (caller polls `get_stats()`) | No | Embedded in another UI (e.g. training loop) |
+| `"text"` | ANSI one-liners to stdout (default) | Yes | Standalone scripts, logging |
+| `"rich"` | Rich Progress bar (standalone Live) | Yes | Standalone scripts with nicer display |
+| `"external"` | None (caller polls `get_stats()`) | No | Embedded in another UI (e.g. training loop), don't start stats thread |
 
 ### Polling stats externally
 
@@ -302,14 +305,13 @@ Background thread checks `process.is_alive()` every `health_check_interval`:
 - Restarts individual workers with same config
 - Repeated crashes (3+ in short window) → full pipeline restart via `pipe.restart()`
 
-## Tensor Handling (Shared Memory)
+## Tensor Handling
 
-Items containing torch tensors are automatically serialized to `/dev/shm` files. The queue carries only a path reference (~60 bytes), not the tensor data.
+**Default (`use_shm=False`): torch's `file_descriptor` sharing.** Items containing torch tensors are passed via PyTorch's built-in `file_descriptor` strategy — the producer holds the tensor's shared-memory fd open and the queue carries a lightweight handle. This is the fast path and the recommended default. Workers deliberately stay alive until the whole pipeline stops (see the keep-alive loop in `_worker_run`), so a producing process never exits while its tensors are still in flight — which removes the "producer dies, fd is gone" failure that torch's fd strategy is sometimes criticised for. In practice this is faster and simpler than the shm path below.
 
-**Why not use torch.multiprocessing's built-in tensor sharing?**
-PyTorch's default `file_descriptor` strategy passes tensors via a socket server in the producer process. If the producer dies (crash, autoscale-down), the socket is gone and consumers can't retrieve the data. Our approach writes named files to `/dev/shm` which persist regardless of process state.
+**Opt-in (`use_shm=True`): `/dev/shm` files.** Tensors are serialized to named `/dev/shm/pipe_<pid>_<uuid>` files and the queue carries only a path reference (~60 bytes). Only reach for this when a producer may genuinely die mid-flight (e.g. crash-prone workers) and you need already-queued tensors to outlive the producer — the files persist regardless of process state. Tradeoffs: per-item file create/mmap/unlink syscalls (slower than fd sharing for small items), and **CPU tensors only** (move tensors to CPU before emitting). Scope it to specific output stages with `output_shm=True`.
 
-**How it works:**
+**How `use_shm=True` works:**
 1. Producer: `_item_to_shm(item)` → writes tensors + pickled metadata to `/dev/shm/pipe_<pid>_<uuid>`
 2. Queue carries: `{"__shm__": "/dev/shm/pipe_12345_abcdef"}` (tiny)
 3. Consumer: `_item_from_shm(ref)` → mmaps file, reconstructs tensors, unlinks file

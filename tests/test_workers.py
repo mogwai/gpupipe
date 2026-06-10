@@ -307,3 +307,35 @@ def test_expand_worker_process():
     results = run_pipeline(stages)
     assert len(results) == n_items * 3
     assert {r["original_id"] for r in results} == set(range(n_items))
+
+
+# === ROOT STAGE WORKER COUNT (root must not run in parallel and duplicate) ===
+
+class GenRoot:
+    """Generator-based root yielding ids 0..n-1."""
+    def __init__(self, n_items):
+        self.n_items = n_items
+
+    def __call__(self):
+        for i in range(self.n_items):
+            yield {"id": i}
+
+
+def test_root_workers_clamped_no_duplication():
+    """A root requested with workers>1 used to emit the stream N times; now once."""
+    n = 20
+    for src in (Generator(n), GenRoot(n)):
+        results = run_pipeline([
+            (src, {"workers": 3, "outqn": 100}),
+            (Collector(), {"workers": 1, "outqn": 0}),
+        ])
+        ids = sorted(r["id"] for r in results)
+        assert ids == list(range(n)), f"{type(src).__name__}: {ids}"
+
+
+def test_root_clamped_to_single_worker():
+    pipe = Pipe(stats_interval=0)
+    pipe.add(Generator(5), workers=4)
+    pipe.add(Collector(), workers=1, outqn=0)
+    assert pipe.jobs[0]["num_workers"] == 1   # root clamped
+    assert pipe.jobs[1]["num_workers"] == 1   # non-root untouched
