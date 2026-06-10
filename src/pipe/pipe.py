@@ -2,6 +2,7 @@ import contextlib
 import inspect
 import os
 from queue import Empty, Full
+import signal
 import threading
 import time
 
@@ -71,6 +72,7 @@ def _log(msg):
         print(msg)
 
 from .monitors import _autoscaler_thread, _collect_stats, _health_monitor_thread, _stats_monitor_thread, _stats_monitor_thread_text
+from .profiling import _profile_dir, _profiled_worker, print_profile_summary
 from .shm import _cleanup_stale_shm, _item_from_shm
 from .types import End
 from .workers import (
@@ -120,6 +122,7 @@ class Pipe:
         max_workers_per_stage=8,
         use_shm=False,
         output_shm=False,
+        profile=False,
     ):
         # Set env vars for shm control (inherited by spawned workers)
         if not use_shm:
@@ -148,6 +151,7 @@ class Pipe:
         self.working = Value("i", 0)
         self.should_stop = Value("i", 0)
         self.restart_needed = Value("i", 0)
+        self.drain_event = Event()
         self.health_monitor_thread = None
         self.health_monitor_stop_event = threading.Event()
         self.stats_monitor_thread = None
@@ -156,6 +160,9 @@ class Pipe:
         self.stats_mode = stats_mode
         self.autoscaler_thread = None
         self.autoscaler_stop_event = threading.Event()
+        self.profile = profile
+        self.profile_dir = None
+        self.profile_rss = {}
         self.gpus = self._get_gpu_count()
         self.expected_consumers = expected_consumers
 
@@ -189,6 +196,7 @@ class Pipe:
         min_workers=None,
         max_workers=None,
         batch=0,
+        drain=True,
     ):
         if hasattr(func, "__name__"):
             stage_name = func.__name__
@@ -270,8 +278,23 @@ class Pipe:
                 "max_workers": effective_max,
                 "min_workers": min_workers if min_workers is not None else 1,
                 "batch": batch,
+                "drain": drain,
             }
         )
+
+    def _spawn(self, target, args, worker_id):
+        if self.profile:
+            from multiprocessing import Value as MpValue
+            rss_val = MpValue("l", 0)
+            self.profile_rss[worker_id] = rss_val
+            p = mp.Process(
+                target=_profiled_worker,
+                args=(target, args, self.profile_dir, worker_id, rss_val),
+            )
+        else:
+            p = mp.Process(target=target, args=args)
+        p.start()
+        return p
 
     def start(self):
         _log(f"Starting pipeline with {len(self.jobs)} jobs")
@@ -280,9 +303,26 @@ class Pipe:
         if not self.jobs:
             raise ValueError("No workers added to pipeline")
 
+        # Stage 0 has no input queue, so it always stops on drain.
+        self.jobs[0]["drain"] = False
+        # drain=False stages must form a contiguous prefix (e.g. 0,1,2 — not 0,3).
+        seen_drain = False
+        for i, job in enumerate(self.jobs):
+            if job["drain"]:
+                seen_drain = True
+            elif seen_drain:
+                raise ValueError(
+                    f"Stage {i} ({job['name']}) has drain=False but an earlier stage has drain=True. "
+                    "drain=False stages must form a contiguous prefix from stage 0."
+                )
+
         if self.sequential:
             _log("Sequential mode - skipping multiprocessing setup")
             return self
+
+        if self.profile:
+            self.profile_dir = _profile_dir()
+            print(f"Profiling enabled, saving to {self.profile_dir}")
 
         _log("Setting up multiprocessing...")
 
@@ -349,6 +389,8 @@ class Pipe:
                             stage_done,
                             self.sequential,
                             job.get("batch", 0),
+                            self.drain_event,
+                            job.get("drain", True),
                         )
 
                         self.worker_configs[worker_id] = {
@@ -357,8 +399,7 @@ class Pipe:
                             "stage_name": stage_name,
                         }
 
-                        p = mp.Process(target=_threaded_worker_run, args=args)
-                        p.start()
+                        p = self._spawn(_threaded_worker_run, args, worker_id)
                         self.processes.append(p)
                         self.worker_info.append((p, worker_id, stage_name))
                 else:
@@ -386,6 +427,8 @@ class Pipe:
                         stage_done,
                         self.sequential,
                         job.get("batch", 0),
+                        self.drain_event,
+                        job.get("drain", True),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -394,8 +437,7 @@ class Pipe:
                         "stage_name": stage_name,
                     }
 
-                    p = mp.Process(target=_threaded_worker_run, args=args)
-                    p.start()
+                    p = self._spawn(_threaded_worker_run, args, worker_id)
                     self.processes.append(p)
                     self.worker_info.append((p, worker_id, stage_name))
             else:
@@ -430,6 +472,8 @@ class Pipe:
                         stage_done,
                         self.sequential,
                         job.get("batch", 0),
+                        self.drain_event,
+                        job.get("drain", True),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -438,8 +482,7 @@ class Pipe:
                         "stage_name": stage_name,
                     }
 
-                    p = mp.Process(target=_worker_run, args=args)
-                    p.start()
+                    p = self._spawn(_worker_run, args, worker_id)
                     self.processes.append(p)
                     self.worker_info.append((p, worker_id, stage_name))
                     _log(f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}")
@@ -615,6 +658,8 @@ class Pipe:
                     stage_done,
                     self.sequential,
                     job.get("batch", 0),
+                    self.drain_event,
+                    job.get("drain", True),
                 )
             else:
                 new_args = (
@@ -637,6 +682,8 @@ class Pipe:
                     stage_done,
                     self.sequential,
                     job.get("batch", 0),
+                    self.drain_event,
+                    job.get("drain", True),
                 )
 
             config["args"] = new_args
@@ -739,13 +786,21 @@ class Pipe:
             except Exception as e:
                 print(f"Error closing queue: {e}")
 
+        if self.profile and self.profile_dir and self.worker_info:
+            rss_resolved = {}
+            for wid, val in self.profile_rss.items():
+                rss_resolved[wid] = val.value
+            print_profile_summary(self.profile_dir, rss_resolved, self.worker_info)
+
         self.processes = []
         self.queues = []
         self.worker_info = []
         self.worker_configs = {}
+        self.profile_rss = {}
         self.working.value = 0
         self.should_stop.value = 0
         self.restart_needed.value = 0
+        self.drain_event.clear()
 
         for counter in self.stage_end_counters:
             counter.value = 0
@@ -760,42 +815,66 @@ class Pipe:
             yield from self._sequential_run()
             return
 
-        final_done = self.stage_done_events[-1]
-        consecutive_empty = 0
-        EMPTY_THRESHOLD = 5
+        # Catch the first Ctrl+C at the OS level so it drains regardless of
+        # whether Python is currently in pipe code or in the user's loop body.
+        # The default handler is restored after one hit, so a second Ctrl+C
+        # raises KeyboardInterrupt as usual and the iterator force-stops below.
+        prev_handler = None
+        is_main_thread = threading.current_thread() is threading.main_thread()
+        if is_main_thread:
+            def _drain_on_sigint(signum, frame):
+                signal.signal(signal.SIGINT, prev_handler if prev_handler is not None else signal.SIG_DFL)
+                self.drain_event.set()
+                stopped = [j["name"] for j in self.jobs if not j.get("drain", True)]
+                stopped_str = ", ".join(stopped) if stopped else "root"
+                in_flight = sum(q.qsize() for q in self.queues)
+                print(
+                    f"Starting to drain... {stopped_str} stopped (their inputs are not drained); "
+                    f"finishing ~{in_flight} items already in the pipeline. "
+                    "(Ctrl+C again to force stop)",
+                    flush=True,
+                )
+            prev_handler = signal.signal(signal.SIGINT, _drain_on_sigint)
 
-        while True:
-            if self.should_stop.value == 2:
-                _log("Worker encountered connection error - restarting pipeline...")
-                self.restart(reason="Worker connection error")
-                consecutive_empty = 0
-                continue
+        try:
+            final_done = self.stage_done_events[-1]
+            consecutive_empty = 0
+            EMPTY_THRESHOLD = 5
 
-            try:
-                item = self.queues[-1].get(timeout=0.1)
-                consecutive_empty = 0
-                item = _item_from_shm(item)
-
-                if _is_end(item):
+            while True:
+                if self.should_stop.value == 2:
+                    _log("Worker encountered connection error - restarting pipeline...")
+                    self.restart(reason="Worker connection error")
+                    consecutive_empty = 0
                     continue
 
-                yield item
-            except Empty:
-                consecutive_empty += 1
-                if final_done.is_set() and consecutive_empty >= EMPTY_THRESHOLD:
-                    _log("Iterator: pipeline complete")
-                    self._stop()
-                    return
-            except (ConnectionError, FileNotFoundError):
-                self.restart()
-                consecutive_empty = 0
-            except KeyboardInterrupt:
-                if self.should_stop.value:
+                try:
+                    item = self.queues[-1].get(timeout=0.1)
+                    consecutive_empty = 0
+                    item = _item_from_shm(item)
+
+                    if _is_end(item):
+                        continue
+
+                    yield item
+                except Empty:
+                    consecutive_empty += 1
+                    if final_done.is_set() and consecutive_empty >= EMPTY_THRESHOLD:
+                        _log("Iterator: pipeline complete")
+                        self._stop()
+                        return
+                except (ConnectionError, FileNotFoundError):
+                    self.restart()
+                    consecutive_empty = 0
+                except KeyboardInterrupt:
+                    # Second Ctrl+C: default handler restored, KeyboardInterrupt fired.
                     _log("Force stopping pipeline")
                     self._stop(force=True)
                     return
-                _log("Stopping after current items... (Ctrl+C again to force quit)")
-                self.should_stop.value = 1
+        finally:
+            if is_main_thread and prev_handler is not None:
+                with contextlib.suppress(Exception):
+                    signal.signal(signal.SIGINT, prev_handler)
 
     def run(self):
         count = 0
