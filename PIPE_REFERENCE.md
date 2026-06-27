@@ -186,6 +186,62 @@ pipe.add(StreamingTranscriber(), pergpu=True, batch=8, outqn=50)
 - Works in both multiprocessing and sequential mode
 - Triggered automatically when a non-root worker defines `run()`
 
+### Sending an item BACK to an earlier stage: `self.push(stage, item)`
+
+Every non-root worker (plain `__call__` or `run()`) gets `self.push(stage, item)`,
+which drops `item` onto the INPUT queue of an EARLIER stage so it gets reprocessed.
+The canonical use is a downstream quality gate that re-runs an expensive earlier
+stage on failure (e.g. re-render audio whose WER check failed):
+
+```python
+class WERCheck:
+    MAX_RETRIES = 2
+
+    def __call__(self, item):
+        if self.wer(item) <= 0.15:
+            return item                      # pass -> forward to next stage
+        if item.get("retries", 0) < self.MAX_RETRIES:
+            item["retries"] = item.get("retries", 0) + 1
+            self.push("Renderer", item)      # back to the Renderer stage
+            return None                      # nothing forwarded this time
+        return item                          # give up: forward the best we have
+
+pipe.add(Renderer(), pergpu=True)            # stage 1
+pipe.add(WERCheck(), pergpu=True)            # stage 2 -> pushes back to stage 1
+```
+
+- `stage` is an int stage index (0 = root), a stage **name** (str), or the worker
+  **class** / a worker **instance** (resolved by its `__name__`). Names/classes
+  resolve to the FIRST stage with that name. `push` targets that stage's input
+  queue. Pushing to stage 0 is invalid (root has no input). So all of these are
+  equivalent: `self.push(1, item)`, `self.push("Renderer", item)`,
+  `self.push(Renderer, item)`.
+- **Always bound retries on the item** — pipe's completion is signalled
+  forward-only, so the retry cycle must terminate on its own.
+- **Best-effort at end-of-run:** a stage finishes once its upstream is done and
+  its input queue drains. An item pushed back *after* the target stage has
+  already drained (only possible once the whole upstream is exhausted) may be
+  dropped. Mid-run (the normal case, upstream still producing) every push is
+  honoured. For bulk data-gen this is exactly the right trade-off.
+- Works in both multiprocessing and sequential mode.
+
+**Avoiding cyclic deadlock (size the back-edge queue).** `push` adds a cycle to
+an otherwise linear pipeline, and a cycle of *bounded* queues can deadlock: if
+the items simultaneously circulating in the cycle outnumber the cycle's total
+queue capacity, the forward stage blocks putting (its output full) so it stops
+draining the back-edge queue, so `push` blocks (back-edge full) — nobody moves.
+The rule:
+
+> the combined capacity of the queues in the cycle (the back-edge's landing
+> queue + the forward queues between the target stage and the pushing stage)
+> must exceed the peak number of items in the cycle at once.
+
+For the intended use (a quality gate that re-runs only the small fraction of
+items that fail) the cycle holds very few items, so default queue sizes are
+safe. If you expect a high retry fraction — or want a hard guarantee — make the
+target stage's input queue (i.e. the `outqn` of the stage *before* the push
+target) large, or unbounded (`outqn=0`). Always cap retries regardless.
+
 ## Return Value Semantics
 
 | Return | Effect |
