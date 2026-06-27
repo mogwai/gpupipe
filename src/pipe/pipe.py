@@ -344,6 +344,10 @@ class Pipe:
                 worker_count = job["num_workers"]
             self.stage_worker_counts.append(Value("i", worker_count))
 
+        # Names of every stage, in order, so workers can resolve a push(stage,...)
+        # target by name as well as by index.
+        stage_names_all = [job["name"] for job in self.jobs]
+
         for i, job in enumerate(self.jobs):
             in_queue = self.queues[i - 1] if i > 0 else None
             out_queue = self.queues[i] if i < len(self.queues) else None
@@ -391,6 +395,8 @@ class Pipe:
                             job.get("batch", 0),
                             self.drain_event,
                             job.get("drain", True),
+                            self.queues,
+                            stage_names_all,
                         )
 
                         self.worker_configs[worker_id] = {
@@ -429,6 +435,8 @@ class Pipe:
                         job.get("batch", 0),
                         self.drain_event,
                         job.get("drain", True),
+                        self.queues,
+                        stage_names_all,
                     )
 
                     self.worker_configs[worker_id] = {
@@ -474,6 +482,8 @@ class Pipe:
                         job.get("batch", 0),
                         self.drain_event,
                         job.get("drain", True),
+                        self.queues,
+                        stage_names_all,
                     )
 
                     self.worker_configs[worker_id] = {
@@ -660,6 +670,8 @@ class Pipe:
                     job.get("batch", 0),
                     self.drain_event,
                     job.get("drain", True),
+                    self.queues,
+                    [j["name"] for j in self.jobs],
                 )
             else:
                 new_args = (
@@ -684,6 +696,8 @@ class Pipe:
                     job.get("batch", 0),
                     self.drain_event,
                     job.get("drain", True),
+                    self.queues,
+                    [j["name"] for j in self.jobs],
                 )
 
             config["args"] = new_args
@@ -908,6 +922,36 @@ class Pipe:
 
         pending_items = []
         root_ended = False
+
+        # Sequential-mode push(stage, item): re-enqueue the item to run at the
+        # target stage (same semantics as the multiprocessing worker.push — send
+        # an item back to an earlier stage). Resolves a stage name to its index.
+        seq_stage_names = [job["name"] for job in self.jobs]
+
+        def _make_seq_push():
+            def _push(stage, item, block=True):
+                if item is None:
+                    return
+                if isinstance(stage, bool):
+                    raise TypeError("push: stage must be an index, name, or class")
+                if isinstance(stage, int):
+                    idx = stage
+                else:
+                    name = (
+                        stage if isinstance(stage, str)
+                        else (stage if isinstance(stage, type) else type(stage)).__name__
+                    )
+                    idx = seq_stage_names.index(name)
+                if idx <= 0 or idx >= len(workers):
+                    raise ValueError(
+                        f"push: stage {stage!r} (idx {idx}) has no input to push to"
+                    )
+                pending_items.append((idx, item))
+            return _push
+
+        for i, worker in enumerate(workers):
+            if i > 0:
+                worker.push = _make_seq_push()
 
         def _add_result(result, next_stage):
             if result is None:

@@ -26,6 +26,61 @@ def _skip_shm_for_output(is_final_stage):
     return bool(is_final_stage and os.environ.get("PIPE_NO_SHM_OUTPUT"))
 
 
+def _make_push(all_queues, stage_names, should_stop):
+    """Build the worker.push(stage, item) primitive.
+
+    Drops `item` onto the INPUT queue of the target stage (= the OUTPUT queue of
+    the stage before it), so a downstream worker can send an item BACK to an
+    earlier stage for reprocessing (e.g. re-render on a failed WER check). `stage`
+    may be an int stage index, a stage name (str), or the worker CLASS / a worker
+    INSTANCE (resolved by its `__name__`). Names/classes resolve to the FIRST
+    stage with that name. Pushing to stage 0 (the root, no input queue) is invalid.
+
+    This is forward-flow's escape hatch and is BEST-EFFORT: pipe's completion is
+    signalled forward-only (End sentinels + upstream-done events), so an item
+    pushed back after the target stage has already drained at end-of-run may be
+    dropped. Cap retries on the item so the cycle always terminates."""
+    name_to_idx = {}
+    if stage_names:
+        for i, nm in enumerate(stage_names):
+            name_to_idx.setdefault(nm, i)  # first match wins
+
+    def _push(stage, item, block=True):
+        if item is None:
+            return
+        if isinstance(stage, bool):
+            raise TypeError("push: stage must be an index, name, or class")
+        if isinstance(stage, int):
+            idx = stage
+        else:
+            # str name, a worker class, or a worker instance -> resolve by name
+            name = (
+                stage if isinstance(stage, str)
+                else (stage if isinstance(stage, type) else type(stage)).__name__
+            )
+            if name not in name_to_idx:
+                raise ValueError(f"push: unknown stage {stage!r}")
+            idx = name_to_idx[name]
+        if idx <= 0 or idx >= len(all_queues) + 1:
+            raise ValueError(
+                f"push: stage {stage!r} (idx {idx}) has no input queue to push to"
+            )
+        target = all_queues[idx - 1]  # input queue of stage idx == output of idx-1
+        serialized = _item_to_shm(item, skip=False)
+        if not block:
+            with contextlib.suppress(Full):
+                target.put_nowait(serialized)
+            return
+        while not (should_stop is not None and should_stop.value):
+            try:
+                target.put(serialized, timeout=0.1)
+                return
+            except Full:
+                time.sleep(0.01)
+
+    return _push
+
+
 def _is_end(item):
     return item is End
 
@@ -106,6 +161,8 @@ def _worker_run(
     batch_size=0,
     drain_event=None,
     drain=True,
+    all_queues=None,
+    stage_names=None,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -170,6 +227,11 @@ def _worker_run(
                 except Full:
                     time.sleep(0.01)
         worker.put = _put
+
+    # push(stage, item): send an item BACK to an earlier stage's input queue
+    # (e.g. re-render on a failed WER check). Available to every non-root worker.
+    if all_queues is not None and not is_root:
+        worker.push = _make_push(all_queues, stage_names, should_stop)
 
     if hasattr(worker, "load"):
         _log(f"Worker {worker_desc} calling load()")
@@ -512,6 +574,8 @@ def _threaded_worker_run(
     batch_size=0,
     drain_event=None,
     drain=True,
+    all_queues=None,
+    stage_names=None,
 ):
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -579,6 +643,10 @@ def _threaded_worker_run(
                 except Full:
                     time.sleep(0.01)
         worker.put = _put
+
+    # push(stage, item): send an item BACK to an earlier stage (see _make_push).
+    if all_queues is not None and not is_root:
+        worker.push = _make_push(all_queues, stage_names, should_stop)
 
     if hasattr(worker, "load"):
         _log(f"Threaded worker {worker_desc} calling load()")
@@ -968,6 +1036,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             job.get("batch", 0),
             pipe_instance.drain_event,
             job.get("drain", True),
+            pipe_instance.queues,
+            [j["name"] for j in pipe_instance.jobs],
         )
         proc = Process(target=_threaded_worker_run, args=args, daemon=True)
     else:
@@ -993,6 +1063,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             job.get("batch", 0),
             pipe_instance.drain_event,
             job.get("drain", True),
+            pipe_instance.queues,
+            [j["name"] for j in pipe_instance.jobs],
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 
