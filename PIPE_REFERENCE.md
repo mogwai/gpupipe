@@ -272,8 +272,10 @@ pipe.add(worker,
     workers=4,          # number of worker processes (or threads if thread=True)
     outqn=50,           # output queue max size (0=unbuffered final stage, None=unlimited)
     thread=True,        # use threads instead of processes (IO-bound, no pickle needed)
-    pergpu=True,        # spawn one worker per available GPU (sets CUDA_VISIBLE_DEVICES)
-    gpu_id=0,           # pin all workers to specific GPU
+    pergpu=True,        # spawn one worker per available GPU (== gpus=range(N))
+    gpus=[5, 6],        # pin this stage to a SPECIFIC GPU pool (round-robin per worker);
+                        # `workers` is a per-GPU multiplier (workers=2 -> 2 per listed GPU)
+    gpu_id=0,           # pin all workers to a single GPU (== gpus=[0])
     batch=16,           # framework collects up to N items, __call__ receives a list
     autoscale=True,     # enable autoscaling for this stage (disabled for GPU stages)
     min_workers=1,      # autoscale floor (won't scale below)
@@ -575,7 +577,11 @@ for result in pipe:
 3. **Workers never see End** - framework handles End sentinel internally, workers never receive it
 4. **`flush()` method for batchers** - framework calls this at shutdown to emit remaining buffered items
 5. **thread=True for IO-bound** - downloads, DB queries. Shares memory, no pickle needed, GIL-friendly for IO waits
-6. **pergpu=True** - one worker per GPU, sets CUDA_VISIBLE_DEVICES per worker
+6. **pergpu=True / gpus=[...]** - GPU pinning. `pergpu` runs one worker on *every*
+   GPU; `gpus=[5,6]` pins a stage to a *specific* pool (round-robin per worker, with
+   `workers` as a per-GPU multiplier). Each worker's process is `set_device`-pinned —
+   no need to hand-roll lock-file GPU pools. Different stages can target disjoint
+   pools (e.g. `render` on `gpus=[0,1,2,3]`, `wer` on `gpus=[4]`, `tts` on `gpus=[5,6]`).
 7. **sequential=True** - single process, sequential execution, for debugging/testing
 8. **debug=True** - wraps queues with InstrumentedQueue, shows per-queue transit latency in stats
 9. **Queue full = backpressure** - workers block on put when downstream slow. This is intentional.
