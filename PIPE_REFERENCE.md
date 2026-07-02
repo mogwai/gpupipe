@@ -276,8 +276,17 @@ pipe.add(worker,
     gpus=[5, 6],        # pin this stage to a SPECIFIC GPU pool (round-robin per worker);
                         # `workers` is a per-GPU multiplier (workers=2 -> 2 per listed GPU)
     gpu_id=0,           # pin all workers to a single GPU (== gpus=[0])
+    cpus=[0, 1, 2, 3],  # pin this stage to a CPU core pool, CHUNKED across its workers
+                        # (each worker gets a contiguous slice + threads sized to it).
+                        # Orthogonal to gpus= (a GPU feeder can set both). Confines workers
+                        # to those cores (locality); disjoint pools partition the box across
+                        # YOUR stages — it does NOT reserve cores from other processes (use a
+                        # cgroup cpuset for that). Disables autoscale.
+    cpu_threads=8,      # per-worker BLAS/torch thread count (torch/OMP/MKL/OpenBLAS).
+                        # Lifts the default flat 2-thread cap for a CPU-heavy stage (mel)
+                        # WITHOUT pinning. With cpus= too, this wins over the slice size.
     batch=16,           # framework collects up to N items, __call__ receives a list
-    autoscale=True,     # enable autoscaling for this stage (disabled for GPU stages)
+    autoscale=True,     # enable autoscaling for this stage (disabled for GPU/CPU-pinned stages)
     min_workers=1,      # autoscale floor (won't scale below)
     max_workers=8,      # autoscale ceiling (won't scale above)
     drain=True,         # on Ctrl+C: True=finish in-flight items, False=stop immediately
@@ -582,6 +591,24 @@ for result in pipe:
    `workers` as a per-GPU multiplier). Each worker's process is `set_device`-pinned —
    no need to hand-roll lock-file GPU pools. Different stages can target disjoint
    pools (e.g. `render` on `gpus=[0,1,2,3]`, `wer` on `gpus=[4]`, `tts` on `gpus=[5,6]`).
+6b. **cpus=[...]** - CPU affinity, the core analog of `gpus=`. The pool is *chunked*
+   across the stage's workers (worker 0 → first slice, etc.) and each worker's BLAS/torch
+   thread count is sized to its slice, so an 8-worker mel stage on `cpus=range(32)` gives
+   every worker 4 dedicated cores instead of 8 workers thrashing 32. Use it to (a) keep a
+   CPU-heavy stage (mel, decode) from migrating/oversubscribing, and (b) *reserve* cores
+   for GPU feeders — pin the feeder to its cores and pin other CPU stages to disjoint
+   pools so nothing else lands there. Orthogonal to `gpus=` (a GPU feeder may set both).
+   Linux-only (`os.sched_setaffinity`); more workers than cores → round-robin oversubscribe.
+   Disables autoscale (a static pin can't track a live worker count).
+   *Caveat:* affinity only **confines your worker** to those cores — it does **not** keep
+   other processes off them. Reserving cores across your own pipeline means pinning every
+   CPU-heavy stage to disjoint pools; walling off *unrelated* jobs needs a cgroup cpuset
+   (`systemd AllowedCPUs=`, `docker --cpuset-cpus`, `isolcpus=`), which composes on top.
+6c. **cpu_threads=N** - per-worker BLAS/torch thread count, independent of pinning. Every
+   worker defaults to a flat 2 threads (this is the main guard against N torch workers each
+   fanning BLAS across the whole machine); `cpu_threads=` raises that for a CPU-heavy stage
+   (e.g. `mel` wanting 8) without touching affinity or autoscale. Precedence when combined
+   with `cpus=`: explicit `cpu_threads` > `cpus=` slice size > the default 2.
 7. **sequential=True** - single process, sequential execution, for debugging/testing
 8. **debug=True** - wraps queues with InstrumentedQueue, shows per-queue transit latency in stats
 9. **Queue full = backpressure** - workers block on put when downstream slow. This is intentional.
