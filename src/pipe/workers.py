@@ -21,6 +21,59 @@ def _log(msg):
         print(msg)
 
 
+def _cpu_chunk(cpu_pool, worker_idx, num_workers):
+    """Split a stage's `cpus=` pool into per-worker contiguous slices.
+
+    Worker `worker_idx` of `num_workers` gets its slice (sizes differ by <=1), so an
+    N-core mel stage over M workers ends up with each worker owning ~N/M dedicated
+    cores rather than all M workers fighting over the whole pool. If a stage has more
+    workers than cores, workers round-robin a single (oversubscribed) core. Returns
+    None when the stage has no cpus= pool."""
+    if not cpu_pool:
+        return None
+    n = len(cpu_pool)
+    if num_workers >= n:
+        return [cpu_pool[worker_idx % n]]
+    base, rem = divmod(n, num_workers)
+    start = worker_idx * base + min(worker_idx, rem)
+    size = base + (1 if worker_idx < rem else 0)
+    return list(cpu_pool[start:start + size])
+
+
+def _setup_cpu(cpu_affinity, cpu_threads, worker_desc):
+    """Pin this worker to a CPU core set (if any) and size its BLAS/torch thread count.
+
+    `cpu_affinity` is the list of core ids this worker may run on (its slice of the
+    stage's `cpus=` pool, from `_cpu_chunk`), or None for no pinning. Thread count is
+    resolved by precedence: an explicit `cpu_threads` wins, else the affinity slice
+    size, else the default 2 that avoids oversubscription across unpinned workers.
+    Pinning is best-effort and Linux-only (os.sched_setaffinity); the thread count is
+    always applied. `cpu_threads` needs no pinning — it just lifts the flat 2-cap for a
+    CPU-heavy stage (e.g. mel)."""
+    if cpu_affinity:
+        setaff = getattr(os, "sched_setaffinity", None)
+        if setaff is not None:
+            try:
+                setaff(0, set(cpu_affinity))
+                _log(f"Worker {worker_desc} pinned to CPUs {sorted(cpu_affinity)}")
+            except OSError as e:
+                print(f"Worker {worker_desc}: could not pin to CPUs {cpu_affinity}: {e}")
+        else:
+            print(f"Worker {worker_desc}: CPU affinity unsupported on this platform; ignoring cpus=")
+
+    if cpu_threads:
+        n = cpu_threads
+    elif cpu_affinity:
+        n = len(cpu_affinity)
+    else:
+        n = 2
+    torch.set_num_threads(n)
+    s = str(n)
+    os.environ["OMP_NUM_THREADS"] = s
+    os.environ["MKL_NUM_THREADS"] = s
+    os.environ["OPENBLAS_NUM_THREADS"] = s
+
+
 def _skip_shm_for_output(is_final_stage):
     """Check if shm should be skipped for output queue."""
     return bool(is_final_stage and os.environ.get("PIPE_NO_SHM_OUTPUT"))
@@ -163,16 +216,16 @@ def _worker_run(
     drain=True,
     all_queues=None,
     stage_names=None,
+    cpu_affinity=None,
+    cpu_threads=None,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
     is_root = (in_queue is None)
 
-    # Limit CPU threads to avoid oversubscription across worker processes
-    torch.set_num_threads(2)
-    os.environ["OMP_NUM_THREADS"] = "2"
-    os.environ["MKL_NUM_THREADS"] = "2"
-    os.environ["OPENBLAS_NUM_THREADS"] = "2"
+    # Pin to this worker's CPU slice (if cpus= was set) and size threads: explicit
+    # cpu_threads > slice size > the default 2-thread cap that avoids oversubscription.
+    _setup_cpu(cpu_affinity, cpu_threads, worker_desc)
 
     _increase_fd_limit(worker_desc)
 
@@ -576,16 +629,16 @@ def _threaded_worker_run(
     drain=True,
     all_queues=None,
     stage_names=None,
+    cpu_affinity=None,
+    cpu_threads=None,
 ):
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
     is_root = (in_queue is None)
 
-    # Limit CPU threads to avoid oversubscription across worker processes
-    torch.set_num_threads(2)
-    os.environ["OMP_NUM_THREADS"] = "2"
-    os.environ["MKL_NUM_THREADS"] = "2"
-    os.environ["OPENBLAS_NUM_THREADS"] = "2"
+    # Pin to this worker's CPU slice (if cpus= was set) and size threads: explicit
+    # cpu_threads > slice size > the default 2-thread cap that avoids oversubscription.
+    _setup_cpu(cpu_affinity, cpu_threads, worker_desc)
 
     _increase_fd_limit(worker_desc)
 
@@ -1000,6 +1053,10 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
     pipe_instance.stage_spawn_counts[stage_idx] += 1
     worker_id = f"stage_{stage_idx}_worker_{new_worker_idx}"
 
+    # cpus= stages force autoscale off (a static pin can't track a live worker count),
+    # so this is normally None; computed defensively to keep the args arity consistent.
+    cpu_affinity = _cpu_chunk(job.get("cpus"), new_worker_idx, job.get("num_workers", 1))
+
     _log(f"Autoscaling: Adding worker {new_worker_idx + 1} to {stage_name} (stage {stage_idx})")
 
     in_queue = pipe_instance.queues[stage_idx - 1] if stage_idx > 0 else None
@@ -1038,6 +1095,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             job.get("drain", True),
             pipe_instance.queues,
             [j["name"] for j in pipe_instance.jobs],
+            cpu_affinity,
+            job.get("cpu_threads"),
         )
         proc = Process(target=_threaded_worker_run, args=args, daemon=True)
     else:
@@ -1065,6 +1124,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             job.get("drain", True),
             pipe_instance.queues,
             [j["name"] for j in pipe_instance.jobs],
+            cpu_affinity,
+            job.get("cpu_threads"),
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 

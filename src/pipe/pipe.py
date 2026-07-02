@@ -119,6 +119,8 @@ class Pipe(LifecycleMixin, SequentialMixin):
         thread=False,
         gpu_id=None,
         gpus=None,
+        cpus=None,
+        cpu_threads=None,
         autoscale=None,
         min_workers=None,
         max_workers=None,
@@ -204,6 +206,38 @@ class Pipe(LifecycleMixin, SequentialMixin):
         else:
             actual_workers = workers
 
+        # CPU affinity pool (orthogonal to GPU pinning — a stage may set both, e.g. a
+        # GPU feeder pinned to reserved cores). `cpus=[0..15]` is chunked across the
+        # stage's workers (each gets a contiguous slice + threads sized to it); disjoint
+        # pools on different stages reserve cores (keep mel off the GPU-feeder cores).
+        # Validated here so a bad core id fails at add(), not in a worker's setaffinity.
+        if cpus is not None:
+            cpu_list = [int(c) for c in cpus]
+            if not cpu_list:
+                raise ValueError(
+                    f"{stage_name}: cpus=[] is empty — pass at least one CPU id, "
+                    f"or omit cpus for an unpinned stage"
+                )
+            ncpu = os.cpu_count() or 0
+            bad = sorted({c for c in cpu_list if c < 0 or c >= ncpu})
+            if bad:
+                raise ValueError(
+                    f"{stage_name}: cpus reference CPU(s) {bad}, but the box has "
+                    f"{ncpu} CPU(s) (valid ids 0..{ncpu - 1})"
+                )
+        else:
+            cpu_list = None
+
+        # Per-worker BLAS/torch thread count. Independent of pinning: lifts the flat
+        # 2-thread cap for a CPU-heavy stage (e.g. mel) without reserving cores. When
+        # both are set, cpu_threads wins over the cpus= slice size (see _setup_cpu).
+        if cpu_threads is not None and (
+            isinstance(cpu_threads, bool) or not isinstance(cpu_threads, int) or cpu_threads < 1
+        ):
+            raise ValueError(
+                f"{stage_name}: cpu_threads must be a positive int, got {cpu_threads!r}"
+            )
+
         if max_workers is None:
             default_max = actual_workers * 4
         else:
@@ -229,6 +263,12 @@ class Pipe(LifecycleMixin, SequentialMixin):
         else:
             stage_autoscale = self.autoscale
 
+        # A static core pin can't track a live worker count, so cpus= disables autoscale
+        # (same reasoning as GPU stages above).
+        if cpu_list is not None and stage_autoscale:
+            _log(f"  {stage_name}: autoscale disabled for CPU-pinned stage")
+            stage_autoscale = False
+
         if max_workers is None and stage_autoscale and not is_gpu_stage:
             effective_max = self.max_workers_per_stage
 
@@ -242,6 +282,8 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 "thread": thread,
                 "gpu_id": gpu_id,
                 "gpus": gpu_list,  # canonical GPU pool (round-robin per worker)
+                "cpus": cpu_list,  # canonical CPU pool (chunked per worker), or None
+                "cpu_threads": cpu_threads,  # explicit per-worker thread count, or None
                 "is_gpu_stage": is_gpu_stage,
                 "autoscale": stage_autoscale,
                 "max_workers": effective_max,
