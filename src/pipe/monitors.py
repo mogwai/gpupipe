@@ -136,6 +136,14 @@ def _collect_stats(pipe_instance):
             qsize = 0
             qmax = 0
 
+        # On a chunked edge each queue message holds up to chunk_eff items, so
+        # scale the display back to ITEMS (upper-bound estimate). The fill
+        # ratio — what the autoscaler thresholds use — is unchanged by this.
+        chunk_eff = pipe_instance.jobs[stage_idx].get("chunk_eff", 0)
+        if chunk_eff > 1:
+            qsize *= chunk_eff
+            qmax *= chunk_eff
+
         stage_items = 0
         stage_rtf = 0.0
         avg_worker_rtf = 0.0

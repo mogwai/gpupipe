@@ -127,6 +127,8 @@ pipe.add(GPUInference(), pergpu=True, batch=16, outqn=50)
 
 The framework collects up to N items greedily (drains queue without blocking), then calls `__call__` with whatever's available. Partial batches are normal — no need to wait for a full batch.
 
+The edge feeding a `batch=N` stage is automatically **transport-chunked** at N (see "Chunked transport"): the upstream worker ships N items per queue message, so the collector assembles a full batch from one queue op instead of N.
+
 At shutdown, the framework calls `flush()` if it exists to emit remaining buffered items.
 
 ### Async IO Worker (batched async downloads)
@@ -286,6 +288,14 @@ pipe.add(worker,
                         # Lifts the default flat 2-thread cap for a CPU-heavy stage (mel)
                         # WITHOUT pinning. With cpus= too, this wins over the slice size.
     batch=16,           # framework collects up to N items, __call__ receives a list
+    chunk=None,         # OUTPUT-edge transport chunking: bundle N serialized items into
+                        # ONE queue message. None (default) = auto: adopts the DOWNSTREAM
+                        # stage's batch size, so edges feeding batch=B stages chunk at B.
+                        # 0 = force off. Explicit N = chunk at N (e.g. set on the final
+                        # stage to speed up consumer iteration). Big win on high-rate
+                        # small-item edges; see "Chunked transport" below.
+    chunk_ms=10.0,      # max age of a partial chunk before it's flushed anyway, so a
+                        # short batch / slow trickle never waits for chunk-mates
     autoscale=True,     # enable autoscaling for this stage (disabled for GPU/CPU-pinned stages)
     min_workers=1,      # autoscale floor (won't scale below)
     max_workers=8,      # autoscale ceiling (won't scale above)
@@ -299,6 +309,48 @@ pipe.add(worker,
 - `outqn=None`: Unlimited (use for GPU stages with variable latency)
 - Small (10-50): Tight backpressure, low memory, good for large items (audio tensors)
 - Large (200-1024): Smooth throughput, higher memory, good for small items (metadata dicts)
+
+## Chunked transport (chunk= / chunk_ms=)
+
+Every `put`/`get` on an mp.Queue costs a lock acquisition, a pipe write, and a
+consumer wakeup — and under multi-worker contention the single queue lock
+serializes. `chunk=N` bundles N **already-serialized** items into ONE queue
+message (a `Chunk`), amortizing that cost by N. Items inside a chunk are still
+independent `_item_to_shm` payloads, so **torch fd-sharing / shm-refs are
+unchanged** — only the message count drops.
+
+**Auto mode (default):** an edge feeding a `batch=B` stage chunks at B, so one
+queue message = one downstream batch, and the batch collector fills from a
+single `get` instead of B. Edges not feeding a batch stage stay unchunked
+(preserves fine-grained fan-out). Force with explicit `chunk=N`, disable with
+`chunk=0`.
+
+**Flush rule (why short batches still get through):** a chunk is emitted when
+it reaches `chunk` items OR its oldest item is `chunk_ms` (default 10ms) old OR
+the worker exits (End sentinels always come after the final flush). Under high
+load chunks fill instantly (max throughput); under low load the timeout fires
+with small chunks (low latency, fine-grained fan-out). Latency bound for a
+partial chunk is `max(chunk_ms, current worker call duration)`.
+
+**Semantics preserved:**
+- `outqn` stays in ITEMS — the underlying queue maxsize is scaled down by the
+  chunk factor, so backpressure triggers at the same item count.
+- Stats display scales `qsize`/`qmax` back to items; autoscaler thresholds use
+  fill ratios, which are unit-invariant.
+- `push()` back-edge items are bare messages and coexist with chunks on the
+  same queue.
+- A worker holding chunk-buffered input when told to scale down (`worker_stop`)
+  re-queues that buffer for its siblings — nothing is dropped.
+- A chunk is grabbed whole by ONE downstream worker. That's the deliberate
+  trade: on a chunked edge, work is handed out N items at a time. Auto mode
+  aligns this with `batch=` (which wants N at a time anyway); don't chunk edges
+  where single heavy items need to spread across workers.
+
+**When it helps:** high-rate small/metadata items (DB rows, shm refs, dicts) —
+benchmark: ~1.7x end-to-end on a no-op batch pipeline (scripts/bench_chunking.py),
+more the more queue-bound the edge. **When it doesn't:** big-tensor edges — the
+fd-sharing default already moves payload out-of-band, so message count is not
+the bottleneck; chunking a tensor edge also pins N tensors' handles per message.
 
 ## Pipe() Options
 

@@ -13,6 +13,7 @@ from queue import Empty, Full
 import torch
 
 from .types import End
+from .queues import _InputChannel, _OutputChannel
 from .shm import _item_from_shm, _item_to_shm
 
 
@@ -218,6 +219,8 @@ def _worker_run(
     stage_names=None,
     cpu_affinity=None,
     cpu_threads=None,
+    out_chunk=0,
+    out_chunk_ms=10.0,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -244,13 +247,29 @@ def _worker_run(
 
     _has_custom_run = hasattr(worker, "run") and not is_root
 
+    # All reads go through a chunk-aware channel: transparently unpacks Chunk
+    # messages (many payloads per queue op) while passing bare items and
+    # sentinels straight through.
+    in_ch = _InputChannel(in_queue) if in_queue is not None else None
+
+    # All writes go through an output channel. With out_chunk > 0 it bundles N
+    # serialized payloads into ONE queue message (size-OR-timeout flush); with
+    # out_chunk=0 it is a plain blocking put — identical to the old inline loops.
+    out_ch = (
+        _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms)
+        if out_queue is not None else None
+    )
+
+    def _emit(obj):
+        out_ch.send(_item_to_shm(obj, skip=_skip_shm_for_output(is_final_stage)))
+
     # Inject pull/put for workers with run()
     if _has_custom_run and in_queue is not None:
         def _pull(n=batch_size or 1):
             items = []
             while len(items) < n and not should_stop.value:
                 try:
-                    raw = in_queue.get_nowait()
+                    raw = in_ch.get_nowait()
                 except Empty:
                     if items:
                         break  # got partial batch, return it
@@ -259,12 +278,16 @@ def _worker_run(
                     time.sleep(0.01)
                     continue
                 if raw == "worker_stop":
-                    in_queue.put("worker_stop")
+                    in_ch.put("worker_stop")
                     break
                 raw = _item_from_shm(raw)
                 if _is_end(raw):
                     continue
                 items.append(raw)
+            # No fresh input: a partial output chunk older than chunk_ms must
+            # not wait for more sends to flush it.
+            if not items and out_ch is not None:
+                out_ch.maybe_flush()
             return items
         worker.pull = _pull
 
@@ -272,13 +295,7 @@ def _worker_run(
         def _put(item):
             if item is None:
                 return
-            serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-            while True:
-                try:
-                    out_queue.put(serialized, timeout=0.1)
-                    return
-                except Full:
-                    time.sleep(0.01)
+            _emit(item)
         worker.put = _put
 
     # push(stage, item): send an item BACK to an earlier stage's input queue
@@ -342,6 +359,9 @@ def _worker_run(
                 print(f"Worker {worker_desc} FD check: {fd_info['fd_count']}/{fd_info['soft_limit']} (items: {items_processed})")
             last_fd_check = now
 
+        if out_ch is not None:
+            out_ch.maybe_flush()
+
         try:
             if should_stop.value == 1:
                 break
@@ -368,14 +388,7 @@ def _worker_run(
                             items_processed += 1
                             total_audio_duration += extract_audio_duration(gen_item)
                         if out_queue:
-                            serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                            while True:
-                                try:
-                                    out_queue.put(serialized, timeout=0.1)
-                                    break
-                                except Full:
-                                    time.sleep(0.01)  # Backoff before retry
-                                    continue
+                            _emit(gen_item)
                     # Generator exhausted = done
                     if timing_dict is not None and worker_id is not None:
                         total_process_time += time.time() - start_time
@@ -411,21 +424,14 @@ def _worker_run(
 
                 if out_queue:
                     for item in valid_items:
-                        serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                        while True:
-                            try:
-                                out_queue.put(serialized, timeout=0.1)
-                                break
-                            except Full:
-                                time.sleep(0.01)  # Backoff before retry
-                                continue
+                        _emit(item)
 
                 if has_end:
                     break
 
             else:
                 try:
-                    item = in_queue.get(timeout=0.1)
+                    item = in_ch.get(timeout=0.1)
                     consecutive_empty = 0
                 except Empty:
                     consecutive_empty += 1
@@ -438,6 +444,12 @@ def _worker_run(
 
                 if item == "worker_stop":
                     _log(f"Worker {worker_id} received stop signal, exiting gracefully")
+                    # Items already unpacked from a chunk belong back on the shared
+                    # queue — siblings must process them, we're leaving the pool.
+                    in_ch.requeue_buffered(should_stop)
+                    # And a partial output chunk must reach downstream.
+                    if out_ch is not None:
+                        out_ch.flush()
                     # Skip coordination - we were removed from the pool, not finishing normally
                     # (count was already decremented in _signal_worker_to_stop)
                     while should_stop is not None and not should_stop.value:
@@ -459,13 +471,13 @@ def _worker_run(
                         if remaining <= 0:
                             break
                         try:
-                            raw = in_queue.get(timeout=min(remaining, 0.01))
+                            raw = in_ch.get(timeout=min(remaining, 0.01))
                         except Empty:
                             if time.monotonic() >= deadline:
                                 break
                             continue
                         if raw == "worker_stop":
-                            in_queue.put("worker_stop")
+                            in_ch.put("worker_stop")
                             break
                         raw = _item_from_shm(raw)
                         if _is_end(raw):
@@ -496,14 +508,7 @@ def _worker_run(
                             continue
                         gen_count += 1
                         if out_queue:
-                            serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                            while True:
-                                try:
-                                    out_queue.put(serialized, timeout=0.1)
-                                    break
-                                except Full:
-                                    time.sleep(0.01)  # Backoff before retry
-                                    continue
+                            _emit(gen_item)
                     if timing_dict is not None and worker_id is not None:
                         items_processed += n_items
                         total_process_time += time.time() - start_time
@@ -539,14 +544,7 @@ def _worker_run(
 
                 if out_queue:
                     for out_item in valid_items:
-                        serialized = _item_to_shm(out_item, skip=_skip_shm_for_output(is_final_stage))
-                        while True:
-                            try:
-                                out_queue.put(serialized, timeout=0.1)
-                                break
-                            except Full:
-                                time.sleep(0.01)  # Backoff before retry
-                                continue
+                        _emit(out_item)
 
         except (ConnectionError, FileNotFoundError):
             should_stop.value = 2
@@ -564,16 +562,14 @@ def _worker_run(
                 _log(f"Worker {worker_desc} flushing {len(flushed_items)} items via flush()")
                 for item in flushed_items:
                     if item is not None:
-                        serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                        while True:
-                            try:
-                                out_queue.put(serialized, timeout=0.1)
-                                break
-                            except Full:
-                                time.sleep(0.01)  # Backoff before retry
-                                continue
+                        _emit(item)
         except Exception as e:
             print(f"Worker {worker_desc} flush() error: {e}")
+
+    # Emit any partial output chunk BEFORE sibling coordination: the last
+    # finisher puts the End sentinel, which must never overtake pending items.
+    if out_ch is not None:
+        out_ch.flush()
 
     # Coordinate with siblings
     if stage_end_counter is not None and stage_worker_count is not None:
@@ -631,6 +627,8 @@ def _threaded_worker_run(
     stage_names=None,
     cpu_affinity=None,
     cpu_threads=None,
+    out_chunk=0,
+    out_chunk_ms=10.0,
 ):
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -660,13 +658,16 @@ def _threaded_worker_run(
 
     _has_custom_run = hasattr(worker, "run") and not is_root
 
-    # Inject pull/put for workers with run()
+    # Inject pull/put for workers with run(). run() is invoked once (not per
+    # thread), so a single chunk-aware channel is safe here.
     if _has_custom_run and in_queue is not None:
+        _pull_ch = _InputChannel(in_queue)
+
         def _pull(n=batch_size or 1):
             items = []
             while len(items) < n and not should_stop.value and not thread_stop.is_set():
                 try:
-                    raw = in_queue.get_nowait()
+                    raw = _pull_ch.get_nowait()
                 except Empty:
                     if items:
                         break  # got partial batch, return it
@@ -675,7 +676,7 @@ def _threaded_worker_run(
                     time.sleep(0.01)
                     continue
                 if raw == "worker_stop":
-                    in_queue.put("worker_stop")
+                    _pull_ch.put("worker_stop")
                     break
                 raw = _item_from_shm(raw)
                 if _is_end(raw):
@@ -684,17 +685,15 @@ def _threaded_worker_run(
             return items
         worker.pull = _pull
 
+    _put_ch = None
     if _has_custom_run and out_queue is not None:
+        # run() is invoked once (single-threaded), so one output channel is safe.
+        _put_ch = _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms)
+
         def _put(item):
             if item is None:
                 return
-            serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-            while True:
-                try:
-                    out_queue.put(serialized, timeout=0.1)
-                    return
-                except Full:
-                    time.sleep(0.01)
+            _put_ch.send(_item_to_shm(item, skip=_skip_shm_for_output(is_final_stage)))
         worker.put = _put
 
     # push(stage, item): send an item BACK to an earlier stage (see _make_push).
@@ -722,6 +721,9 @@ def _threaded_worker_run(
                 worker_id=worker_id,
                 worker_start_wall_time=time.time(),
             )
+        # Partial output chunk must land before the End sentinel below.
+        if _put_ch is not None:
+            _put_ch.flush()
         if stage_end_counter is not None and stage_worker_count is not None:
             with stage_end_counter.get_lock():
                 stage_end_counter.value += 1
@@ -767,8 +769,32 @@ def _threaded_worker_run(
         local_audio = 0.0
         consecutive_empty = 0
         EMPTY_THRESHOLD = 30
+        # Per-thread channels: neither the input chunk buffer nor the output
+        # pending list is thread-safe, so each thread owns its own. A chunk
+        # grabbed by one thread is processed wholly by that thread.
+        in_ch = _InputChannel(in_queue) if in_queue is not None else None
+        out_ch = (
+            _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms)
+            if out_queue is not None else None
+        )
 
+        def _emit(obj):
+            out_ch.send(_item_to_shm(obj, skip=_skip_shm_for_output(is_final_stage)))
+
+        try:
+            _thread_loop(in_ch, out_ch, _emit, local_items, local_time, local_audio,
+                         consecutive_empty, EMPTY_THRESHOLD)
+        finally:
+            # Every exit path (done, worker_stop, force stop, error) must emit
+            # the partial chunk; _blocking_put gives up if should_stop is set.
+            if out_ch is not None:
+                out_ch.flush()
+
+    def _thread_loop(in_ch, out_ch, _emit, local_items, local_time, local_audio,
+                     consecutive_empty, EMPTY_THRESHOLD):
         while not should_stop.value and not thread_stop.is_set():
+            if out_ch is not None:
+                out_ch.maybe_flush()
             try:
                 if (not drain) and drain_event is not None and drain_event.is_set():
                     return
@@ -791,13 +817,7 @@ def _threaded_worker_run(
                                 local_items += 1
                                 local_audio += extract_audio_duration(gen_item)
                             if out_queue:
-                                serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                                while True:
-                                    try:
-                                        out_queue.put(serialized, timeout=0.1)
-                                        break
-                                    except Full:
-                                        continue
+                                _emit(gen_item)
                         # Generator exhausted = done
                         if timing_dict is not None and worker_id is not None:
                             local_time += time.time() - start_time
@@ -821,21 +841,14 @@ def _threaded_worker_run(
 
                     if out_queue:
                         for item in valid_items:
-                            serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                            while True:
-                                try:
-                                    out_queue.put(serialized, timeout=0.1)
-                                    break
-                                except Full:
-                                    time.sleep(0.01)  # Backoff before retry
-                                    continue
+                            _emit(item)
 
                     if has_end:
                         thread_stop.set()
                         return
                 else:
                     try:
-                        item = in_queue.get(timeout=0.1)
+                        item = in_ch.get(timeout=0.1)
                         consecutive_empty = 0
                     except Empty:
                         consecutive_empty += 1
@@ -849,10 +862,13 @@ def _threaded_worker_run(
                     if should_stop.value:
                         with contextlib.suppress(Full):
                             in_queue.put(item)
+                        in_ch.requeue_buffered(should_stop)
                         return
 
                     if item == "worker_stop":
                         _log(f"Thread {worker_id} received stop signal")
+                        # Return chunk-buffered items to the shared queue for siblings.
+                        in_ch.requeue_buffered(should_stop)
                         # Just exit - coordination is skipped for stopped workers
                         # (count was already decremented in _signal_worker_to_stop)
                         return
@@ -872,13 +888,13 @@ def _threaded_worker_run(
                             if remaining <= 0:
                                 break
                             try:
-                                raw = in_queue.get(timeout=min(remaining, 0.01))
+                                raw = in_ch.get(timeout=min(remaining, 0.01))
                             except Empty:
                                 if time.monotonic() >= deadline:
                                     break
                                 continue
                             if raw == "worker_stop":
-                                in_queue.put("worker_stop")
+                                in_ch.put("worker_stop")
                                 break
                             raw = _item_from_shm(raw)
                             if _is_end(raw):
@@ -907,13 +923,7 @@ def _threaded_worker_run(
                             if gen_item is None or _is_end(gen_item):
                                 continue
                             if out_queue:
-                                serialized = _item_to_shm(gen_item, skip=_skip_shm_for_output(is_final_stage))
-                                while True:
-                                    try:
-                                        out_queue.put(serialized, timeout=0.1)
-                                        break
-                                    except Full:
-                                        continue
+                                _emit(gen_item)
                         if timing_dict is not None and worker_id is not None:
                             local_items += n_items
                             local_time += time.time() - start_time
@@ -949,14 +959,7 @@ def _threaded_worker_run(
 
                     if out_queue:
                         for out_item in valid_items:
-                            serialized = _item_to_shm(out_item, skip=_skip_shm_for_output(is_final_stage))
-                            while True:
-                                try:
-                                    out_queue.put(serialized, timeout=0.1)
-                                    break
-                                except Full:
-                                    time.sleep(0.01)  # Backoff before retry
-                                    continue
+                            _emit(out_item)
 
             except (ConnectionError, FileNotFoundError):
                 should_stop.value = 2
@@ -1097,6 +1100,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             [j["name"] for j in pipe_instance.jobs],
             cpu_affinity,
             job.get("cpu_threads"),
+            job.get("chunk_eff", 0),
+            job.get("chunk_ms", 10.0),
         )
         proc = Process(target=_threaded_worker_run, args=args, daemon=True)
     else:
@@ -1126,6 +1131,8 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             [j["name"] for j in pipe_instance.jobs],
             cpu_affinity,
             job.get("cpu_threads"),
+            job.get("chunk_eff", 0),
+            job.get("chunk_ms", 10.0),
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 

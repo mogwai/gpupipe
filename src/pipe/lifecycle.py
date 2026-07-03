@@ -81,7 +81,29 @@ class LifecycleMixin:
         self.stage_spawn_counts = [job["num_workers"] for job in self.jobs]
 
         for i, job in enumerate(self.jobs):
+            # Resolve output-edge chunking. Explicit chunk= wins (0 = force off);
+            # otherwise auto-adopt the DOWNSTREAM stage's batch size, so an edge
+            # feeding a batch=B stage moves one B-item Chunk per queue op instead
+            # of B separate messages. Stored on the job so autoscale/restart
+            # respawns keep the same transport config.
+            if job.get("chunk") is not None:
+                job["chunk_eff"] = max(0, int(job["chunk"]))
+            elif i + 1 < len(self.jobs) and self.jobs[i + 1].get("batch", 0) > 1:
+                job["chunk_eff"] = self.jobs[i + 1]["batch"]
+            else:
+                job["chunk_eff"] = 0
+            if job["chunk_eff"] > 0:
+                _log(
+                    f"Stage {i} ({job['name']}): output chunked x{job['chunk_eff']} "
+                    f"(flush {job.get('chunk_ms', 10.0)}ms)"
+                )
+
+            # outqn is specified in ITEMS. On a chunked edge each queue slot holds
+            # up to chunk_eff items, so scale maxsize down to keep the same item
+            # capacity (and the same backpressure point). 0 stays unbounded.
             outq_size = job.get("outqn") or 0
+            if outq_size and job["chunk_eff"] > 1:
+                outq_size = max(1, outq_size // job["chunk_eff"])
             q = Queue(maxsize=outq_size)
             self.queues.append(InstrumentedQueue(q) if self.debug else q)
             self.stage_end_counters.append(Value("i", 0))
@@ -150,6 +172,8 @@ class LifecycleMixin:
                             stage_names_all,
                             cpu_affinity,
                             job.get("cpu_threads"),
+                            job.get("chunk_eff", 0),
+                            job.get("chunk_ms", 10.0),
                         )
 
                         self.worker_configs[worker_id] = {
@@ -195,6 +219,8 @@ class LifecycleMixin:
                         stage_names_all,
                         cpu_affinity,
                         job.get("cpu_threads"),
+                        job.get("chunk_eff", 0),
+                        job.get("chunk_ms", 10.0),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -244,6 +270,8 @@ class LifecycleMixin:
                         stage_names_all,
                         cpu_affinity,
                         job.get("cpu_threads"),
+                        job.get("chunk_eff", 0),
+                        job.get("chunk_ms", 10.0),
                     )
 
                     self.worker_configs[worker_id] = {
@@ -429,8 +457,10 @@ class LifecycleMixin:
                     job.get("drain", True),
                     self.queues,
                     [j["name"] for j in self.jobs],
-                    old_args[-2],  # cpu_affinity slice, unchanged across restart
-                    old_args[-1],  # cpu_threads, unchanged across restart
+                    old_args[24],  # cpu_affinity slice, unchanged across restart
+                    old_args[25],  # cpu_threads, unchanged across restart
+                    job.get("chunk_eff", 0),
+                    job.get("chunk_ms", 10.0),
                 )
             else:
                 new_args = (
@@ -457,8 +487,10 @@ class LifecycleMixin:
                     job.get("drain", True),
                     self.queues,
                     [j["name"] for j in self.jobs],
-                    old_args[-2],  # cpu_affinity slice, unchanged across restart
-                    old_args[-1],  # cpu_threads, unchanged across restart
+                    old_args[23],  # cpu_affinity slice, unchanged across restart
+                    old_args[24],  # cpu_threads, unchanged across restart
+                    job.get("chunk_eff", 0),
+                    job.get("chunk_ms", 10.0),
                 )
 
             config["args"] = new_args

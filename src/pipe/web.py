@@ -31,6 +31,7 @@ except ImportError:
     HAS_LZ4 = False
 
 from .pipe import Pipe
+from .queues import _InputChannel
 from .shm import _item_from_shm
 from .types import End
 
@@ -115,15 +116,20 @@ class PipeServer:
             lifespan=lifespan,
         )
 
+        # Chunk-aware reader over the final queue (single-threaded handler).
+        self._out_ch = _InputChannel(self.pipe.queues[-1]) if self.pipe.queues else None
+
         @app.get("/next")
         async def get_next():
             try:
+                if self._out_ch is None or self._out_ch.queue is not self.pipe.queues[-1]:
+                    self._out_ch = _InputChannel(self.pipe.queues[-1])
                 deadline = time.time() + self.timeout
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         raise Empty
-                    raw = self.pipe.queues[-1].get(timeout=remaining)
+                    raw = self._out_ch.get(timeout=remaining)
                     item = _item_from_shm(raw)
                     if item is End:
                         continue  # skip completion sentinel, keep waiting for a real item
