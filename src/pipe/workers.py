@@ -234,7 +234,17 @@ def _worker_run(
 
     if gpu_id is not None:
         try:
-            torch.cuda.set_device(gpu_id)
+            # Isolate this process to its GPU *before* any CUDA context is created.
+            # set_device() alone initializes CUDA, and some model/library loads then
+            # create a second bare ~500 MB primary context on cuda:0 regardless of the
+            # current device. Pinning visibility to the one GPU (env var, honoured
+            # only while no context exists yet — which is true here) makes that
+            # impossible. Physical id stays discoverable via CUDA_VISIBLE_DEVICES.
+            # Safe because this is one process per GPU; the *threaded* GPU worker
+            # keeps set_device() (CUDA_VISIBLE_DEVICES is process-global, so it can't
+            # isolate co-resident GPU threads).
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            torch.cuda.set_device(0)  # logical 0 == physical gpu_id
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
 
