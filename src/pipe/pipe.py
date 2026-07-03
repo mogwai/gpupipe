@@ -16,7 +16,7 @@ def _log(msg):
 
 from .lifecycle import LifecycleMixin
 from .monitors import _collect_stats
-from .queues import InstrumentedQueue, PipeIterator  # noqa: F401 (kept importable from pipe.pipe)
+from .queues import InstrumentedQueue, PipeIterator, _InputChannel  # noqa: F401 (kept importable from pipe.pipe)
 from .sequential import SequentialMixin
 from .shm import _cleanup_stale_shm, _item_from_shm
 from .workers import _check_picklable, _is_end
@@ -126,6 +126,8 @@ class Pipe(LifecycleMixin, SequentialMixin):
         max_workers=None,
         batch=0,
         drain=True,
+        chunk=None,
+        chunk_ms=10.0,
     ):
         if hasattr(func, "__name__"):
             stage_name = func.__name__
@@ -290,6 +292,12 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 "min_workers": min_workers if min_workers is not None else 1,
                 "batch": batch,
                 "drain": drain,
+                # Output-edge chunking: bundle N serialized items into one queue
+                # message (huge win for small/metadata items; the per-item torch
+                # fd-sharing is unchanged). None = auto: adopt the downstream
+                # stage's batch size (resolved in start()). 0 = force off.
+                "chunk": chunk,
+                "chunk_ms": chunk_ms,
             }
         )
 
@@ -316,7 +324,10 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 self.drain_event.set()
                 stopped = [j["name"] for j in self.jobs if not j.get("drain", True)]
                 stopped_str = ", ".join(stopped) if stopped else "root"
-                in_flight = sum(q.qsize() for q in self.queues)
+                in_flight = sum(
+                    q.qsize() * max(1, j.get("chunk_eff", 0))
+                    for q, j in zip(self.queues, self.jobs)
+                )
                 print(
                     f"Starting to drain... {stopped_str} stopped (their inputs are not drained); "
                     f"finishing ~{in_flight} items already in the pipeline. "
@@ -329,16 +340,20 @@ class Pipe(LifecycleMixin, SequentialMixin):
             final_done = self.stage_done_events[-1]
             consecutive_empty = 0
             EMPTY_THRESHOLD = 5
+            # Chunk-aware reader over the final queue. Rebuilt after restart()
+            # because restart may recreate the underlying queue objects.
+            out_ch = _InputChannel(self.queues[-1])
 
             while True:
                 if self.should_stop.value == 2:
                     _log("Worker encountered connection error - restarting pipeline...")
                     self.restart(reason="Worker connection error")
+                    out_ch = _InputChannel(self.queues[-1])
                     consecutive_empty = 0
                     continue
 
                 try:
-                    item = self.queues[-1].get(timeout=0.1)
+                    item = out_ch.get(timeout=0.1)
                     consecutive_empty = 0
                     item = _item_from_shm(item)
 
@@ -354,6 +369,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
                         return
                 except (ConnectionError, FileNotFoundError):
                     self.restart()
+                    out_ch = _InputChannel(self.queues[-1])
                     consecutive_empty = 0
                 except KeyboardInterrupt:
                     # Second Ctrl+C: default handler restored, KeyboardInterrupt fired.
