@@ -99,9 +99,15 @@ def _make_push(all_queues, stage_names, should_stop):
         for i, nm in enumerate(stage_names):
             name_to_idx.setdefault(nm, i)  # first match wins
 
-    def _push(stage, item, block=True):
+    def _push(stage, item, block=True, timeout=None):
+        """Returns True if the item landed on the target queue, False if it was
+        dropped (block=False + Full, `timeout` seconds elapsed, or stop). A
+        back-edge push can face a PERMANENTLY full queue under steady-state
+        backpressure (upstream producers instantly refill freed slots), so an
+        unbounded push from a forward-flow worker can deadlock the whole pipe —
+        always pass a timeout from inside a stage and handle False."""
         if item is None:
-            return
+            return False
         if isinstance(stage, bool):
             raise TypeError("push: stage must be an index, name, or class")
         if isinstance(stage, int):
@@ -122,15 +128,21 @@ def _make_push(all_queues, stage_names, should_stop):
         target = all_queues[idx - 1]  # input queue of stage idx == output of idx-1
         serialized = _item_to_shm(item, skip=False)
         if not block:
-            with contextlib.suppress(Full):
+            try:
                 target.put_nowait(serialized)
-            return
+                return True
+            except Full:
+                return False
+        deadline = None if timeout is None else time.monotonic() + timeout
         while not (should_stop is not None and should_stop.value):
             try:
                 target.put(serialized, timeout=0.1)
-                return
+                return True
             except Full:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
                 time.sleep(0.01)
+        return False
 
     return _push
 
