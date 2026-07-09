@@ -12,7 +12,7 @@ Templates (need your own S3 bucket / DB — adapt the config):
 
 | Example | Shows |
 |---------|-------|
-| [s3_downloader.py](s3_downloader.py) | Batched async S3 downloads with obstore: `batch=N` + per-worker event loop |
+| [s3_downloader.py](s3_downloader.py) | Streaming S3 downloads: `AsyncPoolWorker` keeps N GETs in flight, no batch barrier |
 | [basic_download.py](basic_download.py) | DB query → threaded downloads → process → DB update |
 | [batch_s3_upload.py](batch_s3_upload.py) | Batched obstore download + upload with `thread=True` and `flush()` |
 | [gpu_inference.py](gpu_inference.py) | GPU inference with `pergpu=True` and batching |

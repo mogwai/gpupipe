@@ -5,7 +5,7 @@ Run with: pytest test_utils.py -q
 import time
 
 from pipe import Pipe, End
-from pipe.utils import Batcher, BufferAndShuffle
+from pipe.utils import AsyncPoolWorker, Batcher, BufferAndShuffle
 
 
 # === Batcher ===
@@ -105,3 +105,70 @@ def test_batcher_pipeline_no_loss():
         ])
         assert {r["id"] for r in results} == set(range(n)), f"thread={thread}"
         assert len(results) == n, f"thread={thread} got {len(results)}"
+
+
+# === AsyncPoolWorker (streaming async pool, run()/pull()/put()) ===
+
+class VariableLatencySource:
+    def __init__(self, n):
+        self.n = n
+        self._i = 0
+
+    def __call__(self):
+        if self._i >= self.n:
+            return End
+        item = {"id": self._i, "delay": ((self.n - self._i) % 7) * 0.02}
+        self._i += 1
+        if self._i >= self.n:
+            return [item, End]
+        return item
+
+
+class SlowFetch(AsyncPoolWorker):
+    """Simulated download whose latency varies per item; id 13 fails."""
+
+    async def process(self, item):
+        import asyncio
+        await asyncio.sleep(item["delay"])
+        if item["id"] == 13:
+            raise ValueError("permanent failure")
+        item["fetched"] = True
+        return item
+
+
+class ExpandingFetch(AsyncPoolWorker):
+    async def process(self, item):
+        return [{"id": item["id"], "part": p} for p in range(2)]
+
+
+def test_async_pool_worker_multiprocess():
+    """All items arrive despite out-of-order completion; the failing one drops."""
+    n = 20
+    results = _run([
+        (VariableLatencySource(n), {"outqn": 50}),
+        (SlowFetch(max_concurrent=8), {"workers": 1, "outqn": 50}),
+        (Collector(), {"workers": 1, "outqn": 0}),
+    ])
+    ids = sorted(r["id"] for r in results)
+    assert ids == [i for i in range(n) if i != 13]
+    assert all(r["fetched"] for r in results)
+
+
+def test_async_pool_worker_sequential():
+    n = 10
+    pipe = Pipe(sequential=True, stats_interval=0)
+    pipe.add(VariableLatencySource(n))
+    pipe.add(SlowFetch(max_concurrent=4), workers=1)
+    ids = sorted(item["id"] for item in pipe)
+    assert ids == [i for i in range(n) if i != 13]
+
+
+def test_async_pool_worker_list_expansion():
+    n = 6
+    results = _run([
+        (VariableLatencySource(n), {"outqn": 20}),
+        (ExpandingFetch(max_concurrent=4), {"workers": 1, "outqn": 20}),
+        (Collector(), {"workers": 1, "outqn": 0}),
+    ])
+    assert len(results) == n * 2
+    assert {(r["id"], r["part"]) for r in results} == {(i, p) for i in range(n) for p in range(2)}
