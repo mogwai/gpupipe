@@ -4,6 +4,12 @@ import hashlib
 import random
 import pytest
 
+# planned/ holds suites for preserved-but-unwired features (see PLANNED.md).
+# collect_ignore is anchored to this conftest's directory, so the exclusion
+# holds from any invocation cwd (unlike addopts --ignore, which is
+# cwd-relative). The suites also carry their own module-level skip marks.
+collect_ignore = ["planned"]
+
 try:
     import torch
     HAS_TORCH = True
@@ -163,29 +169,6 @@ class Collector:
         pass
 
     def __call__(self, item):
-        return item
-
-
-# === AUTOSCALING WORKER CLASSES ===
-
-class VerySlowWorker:
-    """Worker with 100ms delay for autoscale testing."""
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        time.sleep(0.1)
-        return item
-
-
-class VariableSlowWorker:
-    """Worker with variable processing time based on item."""
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        delay = 0.02 + (item["id"] % 10) * 0.01
-        time.sleep(delay)
         return item
 
 

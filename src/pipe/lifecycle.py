@@ -1,4 +1,4 @@
-"""Process lifecycle for a pipeline: spawning stage workers, health/stats/autoscale
+"""Process lifecycle for a pipeline: spawning stage workers, health/stats
 monitor threads, per-worker and per-stage restart, and graceful/forced shutdown.
 
 Mixed into `Pipe` (methods keep operating on `self`); split out to keep pipe.py
@@ -14,7 +14,6 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
 from .monitors import (
-    _autoscaler_thread,
     _health_monitor_thread,
     _stats_monitor_thread,
     _stats_monitor_thread_text,
@@ -75,17 +74,12 @@ class LifecycleMixin:
 
         _log("Setting up multiprocessing...")
 
-        # Monotonic per-stage id allocator for autoscaled workers. Never reuses an
-        # index (unlike the live stage_worker_counts, which is decremented on
-        # scale-down) so spawned workers can't collide with a still-live worker id.
-        self.stage_spawn_counts = [job["num_workers"] for job in self.jobs]
-
         for i, job in enumerate(self.jobs):
             # Resolve output-edge chunking. Explicit chunk= wins (0 = force off);
             # otherwise auto-adopt the DOWNSTREAM stage's batch size, so an edge
             # feeding a batch=B stage moves one B-item Chunk per queue op instead
-            # of B separate messages. Stored on the job so autoscale/restart
-            # respawns keep the same transport config.
+            # of B separate messages. Stored on the job so restart respawns keep
+            # the same transport config.
             if job.get("chunk") is not None:
                 job["chunk_eff"] = max(0, int(job["chunk"]))
             elif i + 1 < len(self.jobs) and self.jobs[i + 1].get("batch", 0) > 1:
@@ -316,17 +310,6 @@ class LifecycleMixin:
                 daemon=True,
             )
             self.stats_monitor_thread.start()
-
-        has_autoscale = any(job.get("autoscale") for job in self.jobs)
-        if has_autoscale:
-            _log("Starting autoscaler (monitoring queue pressure)")
-            self.autoscaler_stop_event.clear()
-            self.autoscaler_thread = threading.Thread(
-                target=_autoscaler_thread,
-                args=(self, self.should_stop, self.autoscaler_stop_event),
-                daemon=True,
-            )
-            self.autoscaler_thread.start()
 
         return self
 

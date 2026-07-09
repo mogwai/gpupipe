@@ -1,6 +1,6 @@
 # Pipe Reference (for LLM context)
 
-Multiprocessing streaming pipeline framework. Stages connected by queues, each with N workers processing items in parallel. Handles backpressure, autoscaling, GPU distribution, graceful shutdown, tensor serialization, and worker crash recovery.
+Multiprocessing streaming pipeline framework. Stages connected by queues, each with N workers processing items in parallel. Handles backpressure, GPU distribution, graceful shutdown, tensor serialization, and worker crash recovery. (Queue-pressure autoscaling is a planned feature — see PLANNED.md.)
 
 Use for IO-heavy scripts that benefit from parallel stages: downloads, GPU inference, DB writes, audio processing.
 
@@ -283,7 +283,7 @@ pipe.add(worker,
                         # Orthogonal to gpus= (a GPU feeder can set both). Confines workers
                         # to those cores (locality); disjoint pools partition the box across
                         # YOUR stages — it does NOT reserve cores from other processes (use a
-                        # cgroup cpuset for that). Disables autoscale.
+                        # cgroup cpuset for that).
     cpu_threads=8,      # per-worker BLAS/torch thread count (torch/OMP/MKL/OpenBLAS).
                         # Lifts the default flat 2-thread cap for a CPU-heavy stage (mel)
                         # WITHOUT pinning. With cpus= too, this wins over the slice size.
@@ -296,9 +296,6 @@ pipe.add(worker,
                         # small-item edges; see "Chunked transport" below.
     chunk_ms=10.0,      # max age of a partial chunk before it's flushed anyway, so a
                         # short batch / slow trickle never waits for chunk-mates
-    autoscale=True,     # enable autoscaling for this stage (disabled for GPU/CPU-pinned stages)
-    min_workers=1,      # autoscale floor (won't scale below)
-    max_workers=8,      # autoscale ceiling (won't scale above)
     drain=True,         # on Ctrl+C: True=finish in-flight items, False=stop immediately
                         # (drain=False stages must form a contiguous prefix from stage 0)
 )
@@ -335,8 +332,8 @@ partial chunk is `max(chunk_ms, current worker call duration)`.
 **Semantics preserved:**
 - `outqn` stays in ITEMS — the underlying queue maxsize is scaled down by the
   chunk factor, so backpressure triggers at the same item count.
-- Stats display scales `qsize`/`qmax` back to items; autoscaler thresholds use
-  fill ratios, which are unit-invariant.
+- Stats display scales `qsize`/`qmax` back to items; queue fill ratios are
+  unit-invariant.
 - `push()` back-edge items are bare messages and coexist with chunks on the
   same queue.
 - A worker holding chunk-buffered input when told to scale down (`worker_stop`)
@@ -358,8 +355,6 @@ the bottleneck; chunking a tensor edge also pins N tensors' handles per message.
 pipe = Pipe(
     sequential=False,           # sequential single-process mode (no multiprocessing)
     debug=False,                # wrap queues with InstrumentedQueue, track per-queue transit latency
-    autoscale=False,            # global autoscale enable (disabled by default)
-    max_workers_per_stage=8,    # global autoscale cap
     stats_interval=0.2,         # stats collection interval in seconds (0=off)
     stats_mode="text",          # "text" (ANSI one-liners to stdout, default),
                                 # "rich" (Rich Progress bar, standalone Live),
@@ -404,20 +399,13 @@ for item in pipe:
 - `items`, `active`, `total_workers` — worker activity
 - `stage_rtf`, `avg_worker_rtf`, `has_audio` — real-time factor (audio pipelines)
 
-## Autoscaling Details
+## Autoscaling (PLANNED — not currently wired in)
 
-Autoscaler runs as background thread, checks every 1s:
-
-- **Scale UP**: input queue fill >= 80% for 3 consecutive samples
-  - Won't scale if CPU > 85% (system saturated)
-  - Won't scale if output queue >= 90% full (downstream bottleneck)
-  - Spawns new worker process with same config
-- **Scale DOWN**: input queue fill <= 20% for 5 consecutive samples
-  - Sends "worker_stop" sentinel to input queue
-  - Worker exits gracefully after current item
-  - Won't scale below min_workers
-- **Cooldown**: 3s between scaling actions per stage
-- **GPU stages**: Never autoscale (limited by GPU count)
+Queue-pressure autoscaling (scale worker processes up/down per stage based on
+input-queue fill) is a planned feature; the implementation is preserved in
+`src/pipe/_planned/autoscale.py` but not active, and `Pipe`/`add()` accept no
+autoscale parameters. Design, thresholds, and re-integration steps live in
+`PLANNED.md` and that module's docstring — do not restate them here.
 
 ## Health Monitoring
 
@@ -651,7 +639,6 @@ for result in pipe:
    for GPU feeders — pin the feeder to its cores and pin other CPU stages to disjoint
    pools so nothing else lands there. Orthogonal to `gpus=` (a GPU feeder may set both).
    Linux-only (`os.sched_setaffinity`); more workers than cores → round-robin oversubscribe.
-   Disables autoscale (a static pin can't track a live worker count).
    *Caveat:* affinity only **confines your worker** to those cores — it does **not** keep
    other processes off them. Reserving cores across your own pipeline means pinning every
    CPU-heavy stage to disjoint pools; walling off *unrelated* jobs needs a cgroup cpuset
@@ -659,7 +646,7 @@ for result in pipe:
 6c. **cpu_threads=N** - per-worker BLAS/torch thread count, independent of pinning. Every
    worker defaults to a flat 2 threads (this is the main guard against N torch workers each
    fanning BLAS across the whole machine); `cpu_threads=` raises that for a CPU-heavy stage
-   (e.g. `mel` wanting 8) without touching affinity or autoscale. Precedence when combined
+   (e.g. `mel` wanting 8) without touching affinity. Precedence when combined
    with `cpus=`: explicit `cpu_threads` > `cpus=` slice size > the default 2.
 7. **sequential=True** - single process, sequential execution, for debugging/testing
 8. **debug=True** - wraps queues with InstrumentedQueue, shows per-queue transit latency in stats

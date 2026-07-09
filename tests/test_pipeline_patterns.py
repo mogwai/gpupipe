@@ -301,26 +301,5 @@ def test_realistic_audio_pipeline():
     assert complete_count >= n_items * 0.9, f"Too few completions: {complete_count}"
 
 
-def test_realistic_audio_pipeline_autoscale():
-    """Test realistic pipeline with autoscaling on the slow stages."""
-    n_items = 50
-
-    pipe = Pipe(debug=False, stats_interval=0, health_check_interval=0)
-    pipe.add(AudioSegmentGenerator(n_items, min_duration=5, max_duration=60), outqn=10)
-    pipe.add(DownloadSimulator(), workers=2, outqn=20, autoscale=True, max_workers=6)
-    pipe.add(AudioChunker(chunk_seconds=15), workers=1, outqn=100)
-    pipe.add(GPUBatcher(batch_size=4), workers=1, outqn=30)
-    pipe.add(GPUEncoder(ms_per_second_audio=10), workers=1, outqn=50, autoscale=True, max_workers=2)
-    pipe.add(ResultAggregator(), workers=1, outqn=0)
-
-    results = []
-    for item in pipe:
-        if isinstance(item, dict) and item.get("complete"):
-            results.append(item)
-
-    download_workers = pipe.stage_worker_counts[1].value
-    gpu_workers = pipe.stage_worker_counts[4].value
-    complete_count = len([r for r in results if r.get("complete")])
-
-    print(f"Autoscale pipeline: {complete_count}/{n_items} completed, download={download_workers}, gpu={gpu_workers} workers")
-    assert complete_count >= n_items * 0.9
+# test_realistic_audio_pipeline_autoscale was removed with the autoscaling
+# feature; restore it from git history when re-integrating (see PLANNED.md).

@@ -81,6 +81,8 @@ The re-queued item is the deserialized Python object (already unpacked from shm)
 
 ### Interaction with autoscaler
 
+(Autoscaling is itself a planned feature — see `PLANNED.md`. This interaction applies once it is re-integrated.)
+
 When workers are sleeping on transient retries, input queue stays full — autoscaler wants to scale up. But more workers won't help (they'll all hit the same error).
 
 Fix: track a per-stage `transient_retry_active` flag (mp.Value). When any worker is in transient retry sleep, set it. Autoscaler skips scale-up for that stage while flag is set.

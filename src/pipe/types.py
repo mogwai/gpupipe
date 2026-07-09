@@ -1,24 +1,30 @@
 """Type definitions for the pipe module."""
+import enum
 
 
-class _EndSentinel:
-    """Sentinel value for signaling pipeline completion.
+class Sentinel(enum.Enum):
+    """Framework control signals passed through the item queues.
 
-    Root workers return End to signal they're done producing items.
-    Middle workers never see End - the framework handles it internally.
+    A dedicated type (not a magic string) so user data can never collide with
+    a control signal. Enum members pickle by name and unpickle to the same
+    object, so identity checks (`item is End`) hold across process boundaries.
     """
-    _instance = None
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    END = "end"
+    """Signals pipeline completion. Root workers return End when done
+    producing items; middle workers never see it — the framework handles it
+    internally."""
+
+    WORKER_STOP = "worker_stop"
+    """Tells exactly one worker at a stage to exit its pool after its current
+    item. Only scale-down logic puts this on a queue; today that is the
+    planned autoscaler (src/pipe/_planned/autoscale.py), so the handling in
+    the worker run-loops is inert but safe."""
 
     def __repr__(self):
-        return "End"
-
-    def __reduce__(self):
-        return (self.__class__, ())
+        # "End" / "WorkerStop", matching the exported alias names in logs
+        return "".join(part.title() for part in self.name.split("_"))
 
 
-End = _EndSentinel()
+End = Sentinel.END
+WorkerStop = Sentinel.WORKER_STOP

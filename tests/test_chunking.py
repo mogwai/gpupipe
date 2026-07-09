@@ -7,6 +7,7 @@ import time
 import pytest
 
 from pipe.queues import Chunk, _InputChannel, _OutputChannel
+from pipe.types import WorkerStop
 
 
 class FakeStop:
@@ -103,16 +104,16 @@ def test_input_channel_unpacks_chunks_in_order():
 
 
 def test_input_channel_bare_items_pass_through():
-    """push() back-edge items are bare; sentinels are bare strings."""
+    """push() back-edge items are bare; sentinels are bare (never chunked)."""
     q = thread_queue.Queue()
     q.put({"id": 1})
     q.put(Chunk([{"id": 2}, {"id": 3}]))
-    q.put("worker_stop")
+    q.put(WorkerStop)
     ch = _InputChannel(q)
     assert ch.get(timeout=0.1) == {"id": 1}
     assert ch.get(timeout=0.1) == {"id": 2}
     assert ch.get(timeout=0.1) == {"id": 3}
-    assert ch.get(timeout=0.1) == "worker_stop"
+    assert ch.get(timeout=0.1) is WorkerStop
 
 
 def test_input_channel_list_payload_not_confused_with_chunk():

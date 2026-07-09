@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pipe"
 dynamic = ["version"]
-description = "Multiprocessing pipeline framework with autoscaling"
+description = "Multiprocessing pipeline framework"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -27,6 +27,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# find() also picks up pipe._planned (preserved-but-unwired feature code, see
+# PLANNED.md). Shipping it is deliberate: it is inert unless explicitly
+# imported, and excluding it would break `import pipe._planned` under strict
+# editable installs, which tests/test_planned_preserved.py relies on.
 
 [tool.setuptools_scm]
 write_to = "src/pipe/_version.py"
@@ -34,6 +38,10 @@ write_to = "src/pipe/_version.py"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# tests/planned/ (suites for preserved-but-unwired features, see PLANNED.md)
+# is excluded via collect_ignore in tests/conftest.py — NOT via addopts
+# --ignore here, because --ignore resolves relative to the invocation cwd and
+# silently stops working when pytest runs from a subdirectory.
 
 # uv-specific: Use PyTorch CUDA 13.0 index for GPU support
 # [[tool.uv.index]]

@@ -17,7 +17,7 @@ class Chunk:
     Amortizes the per-message queue cost (lock, pipe write, consumer wakeup) across
     N items; each payload inside is still an independent `_item_to_shm` output, so
     shm-refs and torch fd-sharing behave exactly as unchunked items. Sentinels
-    (`End`, "worker_stop") are never placed inside a Chunk. A dedicated class (not
+    (`End`, `WorkerStop`) are never placed inside a Chunk. A dedicated class (not
     a bare list) because worker payloads may themselves be lists."""
 
     __slots__ = ("items",)
@@ -98,10 +98,10 @@ class _InputChannel:
     Chunks are unpacked into a local buffer and returned one payload at a time, so
     every consumer keeps its exact one-item-at-a-time semantics. Bare items (e.g.
     from push() back-edges) pass straight through, as do sentinels — `End` and
-    "worker_stop" are never inside a Chunk.
+    `WorkerStop` are never inside a Chunk.
 
     NOTE: buffered payloads are already OFF the shared queue. A worker that exits
-    early (worker_stop) must drain `buffered()` first or those items are lost."""
+    early (WorkerStop) must drain `buffered()` first or those items are lost."""
 
     __slots__ = ("queue", "_buf")
 
@@ -134,7 +134,7 @@ class _InputChannel:
     def requeue_buffered(self, should_stop=None):
         """Return locally buffered payloads to the shared queue (as one Chunk).
 
-        MUST be called before a worker exits early (worker_stop): buffered
+        MUST be called before a worker exits early (WorkerStop): buffered
         payloads are already off the shared queue and would otherwise be
         silently lost. Retries forever like every put (see _OutputChannel);
         `should_stop` is accepted for call-site symmetry but a graceful stop
@@ -152,7 +152,7 @@ class _InputChannel:
                 time.sleep(0.01)
 
     def put(self, msg, **kwargs):
-        """Pass-through so requeue paths (e.g. re-putting "worker_stop") work."""
+        """Pass-through so requeue paths (e.g. re-putting `WorkerStop`) work."""
         return self.queue.put(msg, **kwargs)
 
 

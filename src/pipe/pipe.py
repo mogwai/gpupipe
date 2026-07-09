@@ -44,8 +44,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
         stats_interval=0.2,
         stats_mode="text",
         allow_full_restart=True,
-        autoscale=False,
-        max_workers_per_stage=8,
         use_shm=False,
         output_shm=False,
         profile=False,
@@ -66,8 +64,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.raise_errors = raise_errors if raise_errors is not None else sequential
         self.health_check_interval = health_check_interval
         self.allow_full_restart = allow_full_restart
-        self.autoscale = autoscale
-        self.max_workers_per_stage = max_workers_per_stage
         self.jobs = []
         self.queues: list[Queue] = []
         self.processes = []
@@ -84,8 +80,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.stats_monitor_stop_event = threading.Event()
         self.stats_interval = stats_interval
         self.stats_mode = stats_mode
-        self.autoscaler_thread = None
-        self.autoscaler_stop_event = threading.Event()
         self.profile = profile
         self.profile_dir = None
         self.profile_rss = {}
@@ -121,9 +115,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
         gpus=None,
         cpus=None,
         cpu_threads=None,
-        autoscale=None,
-        min_workers=None,
-        max_workers=None,
         batch=0,
         drain=True,
         chunk=None,
@@ -240,40 +231,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 f"{stage_name}: cpu_threads must be a positive int, got {cpu_threads!r}"
             )
 
-        if max_workers is None:
-            default_max = actual_workers * 4
-        else:
-            default_max = max_workers
-
-        if is_gpu_stage:
-            # a GPU stage can't have more live workers than GPUs in its pool
-            effective_max = min(default_max, len(gpu_list))
-        else:
-            effective_max = default_max
-
-        if is_gpu_stage:
-            stage_autoscale = False
-        elif thread:
-            # The autoscaler scales by spawning whole processes; a threaded stage is
-            # one process running N threads, so that model doesn't apply. Threaded
-            # stages already parallelize internally via their thread pool.
-            if autoscale:
-                _log(f"  {stage_name}: autoscale disabled for threaded stage")
-            stage_autoscale = False
-        elif autoscale is not None:
-            stage_autoscale = autoscale
-        else:
-            stage_autoscale = self.autoscale
-
-        # A static core pin can't track a live worker count, so cpus= disables autoscale
-        # (same reasoning as GPU stages above).
-        if cpu_list is not None and stage_autoscale:
-            _log(f"  {stage_name}: autoscale disabled for CPU-pinned stage")
-            stage_autoscale = False
-
-        if max_workers is None and stage_autoscale and not is_gpu_stage:
-            effective_max = self.max_workers_per_stage
-
         self.jobs.append(
             {
                 "func": func,
@@ -287,9 +244,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 "cpus": cpu_list,  # canonical CPU pool (chunked per worker), or None
                 "cpu_threads": cpu_threads,  # explicit per-worker thread count, or None
                 "is_gpu_stage": is_gpu_stage,
-                "autoscale": stage_autoscale,
-                "max_workers": effective_max,
-                "min_workers": min_workers if min_workers is not None else 1,
                 "batch": batch,
                 "drain": drain,
                 # Output-edge chunking: bundle N serialized items into one queue
