@@ -1,11 +1,7 @@
-import os
 import re
 import time
 
-
-def _log(msg):
-    if os.environ.get("PIPE_VERBOSE") == "1":
-        print(msg)
+from .utils import _is_tty, _log, _pin_stats_line, _unpin_stats_line
 
 
 def _health_monitor_thread(
@@ -266,11 +262,11 @@ def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
         if not qmax:
             return DIM
         fill = qsize / qmax
-        if fill > 0.5:
-            return GREEN
-        elif fill > 0.2:
+        if fill >= 0.8:
+            return RED
+        elif fill >= 0.5:
             return YELLOW
-        return RED
+        return GREEN
 
     while not stop_event.is_set():
         stop_event.wait(interval_seconds)
@@ -297,6 +293,13 @@ def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
             q_str = f"{s['qsize']}/{s['qmax']}" if s["qmax"] else str(s["qsize"])
             parts.append(f"{CYAN}{name}{RESET}|{qc}{q_str}{RESET}|{s['stage_rtf']:.0f}/{s['avg_worker_rtf']:.0f}x")
 
-        print(f"[{total_items}] " + "\u25b8".join(parts))
+        line = f"[{total_items}] " + "\u25b8".join(parts)
+        if _is_tty():
+            # Repaint one pinned line in place; print_above()/Pipe.print() write
+            # messages on their own line above it.
+            _pin_stats_line(line)
+        else:
+            print(line)
 
+    _unpin_stats_line()
     _log("Stats monitor shutting down")

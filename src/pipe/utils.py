@@ -1,7 +1,68 @@
+import os
 import random
+import sys
+import threading
 import time
 
 from .types import End
+
+
+# Pinned stats line (tqdm-style). The text stats monitor repaints one line in
+# place on a TTY; print_above() writes messages on their own line above it.
+# Module state only exists in the process that runs the monitor (the main
+# process); spawned workers see _pinned = None and rely on the \r\033[K prefix
+# to clear a half-drawn stats line before printing (the monitor repaints it on
+# its next tick).
+_pin_lock = threading.Lock()
+_pinned = None
+
+
+def _is_tty():
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def print_above(msg):
+    """Print a message on its own line, above the pinned stats line if one exists.
+
+    Safe to call from worker processes and threads; falls back to plain print()
+    when stdout is not a TTY (piped logs, tests).
+    """
+    if not _is_tty():
+        print(msg)
+        return
+    with _pin_lock:
+        out = f"\r\033[K{msg}\n"
+        if _pinned is not None:
+            out += _pinned  # repaint the stats line below the message
+        sys.stdout.write(out)
+        sys.stdout.flush()
+
+
+def _pin_stats_line(text):
+    """Paint/repaint the pinned stats line in place (TTY only)."""
+    global _pinned
+    with _pin_lock:
+        _pinned = text
+        sys.stdout.write(f"\r\033[K{text}")
+        sys.stdout.flush()
+
+
+def _unpin_stats_line():
+    """Finalize the pinned line: keep the last frame and move to a fresh line."""
+    global _pinned
+    with _pin_lock:
+        if _pinned is not None:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        _pinned = None
+
+
+def _log(msg):
+    if os.environ.get("PIPE_VERBOSE") == "1":
+        print_above(msg)
 
 
 class Batcher:
@@ -61,6 +122,10 @@ class BufferAndShuffle:
             self.buffer = []
             yield from out
 
+
+# NOTE: RetrieveSQL/SQLConnection assume a project-local `data.db` module and
+# `data.constants.CONNECTION_STRING` (see ~/work/data). Kept exported because
+# downstream jobs import them from `pipe` directly.
 
 class RetrieveSQL:
     def __init__(self, query, chunk_size=20, skip_count=False) -> None:

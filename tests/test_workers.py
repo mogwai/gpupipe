@@ -339,3 +339,35 @@ def test_root_clamped_to_single_worker():
     pipe.add(Collector(), workers=1, outqn=0)
     assert pipe.jobs[0]["num_workers"] == 1   # root clamped
     assert pipe.jobs[1]["num_workers"] == 1   # non-root untouched
+
+
+# === EXPECTED CONSUMERS (DDP shared-queue mode) ===
+
+def test_expected_consumers_multi_reader():
+    """expected_consumers=N must put N End sentinels on the final queue so each
+    DDP-style PipeIterator reader terminates (shared mode in fluac/vui/akro:
+    rank 0 runs the pipe, every rank reads pipe.queues[-1] via PipeIterator)."""
+    import threading
+    from pipe import PipeIterator
+
+    n = 30
+    pipe = Pipe(stats_interval=0, health_check_interval=0, expected_consumers=2)
+    pipe.add(Generator(n), outqn=100)
+    pipe.add(FastWorker(), workers=2, outqn=0)
+    pipe.start()
+
+    got = [[], []]
+
+    def reader(i):
+        for item in PipeIterator(pipe.queues[-1]):
+            got[i].append(item["id"])
+
+    threads = [threading.Thread(target=reader, args=(i,), daemon=True) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    alive = [t.is_alive() for t in threads]
+    pipe.stop()
+    assert not any(alive), f"reader(s) never got an End sentinel: {alive}"
+    assert sorted(got[0] + got[1]) == list(range(n))

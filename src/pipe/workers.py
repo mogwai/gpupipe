@@ -13,13 +13,9 @@ from queue import Empty, Full
 import torch
 
 from .types import End, WorkerStop
+from .utils import _log
 from .queues import _InputChannel, _OutputChannel
 from .shm import _item_from_shm, _item_to_shm
-
-
-def _log(msg):
-    if os.environ.get("PIPE_VERBOSE") == "1":
-        print(msg)
 
 
 def _cpu_chunk(cpu_pool, worker_idx, num_workers):
@@ -214,7 +210,6 @@ def _worker_run(
     in_queue=None,
     out_queue=None,
     should_stop=None,
-    working=None,
     gpu_id=None,
     timing_dict=None,
     worker_id=None,
@@ -335,20 +330,7 @@ def _worker_run(
 
     if _has_custom_run:
         print(f"Worker {worker_desc} using custom run()")
-        if hasattr(worker, "pull"):
-            worker.run()
-        else:
-            worker.run(
-                in_queue=in_queue,
-                out_queue=out_queue,
-                should_stop=should_stop,
-                upstream_done=upstream_done,
-                serialize=lambda item: _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage)),
-                deserialize=lambda raw: None if _is_end(v := _item_from_shm(raw)) else v,
-                timing_dict=timing_dict,
-                worker_id=worker_id,
-                worker_start_wall_time=time.time(),
-            )
+        worker.run()
 
     items_processed = 0
     total_process_time = 0.0
@@ -614,10 +596,14 @@ def _worker_run(
         if finished_workers >= current_worker_count:
             # Put End sentinel on output queue so downstream knows we're done
             if out_queue is not None:
+                # Final stage: one End per consumer (DDP ranks each reading the
+                # shared output queue via PipeIterator stop on their own End).
+                n_ends = expected_consumers if is_final_stage else 1
                 try:
                     serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
-                    out_queue.put(serialized, timeout=1.0)
-                    _log(f"Put End sentinel on queue for {stage_desc}")
+                    for _ in range(n_ends):
+                        out_queue.put(serialized, timeout=1.0)
+                    _log(f"Put {n_ends} End sentinel(s) on queue for {stage_desc}")
                 except Full:
                     print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
             if stage_done is not None:
@@ -635,7 +621,6 @@ def _threaded_worker_run(
     in_queue=None,
     out_queue=None,
     should_stop=None,
-    working=None,
     gpu_id=None,
     timing_dict=None,
     worker_id=None,
@@ -737,20 +722,7 @@ def _threaded_worker_run(
     # Delegate to custom run() if worker defines it
     if _has_custom_run:
         print(f"Threaded worker {worker_desc} using custom run()")
-        if hasattr(worker, "pull"):
-            worker.run()
-        else:
-            worker.run(
-                in_queue=in_queue,
-                out_queue=out_queue,
-                should_stop=should_stop,
-                upstream_done=upstream_done,
-                serialize=lambda item: _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage)),
-                deserialize=lambda raw: None if _is_end(v := _item_from_shm(raw)) else v,
-                timing_dict=timing_dict,
-                worker_id=worker_id,
-                worker_start_wall_time=time.time(),
-            )
+        worker.run()
         # Partial output chunk must land before the End sentinel below.
         if _put_ch is not None:
             _put_ch.flush()
@@ -762,10 +734,12 @@ def _threaded_worker_run(
             print(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
             if finished_workers >= current_worker_count:
                 if out_queue is not None:
+                    n_ends = expected_consumers if is_final_stage else 1
                     with contextlib.suppress(Full):
                         serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
-                        out_queue.put(serialized, timeout=1.0)
-                        print(f"Put End sentinel on queue for {stage_name}")
+                        for _ in range(n_ends):
+                            out_queue.put(serialized, timeout=1.0)
+                        print(f"Put {n_ends} End sentinel(s) on queue for {stage_name}")
                 if stage_done is not None:
                     stage_done.set()
                     print(f"All workers finished at {stage_name}, signaling downstream")
@@ -1039,10 +1013,12 @@ def _threaded_worker_run(
             if finished_workers >= current_worker_count:
                 # Put End sentinel on output queue so downstream knows we're done
                 if out_queue is not None:
+                    n_ends = expected_consumers if is_final_stage else 1
                     try:
                         serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
-                        out_queue.put(serialized, timeout=1.0)
-                        _log(f"Put End sentinel on queue for {stage_name}")
+                        for _ in range(n_ends):
+                            out_queue.put(serialized, timeout=1.0)
+                        _log(f"Put {n_ends} End sentinel(s) on queue for {stage_name}")
                     except Full:
                         print(f"Warning: Could not put End sentinel on queue for {stage_name}")
                 if stage_done is not None:
