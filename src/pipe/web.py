@@ -36,6 +36,24 @@ from .shm import _item_from_shm
 from .types import End
 
 
+
+def _validate_compression(compression):
+    if compression == "lz4" and not HAS_LZ4:
+        raise ImportError("lz4 not installed. Install with: uv pip install lz4")
+    if compression not in ("none", "lz4"):
+        raise ValueError(f"Invalid compression: {compression}. Must be 'none' or 'lz4'")
+
+
+def _serialize(item, compression):
+    """torch-serialize an item, optionally lz4-compressed. Returns bytes."""
+    buffer = io.BytesIO()
+    torch.save(item, buffer)
+    data = buffer.getvalue()
+    if compression == "lz4":
+        data = lz4.frame.compress(data, compression_level=0)
+    return data
+
+
 class SerializerWorker:
     """
     Pipe worker that pre-serializes items for efficient network transfer.
@@ -46,18 +64,10 @@ class SerializerWorker:
 
     def __init__(self, compression: str = "none"):
         self.compression = compression
-        if compression == "lz4" and not HAS_LZ4:
-            raise ImportError("lz4 not installed. Install with: uv pip install lz4")
-        if compression not in ("none", "lz4"):
-            raise ValueError(f"Invalid compression: {compression}. Must be 'none' or 'lz4'")
+        _validate_compression(compression)
 
     def __call__(self, item):
-        buffer = io.BytesIO()
-        torch.save(item, buffer)
-        serialized = buffer.getvalue()
-
-        if self.compression == "lz4":
-            serialized = lz4.frame.compress(serialized, compression_level=0)
+        serialized = _serialize(item, self.compression)
 
         return {
             "data": serialized,
@@ -82,10 +92,7 @@ class PipeServer:
         self.pre_serialized = pre_serialized
 
         if not pre_serialized:
-            if compression == "lz4" and not HAS_LZ4:
-                raise ImportError("lz4 not installed. Install with: uv pip install lz4")
-            if compression not in ("none", "lz4"):
-                raise ValueError(f"Invalid compression: {compression}. Must be 'none' or 'lz4'")
+            _validate_compression(compression)
 
         self.items_served = 0
         self.errors = 0
@@ -142,11 +149,7 @@ class PipeServer:
                     compression = item.get("compression", "none")
                     size_bytes = item.get("size_bytes", len(serialized))
                 else:
-                    buffer = io.BytesIO()
-                    torch.save(item, buffer)
-                    serialized = buffer.getvalue()
-                    if self.compression == "lz4":
-                        serialized = lz4.frame.compress(serialized, compression_level=0)
+                    serialized = _serialize(item, self.compression)
                     compression = self.compression
                     size_bytes = len(serialized)
 

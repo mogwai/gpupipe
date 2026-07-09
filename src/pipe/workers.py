@@ -205,6 +205,57 @@ def _increase_fd_limit(worker_id: str):
         print(f"Worker {worker_id}: Warning - could not increase FD limit: {e}")
 
 
+
+def extract_audio_duration(obj):
+    """Best-effort audio seconds in an item (duration field, sample, segments)
+    for RTF stats. Returns 0.0 for non-audio items."""
+    if obj is None:
+        return 0.0
+    if isinstance(obj, dict):
+        dur = obj.get("duration", 0.0)
+        if isinstance(dur, list):
+            return sum(dur)
+        if dur:
+            return dur
+        if "sample" in obj:
+            return obj["sample"].get("duration", 0.0)
+        if "segments" in obj:
+            return sum(s.get("duration", 0.0) for s in obj["segments"])
+        return 0.0
+    if isinstance(obj, list):
+        return sum(extract_audio_duration(x) for x in obj)
+    return 0.0
+
+
+def _finish_worker(stage_end_counter, stage_worker_count, out_queue, stage_done,
+                   is_final_stage, expected_consumers, stage_desc, worker_desc):
+    """Sibling coordination on worker exit. The last finisher at a stage puts the
+    End sentinel(s) on the output queue (one per consumer on the final stage —
+    DDP ranks each reading the shared queue via PipeIterator stop on their own
+    End) and sets the stage-done event."""
+    if stage_end_counter is None or stage_worker_count is None:
+        return
+    with stage_end_counter.get_lock():
+        stage_end_counter.value += 1
+        finished_workers = stage_end_counter.value
+    current_worker_count = stage_worker_count.value
+    _log(f"Worker {worker_desc} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
+    if finished_workers < current_worker_count:
+        return
+    if out_queue is not None:
+        n_ends = expected_consumers if is_final_stage else 1
+        try:
+            serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
+            for _ in range(n_ends):
+                out_queue.put(serialized, timeout=1.0)
+            _log(f"Put {n_ends} End sentinel(s) on queue for {stage_desc}")
+        except Full:
+            print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
+    if stage_done is not None:
+        stage_done.set()
+        _log(f"All workers finished at {stage_desc}, signaling downstream")
+
+
 def _worker_run(
     worker,
     in_queue=None,
@@ -341,23 +392,6 @@ def _worker_run(
     consecutive_empty = 0
     EMPTY_THRESHOLD = 30
 
-    def extract_audio_duration(obj):
-        if obj is None:
-            return 0.0
-        if isinstance(obj, dict):
-            dur = obj.get("duration", 0.0)
-            if isinstance(dur, list):
-                return sum(dur)
-            if dur:
-                return dur
-            if "sample" in obj:
-                return obj["sample"].get("duration", 0.0)
-            if "segments" in obj:
-                return sum(s.get("duration", 0.0) for s in obj["segments"])
-            return 0.0
-        if isinstance(obj, list):
-            return sum(extract_audio_duration(x) for x in obj)
-        return 0.0
 
     while not should_stop.value and not _has_custom_run:
         now = time.time()
@@ -584,31 +618,9 @@ def _worker_run(
         out_ch.flush()
 
     # Coordinate with siblings
-    if stage_end_counter is not None and stage_worker_count is not None:
-        with stage_end_counter.get_lock():
-            stage_end_counter.value += 1
-            finished_workers = stage_end_counter.value
-
-        current_worker_count = stage_worker_count.value
-        stage_desc = f"{stage_name}" if stage_name else f"stage_{stage_idx}"
-        _log(f"Worker {worker_id} finished ({finished_workers}/{current_worker_count} at {stage_desc})")
-
-        if finished_workers >= current_worker_count:
-            # Put End sentinel on output queue so downstream knows we're done
-            if out_queue is not None:
-                # Final stage: one End per consumer (DDP ranks each reading the
-                # shared output queue via PipeIterator stop on their own End).
-                n_ends = expected_consumers if is_final_stage else 1
-                try:
-                    serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
-                    for _ in range(n_ends):
-                        out_queue.put(serialized, timeout=1.0)
-                    _log(f"Put {n_ends} End sentinel(s) on queue for {stage_desc}")
-                except Full:
-                    print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
-            if stage_done is not None:
-                stage_done.set()
-                _log(f"All workers finished at {stage_desc}, signaling downstream")
+    _finish_worker(stage_end_counter, stage_worker_count, out_queue, stage_done,
+                   is_final_stage, expected_consumers,
+                   stage_name or f"stage_{stage_idx}", worker_id)
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
     # Without this, tensors in queues become invalid when worker exits
@@ -726,46 +738,14 @@ def _threaded_worker_run(
         # Partial output chunk must land before the End sentinel below.
         if _put_ch is not None:
             _put_ch.flush()
-        if stage_end_counter is not None and stage_worker_count is not None:
-            with stage_end_counter.get_lock():
-                stage_end_counter.value += 1
-                finished_workers = stage_end_counter.value
-            current_worker_count = stage_worker_count.value
-            print(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
-            if finished_workers >= current_worker_count:
-                if out_queue is not None:
-                    n_ends = expected_consumers if is_final_stage else 1
-                    with contextlib.suppress(Full):
-                        serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
-                        for _ in range(n_ends):
-                            out_queue.put(serialized, timeout=1.0)
-                        print(f"Put {n_ends} End sentinel(s) on queue for {stage_name}")
-                if stage_done is not None:
-                    stage_done.set()
-                    print(f"All workers finished at {stage_name}, signaling downstream")
+        _finish_worker(stage_end_counter, stage_worker_count, out_queue, stage_done,
+                       is_final_stage, expected_consumers, stage_name, worker_desc)
         while should_stop is not None and not should_stop.value:
             time.sleep(0.1)
         return
 
     worker_start_wall_time = time.time()
 
-    def extract_audio_duration(obj):
-        if obj is None:
-            return 0.0
-        if isinstance(obj, dict):
-            dur = obj.get("duration", 0.0)
-            if isinstance(dur, list):
-                return sum(dur)
-            if dur:
-                return dur
-            if "sample" in obj:
-                return obj["sample"].get("duration", 0.0)
-            if "segments" in obj:
-                return sum(s.get("duration", 0.0) for s in obj["segments"])
-            return 0.0
-        if isinstance(obj, list):
-            return sum(extract_audio_duration(x) for x in obj)
-        return 0.0
 
     def thread_fn():
         local_items = 0
@@ -1002,28 +982,8 @@ def _threaded_worker_run(
             except Exception as e:
                 print(f"Threaded worker {worker_desc} flush error: {e}")
 
-        if stage_end_counter is not None and stage_worker_count is not None:
-            with stage_end_counter.get_lock():
-                stage_end_counter.value += 1
-                finished_workers = stage_end_counter.value
-
-            current_worker_count = stage_worker_count.value
-            _log(f"Threaded worker {worker_desc} finished ({finished_workers}/{current_worker_count})")
-
-            if finished_workers >= current_worker_count:
-                # Put End sentinel on output queue so downstream knows we're done
-                if out_queue is not None:
-                    n_ends = expected_consumers if is_final_stage else 1
-                    try:
-                        serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
-                        for _ in range(n_ends):
-                            out_queue.put(serialized, timeout=1.0)
-                        _log(f"Put {n_ends} End sentinel(s) on queue for {stage_name}")
-                    except Full:
-                        print(f"Warning: Could not put End sentinel on queue for {stage_name}")
-                if stage_done is not None:
-                    stage_done.set()
-                    _log(f"All workers finished at {stage_name}, signaling downstream")
+        _finish_worker(stage_end_counter, stage_worker_count, out_queue, stage_done,
+                       is_final_stage, expected_consumers, stage_name, worker_desc)
 
         _log(f"Threaded worker {worker_desc} shutdown complete")
 
