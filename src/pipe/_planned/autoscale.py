@@ -37,6 +37,10 @@ Re-integration checklist (what was removed from the live code to land this)
    that inert primitive was left in place, so scale-down works as soon as this
    thread drives it.
 5. Tests live in `tests/planned/test_autoscale.py` (currently skipped/ignored).
+6. Live spawning moved to kwargs (`_spawn_and_register` in lifecycle.py):
+   convert `_spawn_additional_worker`'s positional args tuples to kwargs dicts
+   keyed by the run-loop parameter names, and register configs under "kwargs"
+   (not "args") so `_restart_worker` can respawn autoscaled workers.
 
 Drift warning: `_spawn_additional_worker` imports `_worker_run` /
 `_threaded_worker_run` lazily (inside the function) and hand-builds their full

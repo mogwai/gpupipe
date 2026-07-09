@@ -17,11 +17,11 @@ def _profile_dir():
     return d
 
 
-def _profiled_worker(target, args, profile_dir, worker_id, peak_rss_kb):
+def _profiled_worker(target, kwargs, profile_dir, worker_id, peak_rss_kb):
     prof = cProfile.Profile()
     prof.enable()
     try:
-        target(*args)
+        target(**kwargs)
     finally:
         prof.disable()
         prof_path = os.path.join(profile_dir, f"{worker_id}.prof")

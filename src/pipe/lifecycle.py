@@ -25,18 +25,33 @@ from .workers import _cpu_chunk, _threaded_worker_run, _worker_run
 
 
 class LifecycleMixin:
-    def _spawn(self, target, args, worker_id):
+    def _spawn(self, target, kwargs, worker_id):
         if self.profile:
             from multiprocessing import Value as MpValue
             rss_val = MpValue("l", 0)
             self.profile_rss[worker_id] = rss_val
             p = mp.Process(
                 target=_profiled_worker,
-                args=(target, args, self.profile_dir, worker_id, rss_val),
+                args=(target, kwargs, self.profile_dir, worker_id, rss_val),
             )
         else:
-            p = mp.Process(target=target, args=args)
+            p = mp.Process(target=target, kwargs=kwargs)
         p.start()
+        return p
+
+    def _spawn_and_register(self, target, kwargs):
+        worker_id = kwargs["worker_id"]
+        stage_name = kwargs["stage_name"]
+        _log(f"Starting worker: {stage_name} ({worker_id})")
+        self.worker_configs[worker_id] = {
+            "target": target,
+            "kwargs": kwargs,
+            "stage_name": stage_name,
+        }
+        p = self._spawn(target, kwargs, worker_id)
+        self.processes.append(p)
+        self.worker_info.append((p, worker_id, stage_name))
+        _log(f"Worker {stage_name} ({worker_id}) started with PID {p.pid}")
         return p
 
     def start(self):
@@ -98,7 +113,10 @@ class LifecycleMixin:
             self.stage_end_counters.append(Value("i", 0))
             self.stage_done_events.append(Event())
 
-            if job.get("thread", False) and not job.get("pergpu", False):
+            # Threaded stage without a GPU pool = ONE process running N threads;
+            # every other shape spawns num_workers processes. Must mirror the
+            # spawn branches below (keyed on "gpus", the canonical pool).
+            if job.get("thread", False) and not job.get("gpus"):
                 worker_count = 1
             else:
                 worker_count = job["num_workers"]
@@ -109,167 +127,71 @@ class LifecycleMixin:
         stage_names_all = [job["name"] for job in self.jobs]
 
         for i, job in enumerate(self.jobs):
-            in_queue = self.queues[i - 1] if i > 0 else None
-            out_queue = self.queues[i] if i < len(self.queues) else None
-            is_final_stage = i == len(self.jobs) - 1
+            # Everything the worker run-loops take, by PARAMETER NAME. Spawning
+            # with kwargs (not positional tuples) means adding a parameter can't
+            # silently misalign the call — a mismatch raises TypeError at spawn.
+            common = dict(
+                worker=job["func"],
+                in_queue=self.queues[i - 1] if i > 0 else None,
+                out_queue=self.queues[i] if i < len(self.queues) else None,
+                should_stop=self.should_stop,
+                timing_dict=self.timing_dict,
+                raise_errors=self.raise_errors,
+                stage_end_counter=self.stage_end_counters[i],
+                stage_worker_count=self.stage_worker_counts[i],
+                stage_idx=i,
+                stage_name=job["name"],
+                is_final_stage=i == len(self.jobs) - 1,
+                expected_consumers=self.expected_consumers,
+                upstream_done=self.stage_done_events[i - 1] if i > 0 else None,
+                stage_done=self.stage_done_events[i],
+                sequential=self.sequential,
+                batch_size=job.get("batch", 0),
+                drain_event=self.drain_event,
+                drain=job.get("drain", True),
+                all_queues=self.queues,
+                stage_names=stage_names_all,
+                cpu_threads=job.get("cpu_threads"),
+                out_chunk=job.get("chunk_eff", 0),
+                out_chunk_ms=job.get("chunk_ms", 10.0),
+            )
 
-            upstream_done = self.stage_done_events[i - 1] if i > 0 else None
-            stage_done = self.stage_done_events[i]
-
-            func = job["func"]
-            if hasattr(func, "__name__"):
-                stage_name = func.__name__
-            elif hasattr(func, "__class__"):
-                stage_name = func.__class__.__name__
-            else:
-                stage_name = str(type(func).__name__)
-
+            gpu_pool = job.get("gpus")
             if job.get("thread", False):
-                if job.get("gpus"):
-                    gpu_pool = job["gpus"]
+                if gpu_pool:
+                    # One single-threaded process per GPU worker.
                     for worker_idx in range(job["num_workers"]):
-                        num_threads = 1
                         gpu_id = gpu_pool[worker_idx % len(gpu_pool)]
-
-                        worker_id = f"stage_{i}_threaded_worker_{worker_idx}_gpu_{gpu_id}"
-                        cpu_affinity = _cpu_chunk(job.get("cpus"), worker_idx, job["num_workers"])
-
-                        args = (
-                            job["func"],
-                            in_queue,
-                            out_queue,
-                            self.should_stop,
-                                            gpu_id,
-                            self.timing_dict,
-                            worker_id,
-                            self.raise_errors,
-                            num_threads,
-                            self.stage_end_counters[i],
-                            self.stage_worker_counts[i],
-                            i,
-                            stage_name,
-                            is_final_stage,
-                            self.expected_consumers,
-                                            upstream_done,
-                            stage_done,
-                            self.sequential,
-                            job.get("batch", 0),
-                            self.drain_event,
-                            job.get("drain", True),
-                            self.queues,
-                            stage_names_all,
-                            cpu_affinity,
-                            job.get("cpu_threads"),
-                            job.get("chunk_eff", 0),
-                            job.get("chunk_ms", 10.0),
-                        )
-
-                        self.worker_configs[worker_id] = {
-                            "target": _threaded_worker_run,
-                            "args": args,
-                            "stage_name": stage_name,
-                        }
-
-                        p = self._spawn(_threaded_worker_run, args, worker_id)
-                        self.processes.append(p)
-                        self.worker_info.append((p, worker_id, stage_name))
+                        self._spawn_and_register(_threaded_worker_run, dict(
+                            common,
+                            gpu_id=gpu_id,
+                            num_threads=1,
+                            worker_id=f"stage_{i}_threaded_worker_{worker_idx}_gpu_{gpu_id}",
+                            cpu_affinity=_cpu_chunk(job.get("cpus"), worker_idx, job["num_workers"]),
+                        ))
                 else:
+                    # One process runs all threads, so it owns the whole cpus=
+                    # pool; _setup_cpu sizes its thread count to len(cpus).
                     num_threads = job["num_workers"]
-                    worker_id = f"stage_{i}_threaded_{num_threads}threads"
-                    # One process runs all threads, so it owns the whole pool; _setup_cpu
-                    # sizes its thread count to len(cpus).
-                    cpu_affinity = job.get("cpus")
-
-                    args = (
-                        job["func"],
-                        in_queue,
-                        out_queue,
-                        self.should_stop,
-                                    None,
-                        self.timing_dict,
-                        worker_id,
-                        self.raise_errors,
-                        num_threads,
-                        self.stage_end_counters[i],
-                        self.stage_worker_counts[i],
-                        i,
-                        stage_name,
-                        is_final_stage,
-                        self.expected_consumers,
-                                    upstream_done,
-                        stage_done,
-                        self.sequential,
-                        job.get("batch", 0),
-                        self.drain_event,
-                        job.get("drain", True),
-                        self.queues,
-                        stage_names_all,
-                        cpu_affinity,
-                        job.get("cpu_threads"),
-                        job.get("chunk_eff", 0),
-                        job.get("chunk_ms", 10.0),
-                    )
-
-                    self.worker_configs[worker_id] = {
-                        "target": _threaded_worker_run,
-                        "args": args,
-                        "stage_name": stage_name,
-                    }
-
-                    p = self._spawn(_threaded_worker_run, args, worker_id)
-                    self.processes.append(p)
-                    self.worker_info.append((p, worker_id, stage_name))
+                    self._spawn_and_register(_threaded_worker_run, dict(
+                        common,
+                        gpu_id=None,
+                        num_threads=num_threads,
+                        worker_id=f"stage_{i}_threaded_{num_threads}threads",
+                        cpu_affinity=job.get("cpus"),
+                    ))
             else:
-                gpu_pool = job.get("gpus")
                 for worker_idx in range(job["num_workers"]):
                     gpu_id = gpu_pool[worker_idx % len(gpu_pool)] if gpu_pool else None
-
                     worker_id = f"stage_{i}_worker_{worker_idx}"
                     if gpu_id is not None:
                         worker_id += f"_gpu_{gpu_id}"
-                    cpu_affinity = _cpu_chunk(job.get("cpus"), worker_idx, job["num_workers"])
-
-                    _log(f"Starting worker process: {stage_name} ({worker_id})")
-
-                    args = (
-                        job["func"],
-                        in_queue,
-                        out_queue,
-                        self.should_stop,
-                                    gpu_id,
-                        self.timing_dict,
-                        worker_id,
-                        self.raise_errors,
-                        self.stage_end_counters[i],
-                        self.stage_worker_counts[i],
-                        i,
-                        stage_name,
-                        is_final_stage,
-                        self.expected_consumers,
-                                    upstream_done,
-                        stage_done,
-                        self.sequential,
-                        job.get("batch", 0),
-                        self.drain_event,
-                        job.get("drain", True),
-                        self.queues,
-                        stage_names_all,
-                        cpu_affinity,
-                        job.get("cpu_threads"),
-                        job.get("chunk_eff", 0),
-                        job.get("chunk_ms", 10.0),
-                    )
-
-                    self.worker_configs[worker_id] = {
-                        "target": _worker_run,
-                        "args": args,
-                        "stage_name": stage_name,
-                    }
-
-                    p = self._spawn(_worker_run, args, worker_id)
-                    self.processes.append(p)
-                    self.worker_info.append((p, worker_id, stage_name))
-                    _log(f"Worker process {stage_name} ({worker_id}) started with PID {p.pid}")
+                    self._spawn_and_register(_worker_run, dict(
+                        common,
+                        gpu_id=gpu_id,
+                        worker_id=worker_id,
+                        cpu_affinity=_cpu_chunk(job.get("cpus"), worker_idx, job["num_workers"]),
+                    ))
 
         if self.health_check_interval > 0:
             _log(f"Starting health monitor (check interval: {self.health_check_interval}s)")
@@ -313,11 +235,7 @@ class LifecycleMixin:
         with contextlib.suppress(Exception):
             old_proc.join(timeout=1)
 
-        p = mp.Process(
-            target=config["target"],
-            args=config["args"],
-        )
-        p.start()
+        p = self._spawn(config["target"], config["kwargs"], worker_id)
 
         self.worker_info[worker_idx] = (p, worker_id, config["stage_name"])
         for i, proc in enumerate(self.processes):
