@@ -4,10 +4,9 @@ monitor threads, per-worker and per-stage restart, and graceful/forced shutdown.
 Mixed into `Pipe` (methods keep operating on `self`); split out to keep pipe.py
 focused on the public API (init/add/iterate)."""
 import contextlib
-import os
 import threading
 import time
-from queue import Empty, Full
+from queue import Full
 
 import torch
 import torch.multiprocessing as mp
@@ -21,12 +20,8 @@ from .monitors import (
 from .profiling import _profile_dir, _profiled_worker, print_profile_summary
 from .queues import InstrumentedQueue
 from .types import End
-from .workers import _cpu_chunk, _is_end, _threaded_worker_run, _worker_run
-
-
-def _log(msg):
-    if os.environ.get("PIPE_VERBOSE") == "1":
-        print(msg)
+from .utils import _log
+from .workers import _cpu_chunk, _threaded_worker_run, _worker_run
 
 
 class LifecycleMixin:
@@ -144,8 +139,7 @@ class LifecycleMixin:
                             in_queue,
                             out_queue,
                             self.should_stop,
-                            self.working,
-                            gpu_id,
+                                            gpu_id,
                             self.timing_dict,
                             worker_id,
                             self.raise_errors,
@@ -156,7 +150,7 @@ class LifecycleMixin:
                             stage_name,
                             is_final_stage,
                             self.expected_consumers,
-                            upstream_done,
+                                            upstream_done,
                             stage_done,
                             self.sequential,
                             job.get("batch", 0),
@@ -191,8 +185,7 @@ class LifecycleMixin:
                         in_queue,
                         out_queue,
                         self.should_stop,
-                        self.working,
-                        None,
+                                    None,
                         self.timing_dict,
                         worker_id,
                         self.raise_errors,
@@ -203,7 +196,7 @@ class LifecycleMixin:
                         stage_name,
                         is_final_stage,
                         self.expected_consumers,
-                        upstream_done,
+                                    upstream_done,
                         stage_done,
                         self.sequential,
                         job.get("batch", 0),
@@ -243,8 +236,7 @@ class LifecycleMixin:
                         in_queue,
                         out_queue,
                         self.should_stop,
-                        self.working,
-                        gpu_id,
+                                    gpu_id,
                         self.timing_dict,
                         worker_id,
                         self.raise_errors,
@@ -254,7 +246,7 @@ class LifecycleMixin:
                         stage_name,
                         is_final_stage,
                         self.expected_consumers,
-                        upstream_done,
+                                    upstream_done,
                         stage_done,
                         self.sequential,
                         job.get("batch", 0),
@@ -297,12 +289,10 @@ class LifecycleMixin:
 
         if self.stats_interval > 0 and self.stats_mode != "external":
             if self.stats_mode == "text":
-                self.progress = None
                 monitor_fn = _stats_monitor_thread_text
             else:
                 from rich.console import Console
                 self._rich_console = Console()
-                self.progress = None
                 monitor_fn = _stats_monitor_thread
             self.stats_monitor_thread = threading.Thread(
                 target=monitor_fn,
@@ -337,160 +327,6 @@ class LifecycleMixin:
 
         _log(f"Worker {worker_id} restarted with PID {p.pid}")
 
-    def _restart_stage(self, stage_idx):
-        _log(f"   Restarting stage {stage_idx}...")
-
-        stage_workers = []
-        for idx, (proc, worker_id, stage_name) in enumerate(self.worker_info):
-            if worker_id.startswith(f"stage_{stage_idx}_"):
-                stage_workers.append((idx, proc, worker_id, stage_name))
-
-        if not stage_workers:
-            raise ValueError(f"No workers found for stage {stage_idx}")
-
-        for idx, proc, worker_id, stage_name in stage_workers:
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=2)
-                if proc.is_alive():
-                    proc.kill()
-                    proc.join(timeout=1)
-
-        job = self.jobs[stage_idx]
-
-        old_out_queue = self.queues[stage_idx]
-        old_out_maxsize = old_out_queue._maxsize if hasattr(old_out_queue, "_maxsize") else 0
-
-        drained_items = []
-        try:
-            while True:
-                item = old_out_queue.get_nowait()
-                if not _is_end(item):
-                    drained_items.append(item)
-        except Empty:
-            pass
-
-        try:
-            old_out_queue.cancel_join_thread()
-            old_out_queue.close()
-        except Exception:
-            pass
-
-        new_out_queue = Queue(maxsize=old_out_maxsize)
-        self.queues[stage_idx] = new_out_queue
-
-        for item in drained_items:
-            try:
-                new_out_queue.put_nowait(item)
-            except Full:
-                break
-
-        _log(
-            f"   Recreated output queue for stage {stage_idx} (recovered {len(drained_items)} items)"
-        )
-
-        self.stage_end_counters[stage_idx].value = 0
-
-        in_queue = self.queues[stage_idx - 1] if stage_idx > 0 else None
-        out_queue = new_out_queue
-
-        func = job["func"]
-        if hasattr(func, "__name__"):
-            stage_name = func.__name__
-        elif hasattr(func, "__class__"):
-            stage_name = func.__class__.__name__
-        else:
-            stage_name = str(type(func).__name__)
-
-        is_final_stage = stage_idx == len(self.jobs) - 1
-        upstream_done = self.stage_done_events[stage_idx - 1] if stage_idx > 0 else None
-        stage_done = self.stage_done_events[stage_idx]
-
-        for idx, old_proc, worker_id, _ in stage_workers:
-            config = self.worker_configs.get(worker_id)
-            if not config:
-                print(f"   Warning: No config for {worker_id}, skipping")
-                continue
-
-            old_args = config["args"]
-
-            if config["target"] == _threaded_worker_run:
-                new_args = (
-                    old_args[0],
-                    in_queue,
-                    out_queue,
-                    self.should_stop,
-                    self.working,
-                    old_args[5],
-                    self.timing_dict,
-                    worker_id,
-                    self.raise_errors,
-                    old_args[9],
-                    self.stage_end_counters[stage_idx],
-                    self.stage_worker_counts[stage_idx],
-                    stage_idx,
-                    stage_name,
-                    is_final_stage,
-                    self.expected_consumers,
-                    upstream_done,
-                    stage_done,
-                    self.sequential,
-                    job.get("batch", 0),
-                    self.drain_event,
-                    job.get("drain", True),
-                    self.queues,
-                    [j["name"] for j in self.jobs],
-                    old_args[24],  # cpu_affinity slice, unchanged across restart
-                    old_args[25],  # cpu_threads, unchanged across restart
-                    job.get("chunk_eff", 0),
-                    job.get("chunk_ms", 10.0),
-                )
-            else:
-                new_args = (
-                    old_args[0],
-                    in_queue,
-                    out_queue,
-                    self.should_stop,
-                    self.working,
-                    old_args[5],
-                    self.timing_dict,
-                    worker_id,
-                    self.raise_errors,
-                    self.stage_end_counters[stage_idx],
-                    self.stage_worker_counts[stage_idx],
-                    stage_idx,
-                    stage_name,
-                    is_final_stage,
-                    self.expected_consumers,
-                    upstream_done,
-                    stage_done,
-                    self.sequential,
-                    job.get("batch", 0),
-                    self.drain_event,
-                    job.get("drain", True),
-                    self.queues,
-                    [j["name"] for j in self.jobs],
-                    old_args[23],  # cpu_affinity slice, unchanged across restart
-                    old_args[24],  # cpu_threads, unchanged across restart
-                    job.get("chunk_eff", 0),
-                    job.get("chunk_ms", 10.0),
-                )
-
-            config["args"] = new_args
-
-            p = mp.Process(target=config["target"], args=new_args)
-            p.start()
-
-            self.worker_info[idx] = (p, worker_id, stage_name)
-            for i, proc in enumerate(self.processes):
-                if proc == old_proc:
-                    self.processes[i] = p
-                    break
-
-            _log(f"   Restarted {worker_id} with PID {p.pid}")
-
-        _log(f"   Stage {stage_idx} restart complete")
-
     def restart(self, reason="ConnectionError"):
         self._stop(force=True)
 
@@ -522,7 +358,6 @@ class LifecycleMixin:
             self.stats_monitor_stop_event.set()
             self.stats_monitor_thread.join(timeout=2)
             self.stats_monitor_thread = None
-        self.progress = None
 
         if force:
             _log("Force stopping all processes...")
@@ -587,9 +422,7 @@ class LifecycleMixin:
         self.worker_info = []
         self.worker_configs = {}
         self.profile_rss = {}
-        self.working.value = 0
         self.should_stop.value = 0
-        self.restart_needed.value = 0
         self.drain_event.clear()
 
         for counter in self.stage_end_counters:

@@ -267,6 +267,30 @@ Uses Event-based coordination (not sentinel passing):
 
 Workers are flushed on exit: framework calls `worker.flush()` to drain buffered items before signaling downstream.
 
+## DDP / Multi-Consumer (shared queue mode)
+
+One process builds and runs the pipe; every training rank reads the SAME final
+queue through `PipeIterator`. `expected_consumers=N` makes the final stage emit
+N `End` sentinels — one per reader — so every rank's iterator terminates.
+
+```python
+from pipe import Pipe, PipeIterator
+
+# rank 0 (or a dedicated data process)
+pipe = Pipe(expected_consumers=world_size)
+pipe.add(Loader(), outqn=200)
+pipe.add(GPUEncode(), pergpu=True, outqn=None)
+pipe.start()
+shared_queue = pipe.queues[-1]   # hand to the other ranks (torch.mp spawn args)
+
+# every rank
+for batch in PipeIterator(shared_queue):
+    train_step(batch)
+```
+
+Items are NOT duplicated across readers — each item goes to exactly one rank
+(competing consumers). Use it for work distribution, not broadcast.
+
 ## pipe.add() Options
 
 ```python
@@ -360,13 +384,29 @@ pipe = Pipe(
                                 # "rich" (Rich Progress bar, standalone Live),
                                 # "external" (no display, poll with get_stats())
     health_check_interval=30,   # check worker liveness every N seconds (0=off)
-    expected_consumers=1,       # for DDP: multiply end signals for N consumers
+    expected_consumers=1,       # DDP shared mode: N End sentinels on the final queue,
+                                # one per PipeIterator reader (see DDP section)
     raise_errors=None,          # if None, defaults to sequential mode; True raises exceptions
     allow_full_restart=True,    # allow restarting entire pipeline on repeated crashes
     use_shm=False,              # use shared memory for tensor serialization
     output_shm=False,           # output items use shared memory encoding
+    profile=False,              # run every worker under cProfile + track peak RSS
 )
 ```
+
+### Profiling (profile=True)
+
+Every worker process runs under cProfile and records its peak RSS. On `pipe.stop()`
+a summary prints: per-worker CPU time + peak memory, then the top-5 functions per
+stage. Raw `.prof` files land in `/tmp/pipe_profile_<pid>/` for deeper inspection:
+
+```python
+import pstats
+pstats.Stats("/tmp/pipe_profile_1234/stage_1_worker_0.prof").sort_stats("cumulative").print_stats(20)
+```
+
+Use to find which stage burns CPU (vs waits on IO) and which worker leaks memory.
+Overhead is small but nonzero — don't leave on in production runs.
 
 ### Stats Modes
 
@@ -658,6 +698,19 @@ for result in pipe:
 
 Pipe is quiet by default. Set `PIPE_VERBOSE=1` to enable informational prints (startup messages, worker lifecycle, signal handling). Errors and warnings always print regardless. Stats display is controlled separately via `stats_mode`.
 
+## Printing without clobbering the stats line
+
+On a TTY, text-mode stats render as ONE pinned line repainted in place. To print a message on its own line above it (tqdm-style):
+
+```python
+pipe.print("checkpoint saved")        # main process (rich-mode aware)
+
+from pipe import print_above          # inside worker classes (child processes)
+print_above("retrying item 42")
+```
+
+Both fall back to plain `print()` when stdout is not a TTY (piped logs, tests). A bare `print()` from a worker still works — it wipes the current stats frame, which repaints on the next tick — but `print_above` keeps the line intact.
+
 ## Common Pitfalls
 
 - **Deadlock**: Usually queue full + worker waiting. Fix: increase outqn or add more downstream workers
@@ -760,8 +813,9 @@ pipe.stop(force=True)  # terminate immediately
 
 ## Helpers (from pipe import ...)
 
-- `Batcher(size, collate_fn=None)` - simple batching, returns None until full then returns batch
-- `BufferAndShuffle(size)` - ring buffer with random shuffle on overflow
-- `RetrieveSQL(conn_str, query, batch_size)` - paginated DB iteration with randomization
-- `SQLConnection(conn_str)` - reusable postgres connection for workers
+- `Batcher(size, collate_fn=None)` - simple batching, returns None until full then returns batch; flush() emits the partial tail
+- `BufferAndShuffle(size, batch_size)` - shuffle buffer, releases shuffled batches on overflow; flush() drains the remainder
+- `print_above(msg)` - print without clobbering the pinned stats line (safe in workers)
+- `RetrieveSQL(query, chunk_size=20, skip_count=False)` - paginated DB root worker (randomized order, re-checks COUNT(*) for new rows); requires a project-local `data.db` module
+- `SQLConnection(query=None)` - reusable postgres connection for writer stages; requires project-local `data.constants.CONNECTION_STRING`
 - `RTF()` - real-time factor tracking (audio_duration / process_duration)

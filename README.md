@@ -75,9 +75,10 @@ pytest tests/test_basic.py -v
 ## Key Classes
 
 - `Pipe` - Main pipeline orchestrator
+- `End` - Sentinel a root worker returns to signal completion
 - `Batcher` - Batch items together
 - `BufferAndShuffle` - Buffer and shuffle items
-- `PipeIterator` - Iterate over pipeline output
+- `PipeIterator` - Read a pipe's output queue from another process (DDP shared mode)
 
 ## Features
 

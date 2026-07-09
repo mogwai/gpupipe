@@ -4,14 +4,9 @@ Mixed into `Pipe`; runs all stages in-process with no multiprocessing, preservin
 generator/list/None/batch/run()/push() semantics so a `sequential=True` run behaves
 like the parallel one."""
 import inspect
-import os
 
+from .utils import _log
 from .workers import _is_end
-
-
-def _log(msg):
-    if os.environ.get("PIPE_VERBOSE") == "1":
-        print(msg)
 
 
 class SequentialMixin:

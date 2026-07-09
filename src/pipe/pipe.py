@@ -9,16 +9,12 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
 
-def _log(msg):
-    if os.environ.get("PIPE_VERBOSE") == "1":
-        print(msg)
-
-
 from .lifecycle import LifecycleMixin
 from .monitors import _collect_stats
 from .queues import InstrumentedQueue, PipeIterator, _InputChannel  # noqa: F401 (kept importable from pipe.pipe)
 from .sequential import SequentialMixin
 from .shm import _cleanup_stale_shm, _item_from_shm
+from .utils import _log, print_above
 from .workers import _check_picklable, _is_end
 
 if not mp.get_start_method(allow_none=True):
@@ -70,9 +66,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.worker_info = []
         self.worker_configs = {}
         self.started = False
-        self.working = Value("i", 0)
         self.should_stop = Value("i", 0)
-        self.restart_needed = Value("i", 0)
         self.drain_event = Event()
         self.health_monitor_thread = None
         self.health_monitor_stop_event = threading.Event()
@@ -257,6 +251,19 @@ class Pipe(LifecycleMixin, SequentialMixin):
 
     def get_stats(self):
         return _collect_stats(self)
+
+    def print(self, msg):
+        """Print a message without clobbering the stats display.
+
+        In text stats mode the message lands on its own line above the pinned
+        stats line; in rich mode it routes through the Live-aware console; with
+        stats off it is a plain print.
+        """
+        console = getattr(self, "_rich_console", None)
+        if console is not None:
+            console.print(msg)
+        else:
+            print_above(msg)
 
     def __iter__(self):
         if not self.started:
