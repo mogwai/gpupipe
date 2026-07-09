@@ -1,4 +1,10 @@
-"""Demo script for pipe autoscaling with realistic audio-like workload."""
+"""Demo: multi-stage parallel pipeline on a realistic audio-like workload.
+
+Simulates fetch -> download -> CPU-bound process -> collect with fixed
+per-stage worker counts. (An autoscaling variant of this workload lives in
+examples/planned/autoscale_demo.py — that one needs the planned autoscaling
+feature; see PLANNED.md.)
+"""
 
 import hashlib
 import random
@@ -44,7 +50,7 @@ class Downloader:
         print("Downloader ready")
 
     def __call__(self, item):
-        # Simulate network: 50-150ms (slower to trigger scaling)
+        # Simulate network: 50-150ms
         time.sleep(random.uniform(0.05, 0.15))
         item["downloaded"] = True
         return item
@@ -77,41 +83,30 @@ if __name__ == "__main__":
     n_items = 100
 
     print("=" * 60)
-    print("PIPE AUTOSCALING DEMO")
+    print("PIPE DEMO")
     print("=" * 60)
     print(f"Processing {n_items} simulated audio files (5s-120s each)")
     print()
 
-    # Global autoscale=True enables autoscaling for all stages
-    # Per-stage max_workers can still override the global max_workers_per_stage
     pipe = Pipe(
         debug=False,
         stats_interval=0.2,
         stats_mode="rich",
         health_check_interval=0,
-        autoscale=True,
-        max_workers_per_stage=6,
     )
     pipe.add(AudioGenerator(n_items), outqn=20)
-    pipe.add(Downloader(), workers=2, outqn=30)  # Will autoscale 1-6 (global settings)
-    pipe.add(Processor(), workers=1, outqn=30, max_workers=4)  # Will autoscale 1-4 (custom max)
+    pipe.add(Downloader(), workers=4, outqn=30)  # I/O-bound: more workers
+    pipe.add(Processor(), workers=2, outqn=30)  # CPU-bound
     pipe.add(Collector(), workers=1, outqn=0)
 
     start = time.time()
     results = []
-    worker_snapshots = []
 
     for i, item in enumerate(pipe):
         results.append(item)
-        dl_workers = pipe.stage_worker_counts[1].value
-        proc_workers = pipe.stage_worker_counts[2].value
-        worker_snapshots.append((dl_workers, proc_workers))
-
         if (i + 1) % 20 == 0:
             elapsed = time.time() - start
-            print(
-                f"  [{i + 1:3d}/{n_items}] {elapsed:5.1f}s | downloaders={dl_workers} processors={proc_workers}"
-            )
+            print(f"  [{i + 1:3d}/{n_items}] {elapsed:5.1f}s")
 
     elapsed = time.time() - start
     print()
@@ -121,18 +116,3 @@ if __name__ == "__main__":
     print(f"Items processed: {len(results)}/{n_items}")
     print(f"Time elapsed: {elapsed:.1f}s")
     print(f"Throughput: {len(results) / elapsed:.1f} items/sec")
-    print()
-
-    # Worker history
-    dl_history = [s[0] for s in worker_snapshots]
-    proc_history = [s[1] for s in worker_snapshots]
-    print(f"Downloader workers: min={min(dl_history)} max={max(dl_history)} final={dl_history[-1]}")
-    print(
-        f"Processor workers:  min={min(proc_history)} max={max(proc_history)} final={proc_history[-1]}"
-    )
-
-    dl_changes = sum(1 for i in range(1, len(dl_history)) if dl_history[i] != dl_history[i - 1])
-    proc_changes = sum(
-        1 for i in range(1, len(proc_history)) if proc_history[i] != proc_history[i - 1]
-    )
-    print(f"Scaling events: downloaders={dl_changes} processors={proc_changes}")

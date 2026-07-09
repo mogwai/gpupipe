@@ -2,8 +2,6 @@ import os
 import re
 import time
 
-from .workers import _signal_worker_to_stop, _spawn_additional_worker
-
 
 def _log(msg):
     if os.environ.get("PIPE_VERBOSE") == "1":
@@ -138,7 +136,7 @@ def _collect_stats(pipe_instance):
 
         # On a chunked edge each queue message holds up to chunk_eff items, so
         # scale the display back to ITEMS (upper-bound estimate). The fill
-        # ratio — what the autoscaler thresholds use — is unchanged by this.
+        # ratio is unchanged by this.
         chunk_eff = pipe_instance.jobs[stage_idx].get("chunk_eff", 0)
         if chunk_eff > 1:
             qsize *= chunk_eff
@@ -302,135 +300,3 @@ def _stats_monitor_thread_text(pipe_instance, stop_event, interval_seconds=30):
         print(f"[{total_items}] " + "\u25b8".join(parts))
 
     _log("Stats monitor shutting down")
-
-
-def _get_cpu_usage():
-    try:
-        with open("/proc/stat", "r") as f:
-            line = f.readline()
-        parts = line.split()
-        idle = int(parts[4])
-        total = sum(int(x) for x in parts[1:])
-        return idle, total
-    except Exception:
-        return None, None
-
-
-def _autoscaler_thread(
-    pipe_instance,
-    should_stop,
-    stop_event,
-    check_interval=1.0,
-    scale_up_threshold=0.8,
-    scale_down_threshold=0.2,
-    scale_up_samples=3,
-    scale_down_samples=5,
-    cooldown_seconds=3.0,
-    cpu_limit=0.85,
-):
-    _log("Autoscaler started")
-
-    high_pressure_counts = {}
-    low_pressure_counts = {}
-    last_scale_time = {}
-
-    prev_idle, prev_total = _get_cpu_usage()
-    cpu_saturated = False
-
-    while not should_stop.value and not stop_event.is_set():
-        time.sleep(check_interval)
-
-        if should_stop.value or stop_event.is_set():
-            break
-
-        current_time = time.time()
-
-        curr_idle, curr_total = _get_cpu_usage()
-        if prev_idle is not None and curr_idle is not None:
-            idle_delta = curr_idle - prev_idle
-            total_delta = curr_total - prev_total
-            if total_delta > 0:
-                cpu_usage = 1.0 - (idle_delta / total_delta)
-                cpu_saturated = cpu_usage > cpu_limit
-            prev_idle, prev_total = curr_idle, curr_total
-
-        for stage_idx, job in enumerate(pipe_instance.jobs):
-            if not job.get("autoscale"):
-                continue
-
-            if stage_idx == 0:
-                continue
-
-            if stage_idx in last_scale_time:
-                if current_time - last_scale_time[stage_idx] < cooldown_seconds:
-                    continue
-
-            try:
-                total_workers = pipe_instance.stage_worker_counts[stage_idx].value
-                finished_workers = pipe_instance.stage_end_counters[stage_idx].value
-                active_workers = total_workers - finished_workers
-                max_workers = job.get("max_workers", active_workers * 4)
-                min_workers = job.get("min_workers", 1)
-
-                num_queues = len(pipe_instance.queues)
-                num_workers = len(pipe_instance.stage_worker_counts)
-                if stage_idx - 1 >= num_queues:
-                    continue
-                if stage_idx >= num_workers:
-                    continue
-                if active_workers <= 0:
-                    continue
-
-                in_queue = pipe_instance.queues[stage_idx - 1]
-                in_size = in_queue.qsize()
-                in_max = in_queue._maxsize if hasattr(in_queue, "_maxsize") else 0
-                if in_max <= 0:
-                    continue
-
-                in_fill = in_size / in_max
-
-                out_queue = pipe_instance.queues[stage_idx] if stage_idx < len(pipe_instance.queues) else None
-                out_blocked = False
-                if out_queue:
-                    out_size = out_queue.qsize()
-                    out_max = out_queue._maxsize if hasattr(out_queue, "_maxsize") else 0
-                    if out_max > 0:
-                        out_fill = out_size / out_max
-                        out_blocked = out_fill >= 0.9
-
-                if active_workers < max_workers and in_fill >= scale_up_threshold:
-                    if cpu_saturated:
-                        high_pressure_counts[stage_idx] = 0
-                        continue
-
-                    if out_blocked:
-                        high_pressure_counts[stage_idx] = 0
-                        continue
-
-                    high_pressure_counts[stage_idx] = high_pressure_counts.get(stage_idx, 0) + 1
-                    low_pressure_counts[stage_idx] = 0
-
-                    if high_pressure_counts[stage_idx] >= scale_up_samples:
-                        high_pressure_counts[stage_idx] = 0
-                        last_scale_time[stage_idx] = current_time
-                        _log(f"   Autoscale UP: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers + 1} workers")
-                        _spawn_additional_worker(pipe_instance, stage_idx, job)
-
-                elif active_workers > min_workers and in_fill <= scale_down_threshold:
-                    low_pressure_counts[stage_idx] = low_pressure_counts.get(stage_idx, 0) + 1
-                    high_pressure_counts[stage_idx] = 0
-
-                    if low_pressure_counts[stage_idx] >= scale_down_samples:
-                        low_pressure_counts[stage_idx] = 0
-                        last_scale_time[stage_idx] = current_time
-                        _log(f"   Autoscale DOWN: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers - 1} workers")
-                        _signal_worker_to_stop(pipe_instance, stage_idx)
-                else:
-                    high_pressure_counts[stage_idx] = 0
-                    low_pressure_counts[stage_idx] = 0
-
-            except Exception as e:
-                import traceback
-                print(f"Autoscaler error at stage {stage_idx}: {e}\n{traceback.format_exc()}")
-
-    _log("Autoscaler stopped")

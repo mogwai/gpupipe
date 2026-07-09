@@ -12,7 +12,7 @@ from queue import Empty, Full
 
 import torch
 
-from .types import End
+from .types import End, WorkerStop
 from .queues import _InputChannel, _OutputChannel
 from .shm import _item_from_shm, _item_to_shm
 
@@ -137,6 +137,10 @@ def _make_push(all_queues, stage_names, should_stop):
 
 def _is_end(item):
     return item is End
+
+
+def _is_worker_stop(item):
+    return item is WorkerStop
 
 
 def _check_picklable(obj, name: str, is_thread: bool = False) -> None:
@@ -287,8 +291,8 @@ def _worker_run(
                         return []  # truly done
                     time.sleep(0.01)
                     continue
-                if raw == "worker_stop":
-                    in_ch.put("worker_stop")
+                if _is_worker_stop(raw):
+                    in_ch.put(WorkerStop)
                     break
                 raw = _item_from_shm(raw)
                 if _is_end(raw):
@@ -452,7 +456,11 @@ def _worker_run(
                 except (OSError, EOFError, BrokenPipeError):
                     break
 
-                if item == "worker_stop":
+                # Graceful early-exit primitive: a worker leaves the pool when it
+                # pulls a WorkerStop sentinel. Currently only driven by the
+                # planned autoscaler (src/pipe/_planned/autoscale.py); left inert
+                # here so scale-down works the moment that feature is re-enabled.
+                if _is_worker_stop(item):
                     _log(f"Worker {worker_id} received stop signal, exiting gracefully")
                     # Items already unpacked from a chunk belong back on the shared
                     # queue — siblings must process them, we're leaving the pool.
@@ -461,7 +469,7 @@ def _worker_run(
                     if out_ch is not None:
                         out_ch.flush()
                     # Skip coordination - we were removed from the pool, not finishing normally
-                    # (count was already decremented in _signal_worker_to_stop)
+                    # (count is decremented by whatever signalled the stop)
                     while should_stop is not None and not should_stop.value:
                         time.sleep(0.1)
                     return
@@ -486,8 +494,8 @@ def _worker_run(
                             if time.monotonic() >= deadline:
                                 break
                             continue
-                        if raw == "worker_stop":
-                            in_ch.put("worker_stop")
+                        if _is_worker_stop(raw):
+                            in_ch.put(WorkerStop)
                             break
                         raw = _item_from_shm(raw)
                         if _is_end(raw):
@@ -685,8 +693,8 @@ def _threaded_worker_run(
                         return []  # truly done
                     time.sleep(0.01)
                     continue
-                if raw == "worker_stop":
-                    _pull_ch.put("worker_stop")
+                if _is_worker_stop(raw):
+                    _pull_ch.put(WorkerStop)
                     break
                 raw = _item_from_shm(raw)
                 if _is_end(raw):
@@ -875,12 +883,14 @@ def _threaded_worker_run(
                         in_ch.requeue_buffered(should_stop)
                         return
 
-                    if item == "worker_stop":
+                    # Inert graceful early-exit primitive (see _worker_run above);
+                    # only the planned autoscaler emits WorkerStop today.
+                    if _is_worker_stop(item):
                         _log(f"Thread {worker_id} received stop signal")
                         # Return chunk-buffered items to the shared queue for siblings.
                         in_ch.requeue_buffered(should_stop)
                         # Just exit - coordination is skipped for stopped workers
-                        # (count was already decremented in _signal_worker_to_stop)
+                        # (count is decremented by whatever signalled the stop)
                         return
 
                     item = _item_from_shm(item)
@@ -903,8 +913,8 @@ def _threaded_worker_run(
                                 if time.monotonic() >= deadline:
                                     break
                                 continue
-                            if raw == "worker_stop":
-                                in_ch.put("worker_stop")
+                            if _is_worker_stop(raw):
+                                in_ch.put(WorkerStop)
                                 break
                             raw = _item_from_shm(raw)
                             if _is_end(raw):
@@ -1033,127 +1043,3 @@ def _threaded_worker_run(
     while should_stop is not None and not should_stop.value:
         time.sleep(0.1)
 
-
-def _signal_worker_to_stop(pipe_instance, stage_idx):
-    """Signal one worker at a stage to stop after completing current item."""
-    in_queue = pipe_instance.queues[stage_idx - 1] if stage_idx > 0 else None
-    if in_queue:
-        try:
-            in_queue.put("worker_stop", timeout=0.1)
-            # Decrement worker count so stage completion check works correctly
-            with pipe_instance.stage_worker_counts[stage_idx].get_lock():
-                pipe_instance.stage_worker_counts[stage_idx].value -= 1
-            _log(f"   Signaled worker at stage {stage_idx} to stop")
-        except Exception as e:
-            _log(f"   Failed to signal worker stop: {e}")
-
-
-def _spawn_additional_worker(pipe_instance, stage_idx, job):
-    """Spawn an additional worker for the given stage."""
-    from torch.multiprocessing import Process
-
-    func = job["func"]
-    is_threaded = job.get("thread", False)
-
-    if hasattr(func, "__name__"):
-        stage_name = func.__name__
-    elif hasattr(func, "__class__"):
-        stage_name = func.__class__.__name__
-    else:
-        stage_name = str(type(func).__name__)
-
-    new_worker_idx = pipe_instance.stage_spawn_counts[stage_idx]
-    pipe_instance.stage_spawn_counts[stage_idx] += 1
-    worker_id = f"stage_{stage_idx}_worker_{new_worker_idx}"
-
-    # cpus= stages force autoscale off (a static pin can't track a live worker count),
-    # so this is normally None; computed defensively to keep the args arity consistent.
-    cpu_affinity = _cpu_chunk(job.get("cpus"), new_worker_idx, job.get("num_workers", 1))
-
-    _log(f"Autoscaling: Adding worker {new_worker_idx + 1} to {stage_name} (stage {stage_idx})")
-
-    in_queue = pipe_instance.queues[stage_idx - 1] if stage_idx > 0 else None
-    out_queue = pipe_instance.queues[stage_idx] if stage_idx < len(pipe_instance.queues) else None
-
-    is_final_stage = stage_idx == len(pipe_instance.jobs) - 1
-
-    upstream_done = pipe_instance.stage_done_events[stage_idx - 1] if stage_idx > 0 else None
-    stage_done = pipe_instance.stage_done_events[stage_idx]
-
-    pipe_instance.stage_worker_counts[stage_idx].value += 1
-
-    if is_threaded:
-        args = (
-            func,
-            in_queue,
-            out_queue,
-            pipe_instance.should_stop,
-            pipe_instance.working,
-            None,
-            pipe_instance.timing_dict,
-            worker_id,
-            pipe_instance.raise_errors,
-            job.get("num_workers", 4),
-            pipe_instance.stage_end_counters[stage_idx],
-            pipe_instance.stage_worker_counts[stage_idx],
-            stage_idx,
-            stage_name,
-            is_final_stage,
-            pipe_instance.expected_consumers,
-            upstream_done,
-            stage_done,
-            pipe_instance.sequential,
-            job.get("batch", 0),
-            pipe_instance.drain_event,
-            job.get("drain", True),
-            pipe_instance.queues,
-            [j["name"] for j in pipe_instance.jobs],
-            cpu_affinity,
-            job.get("cpu_threads"),
-            job.get("chunk_eff", 0),
-            job.get("chunk_ms", 10.0),
-        )
-        proc = Process(target=_threaded_worker_run, args=args, daemon=True)
-    else:
-        args = (
-            func,
-            in_queue,
-            out_queue,
-            pipe_instance.should_stop,
-            pipe_instance.working,
-            None,
-            pipe_instance.timing_dict,
-            worker_id,
-            pipe_instance.raise_errors,
-            pipe_instance.stage_end_counters[stage_idx],
-            pipe_instance.stage_worker_counts[stage_idx],
-            stage_idx,
-            stage_name,
-            is_final_stage,
-            pipe_instance.expected_consumers,
-            upstream_done,
-            stage_done,
-            pipe_instance.sequential,
-            job.get("batch", 0),
-            pipe_instance.drain_event,
-            job.get("drain", True),
-            pipe_instance.queues,
-            [j["name"] for j in pipe_instance.jobs],
-            cpu_affinity,
-            job.get("cpu_threads"),
-            job.get("chunk_eff", 0),
-            job.get("chunk_ms", 10.0),
-        )
-        proc = Process(target=_worker_run, args=args, daemon=True)
-
-    proc.start()
-    _log(f"   Worker {worker_id} started with PID {proc.pid}")
-
-    pipe_instance.processes.append(proc)
-    pipe_instance.worker_info.append((proc, worker_id, stage_name))
-
-    pipe_instance.worker_configs[worker_id] = {
-        "target": _threaded_worker_run if is_threaded else _worker_run,
-        "args": args,
-        "stage_name": stage_name,
-    }

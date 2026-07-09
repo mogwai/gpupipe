@@ -221,17 +221,6 @@ def test_cpu_threads_validation(bad):
         p.add(AffinityReporter(), cpu_threads=bad)
 
 
-def test_cpu_threads_does_not_disable_autoscale():
-    """Unlike cpus=, a bare cpu_threads doesn't pin, so autoscale stays on."""
-    p = Pipe(raise_errors=True, stats_interval=0, health_check_interval=0, autoscale=True)
-    p.add(Gen(1), workers=1)
-    p.add(AffinityReporter(), cpu_threads=4, autoscale=True)
-    assert p.jobs[-1]["autoscale"] is True
-
-
-def test_cpus_disables_autoscale():
-    """A static core pin can't track a live worker count, so cpus= forces autoscale off."""
-    p = Pipe(raise_errors=True, stats_interval=0, health_check_interval=0, autoscale=True)
-    p.add(Gen(1), workers=1)
-    p.add(AffinityReporter(), cpus=[0], autoscale=True)
-    assert p.jobs[-1]["autoscale"] is False
+# The autoscale/cpus interaction tests were removed with the autoscaling
+# feature and are currently NOT covered anywhere that runs; restore them from
+# git history when re-integrating (see PLANNED.md).

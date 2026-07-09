@@ -1,6 +1,6 @@
 # Pipe - Multiprocessing Pipeline Framework
 
-A robust multiprocessing pipeline framework for streaming data processing with autoscaling, multi-worker stages, threaded workers, and graceful shutdown.
+A robust multiprocessing pipeline framework for streaming data processing with multi-worker stages, threaded workers, and graceful shutdown.
 
 ## Installation
 
@@ -40,28 +40,9 @@ for result in pipe:
     print(result)
 ```
 
-## Autoscaling
-
-Enable automatic worker scaling based on queue pressure:
-
-```python
-# Global autoscale - all stages scale automatically
-pipe = Pipe(autoscale=True, max_workers_per_stage=8)
-pipe.add(Generator(), outqn=20)
-pipe.add(Worker(), workers=1, outqn=20)  # Will scale 1-8 based on load
-pipe.add(Worker(), workers=1, outqn=20, max_workers=4)  # Custom max
-
-# Per-stage autoscale
-pipe = Pipe()
-pipe.add(Generator(), outqn=20)
-pipe.add(Worker(), workers=1, outqn=20, autoscale=True, min_workers=1, max_workers=6)
-```
-
-Autoscaling features:
-- **Queue pressure based**: Scales up when input queue is full, down when empty
-- **CPU aware**: Won't scale up if CPU usage exceeds 85%
-- **GPU stages disabled**: GPU workers (`pergpu=True` or `gpu_id`) never autoscale
-- **Cooldown**: 3 second minimum between scaling actions
+> **Autoscaling** (queue-pressure-based worker scaling) is a **planned feature** —
+> designed and implemented, but not currently wired into `Pipe`. See
+> [`PLANNED.md`](PLANNED.md) for the design and re-integration steps.
 
 ## GPU Workers
 
@@ -87,8 +68,8 @@ pipe.add(IOWorker(), workers=8, thread=True, outqn=20)
 # Run all tests
 pytest tests/
 
-# Run specific tests
-pytest tests/test_pipe.py::test_autoscale_global -v
+# Run a specific test
+pytest tests/test_basic.py -v
 ```
 
 ## Key Classes
