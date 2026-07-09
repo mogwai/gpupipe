@@ -68,18 +68,11 @@ def _health_monitor_thread(
                     print("   Full pipeline restart complete")
                 except Exception as e:
                     print(f"   Failed to restart pipeline: {e}")
-            elif need_full_restart:
-                print(
-                    "   Full restart needed but disabled - restarting workers individually"
-                )
-                for idx, worker_id, stage_name, exitcode in crashed_workers:
-                    try:
-                        pipe_instance._restart_worker(idx, worker_id)
-                        print(f"   Restarted {worker_id}")
-                    except Exception as e:
-                        print(f"   Failed to restart {worker_id}: {e}")
             else:
-                print("   Restarting crashed workers individually...")
+                if need_full_restart:
+                    print("   Full restart needed but disabled - restarting workers individually")
+                else:
+                    print("   Restarting crashed workers individually...")
                 for idx, worker_id, stage_name, exitcode in crashed_workers:
                     try:
                         pipe_instance._restart_worker(idx, worker_id)
@@ -93,7 +86,7 @@ def _health_monitor_thread(
 def _queue_bar(qsize, qmax, width=10):
     if not qmax:
         return ""
-    fill = qsize / qmax if qmax > 0 else 0
+    fill = qsize / qmax
     filled = int(fill * width)
     bar = "|" * filled + " " * (width - filled)
     if fill >= 0.8:
