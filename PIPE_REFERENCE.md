@@ -188,6 +188,31 @@ pipe.add(StreamingTranscriber(), pergpu=True, batch=8, outqn=50)
 - Works in both multiprocessing and sequential mode
 - Triggered automatically when a non-root worker defines `run()`
 
+### AsyncPoolWorker (streaming async IO — preferred for downloads)
+
+For IO stages, subclass `AsyncPoolWorker` instead of hand-writing `run()`: a single
+worker keeps up to `max_concurrent` async tasks in flight continuously, pulling new
+items as capacity frees and emitting each result the moment it lands. Unlike
+`batch=N` + `asyncio.gather` there is NO barrier — one slow item never holds up the
+rest, so a downstream GPU stage stays fed.
+
+```python
+from pipe import AsyncPoolWorker
+
+class Downloader(AsyncPoolWorker):
+    def load(self):
+        self.store = make_s3_store()
+
+    async def process(self, item):        # return item, a list, or None to drop
+        item["data"] = await fetch(self.store, item["key"])
+        return item
+
+pipe.add(Downloader(max_concurrent=256), workers=1, outqn=200)
+```
+
+Exceptions in `process()` print a traceback and drop the item. Works in
+multiprocessing and sequential mode.
+
 ### Sending an item BACK to an earlier stage: `self.push(stage, item)`
 
 Every non-root worker (plain `__call__` or `run()`) gets `self.push(stage, item)`,
@@ -813,6 +838,7 @@ pipe.stop(force=True)  # terminate immediately
 
 ## Helpers (from pipe import ...)
 
+- `AsyncPoolWorker(max_concurrent=64)` - subclass with `async def process(item)`: streaming async pool, no gather barrier (see Worker Types)
 - `Batcher(size, collate_fn=None)` - simple batching, returns None until full then returns batch; flush() emits the partial tail
 - `BufferAndShuffle(size, batch_size)` - shuffle buffer, releases shuffled batches on overflow; flush() drains the remainder
 - `print_above(msg)` - print without clobbering the pinned stats line (safe in workers)

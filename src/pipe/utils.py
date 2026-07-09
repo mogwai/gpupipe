@@ -250,3 +250,87 @@ class RTF:
         rtf = self.total / (time.perf_counter() - self.start)
         print(f"{rtf:.2f}x")
         return item
+
+
+class AsyncPoolWorker:
+    """Streaming async pool: a single worker that keeps up to `max_concurrent`
+    async tasks in flight continuously, pulling new items as capacity frees up
+    and emitting each result the moment it lands.
+
+    Unlike `batch=N` + asyncio.gather there is NO barrier: one slow/retrying
+    item never holds up the rest, so downstream (e.g. a GPU stage) stays fed.
+
+    Subclass and implement `async def process(self, item)`; return an item to
+    emit, a list to emit several, or None to drop. Heavy clients (S3 stores,
+    HTTP sessions) go in `load()` as usual.
+
+        class Downloader(AsyncPoolWorker):
+            def load(self):
+                self.store = make_store()
+            async def process(self, item):
+                item["data"] = await fetch(self.store, item["key"])
+                return item
+
+        pipe.add(Downloader(max_concurrent=256), workers=1, outqn=200)
+
+    Uses the framework's run()/pull()/put() contract, so it works in both
+    multiprocessing and sequential mode. Exceptions in process() print a
+    traceback and drop the item (matching normal worker semantics).
+    """
+
+    def __init__(self, max_concurrent=64):
+        self.max_concurrent = max_concurrent
+
+    async def process(self, item):
+        raise NotImplementedError("subclass AsyncPoolWorker and implement process()")
+
+    def run(self):
+        import asyncio
+
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
+        import asyncio
+        import traceback
+
+        async def _process_safe(item):
+            try:
+                return await self.process(item)
+            except Exception as e:
+                print(f"{type(self).__name__}.process() error: {e}")
+                traceback.print_exc()
+                return None
+
+        in_flight, pull_task, upstream_done = set(), None, False
+        while True:
+            need = self.max_concurrent - len(in_flight)
+            if pull_task is None and not upstream_done and need > 0:
+                # pull() blocks (waiting on upstream), so run it in a thread to
+                # keep the event loop free for the in-flight tasks.
+                pull_task = asyncio.create_task(asyncio.to_thread(self.pull, need))
+            waiters = set(in_flight) | ({pull_task} if pull_task else set())
+            if not waiters:
+                break
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task is pull_task:
+                    items = task.result()
+                    pull_task = None
+                    if not items:
+                        upstream_done = True  # pull() returns [] only when upstream is done
+                    else:
+                        for it in items:
+                            in_flight.add(asyncio.create_task(_process_safe(it)))
+                else:
+                    in_flight.discard(task)
+                    result = task.result()
+                    if result is None:
+                        continue
+                    # put() blocks on backpressure; emit from a thread so the
+                    # pool keeps draining while downstream is full.
+                    if isinstance(result, list):
+                        for r in result:
+                            if r is not None:
+                                await asyncio.to_thread(self.put, r)
+                    else:
+                        await asyncio.to_thread(self.put, result)

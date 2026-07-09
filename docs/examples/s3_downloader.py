@@ -1,20 +1,18 @@
-"""Batched async S3 downloader stage (obstore).
+"""Streaming S3 downloader (obstore + AsyncPoolWorker).
 
-The canonical download stage used across data/fluac/akro jobs, distilled.
-Instead of hand-rolling a buffer + flush() (the old pattern), let the framework
-collect batches with `batch=N` — the worker just downloads one list concurrently.
+The canonical download stage, distilled from the real data/fluac/akro jobs.
+One worker keeps up to `max_concurrent` GETs in flight continuously and emits
+each item the instant its download lands — no batch barrier, so one slow or
+retrying object never stalls the rest and the downstream GPU stage stays fed.
 
-Throughput knobs:
-- batch=64        how many items each __call__ downloads concurrently
-- workers=4       parallel downloader processes (each with its own event loop)
-- thread=True     fine too for pure-IO; processes isolate the event loops better
-  when downstream stages are CPU-heavy
+(The alternative for simpler cases: a plain `__call__(self, batch)` worker with
+`batch=64` + asyncio.gather — fine when per-item latency is uniform.)
 
 Env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL (e.g. R2).
 """
 import os
 
-from pipe import Pipe
+from pipe import AsyncPoolWorker, Pipe
 
 
 def s3_key(path: str) -> str:
@@ -22,18 +20,13 @@ def s3_key(path: str) -> str:
     return path.split("/", 3)[3]
 
 
-class S3Downloader:
-    """Receives a list of items (batch=N), downloads all their S3 objects
-    concurrently, emits items with `data` attached. Failed downloads are
-    dropped (returning None from the list filters them)."""
-
-    def __init__(self, bucket: str = "my-bucket"):
+class S3Downloader(AsyncPoolWorker):
+    def __init__(self, bucket: str = "my-bucket", max_concurrent: int = 256):
+        super().__init__(max_concurrent=max_concurrent)
         self.bucket = bucket  # __init__ must stay picklable: config only
 
     def load(self):
         # Heavy/unpicklable state goes here (runs inside the worker process)
-        import asyncio
-
         from obstore.store import S3Store
 
         self._store = S3Store(
@@ -43,29 +36,17 @@ class S3Downloader:
             aws_endpoint=os.environ.get("AWS_ENDPOINT_URL"),
             aws_region="auto",
         )
-        self._loop = asyncio.new_event_loop()
 
-    async def _fetch_all(self, items):
-        import asyncio
-
+    async def process(self, item):
         import obstore as obs
 
-        async def fetch_one(item):
-            try:
-                result = await obs.get_async(self._store, s3_key(item["s3_path"]))
-                item["data"] = bytes(result.bytes())
-                return item
-            except Exception as e:
-                print(f"download failed for {item['s3_path']}: {e}")
-                return None
-
-        return await asyncio.gather(*[fetch_one(i) for i in items])
-
-    def __call__(self, batch):
-        # batch is a list of up to `batch=` items, collected by the framework —
-        # partial batches arrive as-is, no flush() needed.
-        results = self._loop.run_until_complete(self._fetch_all(batch))
-        return [r for r in results if r is not None]
+        try:
+            result = await obs.get_async(self._store, s3_key(item["s3_path"]))
+            item["data"] = bytes(result.bytes())
+            return item
+        except Exception as e:
+            print(f"download failed for {item['s3_path']}: {e}")
+            return None  # drop; return the item into a retry field if you need retries
 
 
 class KeySource:
@@ -84,7 +65,7 @@ class Sink:
 if __name__ == "__main__":
     pipe = Pipe(stats_interval=3)
     pipe.add(KeySource(), outqn=500)
-    pipe.add(S3Downloader(bucket="my-bucket"), workers=4, batch=64, outqn=200)
+    pipe.add(S3Downloader(bucket="my-bucket", max_concurrent=256), workers=1, outqn=200)
     pipe.add(Sink(), workers=1, outqn=0)
 
     for result in pipe:
