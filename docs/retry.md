@@ -1,4 +1,9 @@
-# Item-level retry via re-queue
+# Item-level retry via re-queue (DESIGN PROPOSAL — not implemented)
+
+> Status: design sketch only; there is no `retries=` parameter. For the retry
+> pattern that exists today, see `worker.push()` (send an item back to an
+> earlier stage, capped by an attempts counter) and
+> `docs/examples/retry_downloader.py`.
 
 ## Problem
 
