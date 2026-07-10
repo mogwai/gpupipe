@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pipe"
+name = "gpupipe"
 dynamic = ["version"]
 description = "Get the most out of your CPUs and GPUs without leaving Python: streaming multiprocessing pipelines"
 readme = "README.md"
