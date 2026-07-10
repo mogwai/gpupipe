@@ -1,4 +1,4 @@
-# Pipe - Multiprocessing Pipeline Framework
+# gpupipe
 
 Get the most out of your CPUs and GPUs without leaving Python: streaming pipelines of multi-worker stages — parallel downloads feeding GPU inference feeding DB writes — with backpressure, batching, and graceful shutdown handled for you.
 
@@ -10,6 +10,12 @@ uv add git+https://github.com/mogwai/gpupipe.git
 
 # Or pip
 pip install git+https://github.com/mogwai/gpupipe.git
+```
+
+The distribution is `gpupipe`; the module you import is `pipe` (sklearn-style):
+
+```python
+from pipe import Pipe
 ```
 
 ## Quick Start
