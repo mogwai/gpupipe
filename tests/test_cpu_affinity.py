@@ -10,9 +10,9 @@ import time
 
 import pytest
 import torch
-
 from conftest import Collector
-from pipe import Pipe, End
+
+from pipe import End, Pipe
 from pipe.workers import _cpu_chunk
 
 N_CPU = os.cpu_count() or 1

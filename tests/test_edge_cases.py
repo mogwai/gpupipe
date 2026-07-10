@@ -5,7 +5,6 @@ Run with: pytest test_edge_cases.py -n auto
 
 from conftest import BatchGenerator, Collector, FastWorker, Generator, SlowWorker, run_pipeline
 
-
 # === EDGE CASES: ITEM COUNTS ===
 
 def test_zero_items():

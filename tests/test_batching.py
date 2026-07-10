@@ -3,7 +3,17 @@
 Run with: pytest test_batching.py -n auto
 """
 
-from conftest import BatchGenerator, Batcher, Collector, ExpandWorker, FastWorker, FlushingBatcher, Generator, SlowWorker, run_pipeline
+from conftest import (
+    Batcher,
+    BatchGenerator,
+    Collector,
+    ExpandWorker,
+    FastWorker,
+    FlushingBatcher,
+    Generator,
+    SlowWorker,
+    run_pipeline,
+)
 
 
 def test_partial_batch_flush():

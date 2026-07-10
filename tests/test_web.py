@@ -7,7 +7,7 @@ import io
 import pytest
 import torch
 
-from pipe import Pipe, End
+from pipe import End, Pipe
 
 pytest.importorskip("fastapi")
 
@@ -83,3 +83,29 @@ def test_next_deserializes_shm_output():
         item = torch.load(io.BytesIO(r.content), weights_only=False)
         assert "__shm__" not in item        # not the raw path reference
         assert torch.equal(item["t"], torch.arange(4, dtype=torch.float32))
+
+
+def test_health_endpoint():
+    from pipe.web import PipeServer
+    pipe = Pipe(stats_interval=0, health_check_interval=0)
+    pipe.add(Source(1), outqn=0)
+    server = PipeServer(pipe, timeout=5.0)
+    with _client(server) as client:
+        assert client.get("/next").status_code == 200
+        h = client.get("/health").json()
+        assert h["status"] == "healthy"
+        assert h["items_served"] == 1
+        assert h["uptime_seconds"] >= 0
+
+
+def test_stats_endpoint():
+    from pipe.web import PipeServer
+    pipe = Pipe(stats_interval=0, health_check_interval=0)
+    pipe.add(Source(1), outqn=0)
+    server = PipeServer(pipe, timeout=5.0)
+    with _client(server) as client:
+        client.get("/next")
+        s = client.get("/stats").json()
+        assert s["items_served"] == 1
+        assert s["total_bytes_served"] > 0
+        assert s["compression"] == "none"

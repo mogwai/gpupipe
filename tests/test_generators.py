@@ -1,8 +1,10 @@
 """Tests for generator/yield support in Pipe workers."""
 import time
+
 import pytest
-from pipe import Pipe
 from conftest import Collector
+
+from pipe import Pipe
 
 
 class YieldingRootGenerator:

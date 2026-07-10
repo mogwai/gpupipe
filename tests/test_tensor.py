@@ -15,8 +15,9 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
 
-from pipe import Pipe, End
 from conftest import Collector
+
+from pipe import End, Pipe
 
 
 class TensorGenerator:

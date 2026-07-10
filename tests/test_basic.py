@@ -1,4 +1,4 @@
-from conftest import Generator, Batcher, SlowWorker, Collector, run_pipeline
+from conftest import Batcher, Collector, Generator, SlowWorker, run_pipeline
 
 
 def test_basic_pipeline():

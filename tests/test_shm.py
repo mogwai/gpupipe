@@ -8,14 +8,12 @@ Verifies that:
 - Throughput improvement over the old torch.save/load approach
 """
 import os
-import time
-import pytest
 
+import pytest
 import torch
 
-from pipe.shm import _item_to_shm, _item_from_shm, _cleanup_stale_shm, _has_tensors
-from pipe import Pipe
-from pipe import End
+from pipe import End, Pipe
+from pipe.shm import _cleanup_stale_shm, _has_tensors, _item_from_shm, _item_to_shm
 
 
 class TensorGenerator:

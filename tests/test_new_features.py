@@ -8,9 +8,8 @@ Covers:
 """
 import time
 
-from pipe import Pipe, End
+from pipe import End, Pipe
 from pipe.pipe import InstrumentedQueue
-
 
 # === Workers ===
 
@@ -351,15 +350,13 @@ def test_debug_tracks_counts():
     results = list(pipe)
     assert len(results) == 20
 
-    # First queue (generator output) should have items_put >= 20
-    # (includes End sentinel)
-    q0 = pipe.queues[0] if pipe.queues else None
-    # After pipeline stops, queues are cleared, so check during iteration instead
+    # After pipeline stops, queues are cleared, so queue instrumentation is
+    # checked during iteration instead.
 
 
 def test_debug_transit_latency():
     """InstrumentedQueue tracks transit latency."""
-    from torch.multiprocessing import Queue, Value
+    from torch.multiprocessing import Queue
     q = InstrumentedQueue(Queue(maxsize=10))
 
     q.put("item1")

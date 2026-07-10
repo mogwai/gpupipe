@@ -3,10 +3,19 @@
 Run with: pytest test_workers.py -n auto
 """
 import pytest
+from conftest import (
+    Batcher,
+    BatchGenerator,
+    Collector,
+    ExpandWorker,
+    FastWorker,
+    FilterWorker,
+    Generator,
+    SlowWorker,
+    run_pipeline,
+)
 
 from pipe import Pipe
-from conftest import BatchGenerator, Batcher, Collector, ExpandWorker, FastWorker, FilterWorker, Generator, SlowWorker, run_pipeline
-
 
 # === THREADED WORKER TESTS ===
 
@@ -209,6 +218,7 @@ def test_expected_consumers_multi_reader():
     DDP-style PipeIterator reader terminates (shared mode in fluac/vui/akro:
     rank 0 runs the pipe, every rank reads pipe.queues[-1] via PipeIterator)."""
     import threading
+
     from pipe import PipeIterator
 
     n = 30
