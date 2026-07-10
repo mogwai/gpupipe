@@ -21,7 +21,7 @@ Stage 2 workers
     ↑
 Stage 1 (root generator, no input queue)
 
-Background threads: Health Monitor, Stats Monitor, Autoscaler
+Background threads: Health Monitor, Stats Monitor
 ```
 
 Each stage pulls from its input queue, processes, pushes to output queue. Multiple workers per stage = data parallelism. Backpressure: when output queue full, workers block on put.
@@ -459,7 +459,9 @@ for item in pipe:
     process(item)
 ```
 
-`get_stats()` returns a list of dicts per stage:
+`get_stats()` returns a list of dicts per stage (note: per-worker item/RTF
+fields need `stats_interval > 0` — with stats disabled no timing is collected
+and only queue/worker-count fields are populated):
 - `stage_idx`, `done`, `qsize`, `qmax` — queue fill level
 - `items`, `active`, `total_workers` — worker activity
 - `stage_rtf`, `avg_worker_rtf`, `has_audio` — real-time factor (audio pipelines)
@@ -735,6 +737,15 @@ print_above("retrying item 42")
 ```
 
 Both fall back to plain `print()` when stdout is not a TTY (piped logs, tests). A bare `print()` from a worker still works — it wipes the current stats frame, which repaints on the next tick — but `print_above` keeps the line intact.
+
+## Environment Variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PIPE_VERBOSE=1` | off | informational prints (startup, worker lifecycle, signals) |
+| `PIPE_DRAIN_GRACE` | `3.0` | seconds a worker keeps polling an empty input queue after upstream completes before exiting; lower it in tests for faster shutdown, raise it on heavily loaded boxes (mp.Queue's feeder thread can delay put() visibility) |
+| `PIPE_NO_SHM=1` | set unless `use_shm=True` | disable /dev/shm tensor serialization (managed by `Pipe()`, not usually set by hand) |
+| `PIPE_NO_SHM_OUTPUT=1` | set unless `output_shm=True` | disable shm encoding on the final output queue (managed by `Pipe()`) |
 
 ## Common Pitfalls
 
