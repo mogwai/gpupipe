@@ -2,26 +2,21 @@
 
 Run with: pytest test_pipeline_patterns.py -n auto
 """
-import time
-import hashlib
-import random
-
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None
-
 from conftest import (
-    Generator,
+    AudioChunker,
+    AudioSegmentGenerator,
     BatchGenerator,
-    SlowWorker,
-    FastWorker,
     Collector,
+    DownloadSimulator,
+    FastWorker,
+    Generator,
+    GPUBatcher,
+    GPUEncoder,
+    ResultAggregator,
+    SlowWorker,
     run_pipeline,
 )
-from pipe import Pipe, End
+from pipe import Pipe
 
 
 # === DEEP PIPELINE TESTS ===
@@ -87,194 +82,6 @@ def test_multi_stage_fast_to_slow_threaded():
 
 
 # === REALISTIC AUDIO PIPELINE WORKERS ===
-
-class AudioSegmentGenerator:
-    """Simulates database retrieval of audio segments with variable lengths (10s to 40min)."""
-    def __init__(self, n_items: int, min_duration: float = 10.0, max_duration: float = 600.0):
-        self.n_items = n_items
-        self.min_duration = min_duration
-        self.max_duration = max_duration
-        self._idx = 0
-        random.seed(42)
-
-    def load(self):
-        pass
-
-    def __call__(self):
-        if self._idx >= self.n_items:
-            return End
-
-        duration = random.expovariate(1 / 60)
-        duration = max(self.min_duration, min(self.max_duration, duration))
-
-        sample_rate = 16000
-        n_samples = int(duration * sample_rate)
-
-        item = {
-            "id": self._idx,
-            "duration": duration,
-            "n_samples": n_samples,
-            "source_url": f"s3://bucket/audio_{self._idx}.wav",
-        }
-        self._idx += 1
-        if self._idx >= self.n_items:
-            return [item, End]
-        return item
-
-
-class DownloadSimulator:
-    """Simulates S3 download with variable latency based on file size."""
-    def __init__(self, bytes_per_second: float = 50_000_000):
-        self.bytes_per_second = bytes_per_second
-
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        n_bytes = item["n_samples"] * 2
-        download_time = n_bytes / self.bytes_per_second
-        download_time *= random.uniform(0.8, 1.5)
-        time.sleep(min(download_time, 0.5))
-
-        item["audio_bytes"] = bytes(random.getrandbits(8) for _ in range(min(n_bytes, 10000)))
-        return item
-
-
-class AudioChunker:
-    """Chunks long audio into fixed-size segments (like Fluac does)."""
-    def __init__(self, chunk_seconds: float = 30.0, overlap_seconds: float = 1.0):
-        self.chunk_seconds = chunk_seconds
-        self.overlap_seconds = overlap_seconds
-
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        duration = item["duration"]
-        n_chunks = max(1, int(duration / self.chunk_seconds))
-
-        chunks = []
-        for i in range(n_chunks):
-            chunk = {
-                "parent_id": item["id"],
-                "chunk_idx": i,
-                "n_chunks": n_chunks,
-                "chunk_duration": min(self.chunk_seconds, duration - i * self.chunk_seconds),
-                "audio_hash": hashlib.sha256(item.get("audio_bytes", b"") + str(i).encode()).hexdigest()[:16],
-            }
-            chunks.append(chunk)
-
-        return chunks
-
-
-class GPUBatcher:
-    """Collects items into batches for GPU processing."""
-    def __init__(self, batch_size: int = 8):
-        self.batch_size = batch_size
-        self.buffer = []
-
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        self.buffer.append(item)
-        if len(self.buffer) >= self.batch_size:
-            batch = self.buffer.copy()
-            self.buffer = []
-            return {"batch": batch, "batch_size": len(batch)}
-        return None
-
-    def flush(self):
-        if self.buffer:
-            batch = self.buffer.copy()
-            self.buffer = []
-            yield {"batch": batch, "batch_size": len(batch)}
-
-
-class GPUEncoder:
-    """Simulates GPU encoding with variable processing time based on batch."""
-    def __init__(self, ms_per_second_audio: float = 5.0):
-        self.ms_per_second_audio = ms_per_second_audio
-        self.model = None
-
-    def load(self):
-        if HAS_TORCH:
-            self.model = torch.nn.Linear(256, 256).cuda() if torch.cuda.is_available() else torch.nn.Linear(256, 256)
-        time.sleep(0.1)
-
-    def __call__(self, item):
-        batch = item["batch"]
-        total_duration = sum(c.get("chunk_duration", 1.0) for c in batch)
-
-        process_time = (total_duration * self.ms_per_second_audio) / 1000
-
-        if HAS_TORCH and self.model is not None:
-            x = torch.randn(len(batch), 256)
-            if torch.cuda.is_available():
-                x = x.cuda()
-            for _ in range(int(process_time * 100)):
-                x = self.model(x)
-                x = torch.relu(x)
-        else:
-            time.sleep(process_time)
-
-        results = []
-        for chunk in batch:
-            results.append({
-                "parent_id": chunk["parent_id"],
-                "chunk_idx": chunk["chunk_idx"],
-                "n_chunks": chunk["n_chunks"],
-                "encoded": True,
-                "code_hash": hashlib.sha256(chunk["audio_hash"].encode()).hexdigest()[:16],
-            })
-        return results
-
-
-class ResultAggregator:
-    """Reassembles chunks back into complete files (like Process in encode-pipe.py)."""
-    def __init__(self):
-        self.pending = {}
-        self.completed = 0
-
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        parent_id = item["parent_id"]
-        n_chunks = item["n_chunks"]
-
-        if parent_id not in self.pending:
-            self.pending[parent_id] = {"chunks": [], "n_chunks": n_chunks}
-
-        self.pending[parent_id]["chunks"].append(item)
-
-        if len(self.pending[parent_id]["chunks"]) >= n_chunks:
-            chunks = self.pending[parent_id]["chunks"]
-            del self.pending[parent_id]
-            self.completed += 1
-
-            combined_hash = hashlib.sha256(
-                "".join(c["code_hash"] for c in sorted(chunks, key=lambda x: x["chunk_idx"])).encode()
-            ).hexdigest()[:16]
-
-            return {
-                "id": parent_id,
-                "complete": True,
-                "n_chunks": n_chunks,
-                "combined_hash": combined_hash,
-            }
-
-        return None
-
-    def flush(self):
-        for parent_id, data in self.pending.items():
-            yield {
-                "id": parent_id,
-                "complete": False,
-                "chunks_received": len(data["chunks"]),
-                "chunks_expected": data["n_chunks"],
-            }
-        self.pending = {}
 
 
 # === REALISTIC AUDIO PIPELINE TESTS ===

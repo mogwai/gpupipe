@@ -2,6 +2,7 @@
 import time
 import pytest
 from pipe import Pipe
+from conftest import Collector
 
 
 class YieldingRootGenerator:
@@ -35,15 +36,6 @@ class YieldingExpander:
 
 class PassThrough:
     """Simple pass-through worker. No 'end' handling needed."""
-    def load(self):
-        pass
-
-    def __call__(self, item):
-        return item
-
-
-class Collector:
-    """Collects items without modification. No 'end' handling needed."""
     def load(self):
         pass
 
