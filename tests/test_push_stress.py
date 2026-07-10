@@ -8,13 +8,20 @@ Invariants checked everywhere:
 The fail count is a pure function of the item id (id % MOD), so the retry cycle
 is deterministic and always converges.
 """
+import os
+
+# push()-back tests need the full production drain window: with a short
+# PIPE_DRAIN_GRACE (set for speed in conftest) the push target can drain and
+# exit before retried items land, leaving the pusher spinning on a full queue.
+os.environ["PIPE_DRAIN_GRACE"] = "3.0"
+
 import time
 
 import pytest
 import torch
-
 from conftest import Collector
-from pipe import Pipe, End
+
+from pipe import End, Pipe
 
 MOD = 5  # item `i` must be retried (i % MOD) times before it passes
 
