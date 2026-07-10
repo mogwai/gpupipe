@@ -36,7 +36,6 @@ from .shm import _item_from_shm
 from .types import End
 
 
-
 def _validate_compression(compression):
     if compression == "lz4" and not HAS_LZ4:
         raise ImportError("lz4 not installed. Install with: uv pip install lz4")

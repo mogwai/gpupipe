@@ -32,6 +32,16 @@ class Chunk:
         self.items = state
 
 
+def _put_retry(queue, msg):
+    """Blocking put that retries forever on Full (0.1s put timeout + 10ms backoff)."""
+    while True:
+        try:
+            queue.put(msg, timeout=0.1)
+            return
+        except Full:
+            time.sleep(0.01)
+
+
 class _OutputChannel:
     """Accumulates serialized payloads and flushes them as Chunks.
 
@@ -55,12 +65,7 @@ class _OutputChannel:
         self._oldest = 0.0  # monotonic time of first pending item
 
     def _blocking_put(self, msg):
-        while True:
-            try:
-                self.queue.put(msg, timeout=0.1)
-                return
-            except Full:
-                time.sleep(0.01)
+        _put_retry(self.queue, msg)
 
     def send(self, payload):
         """Queue one serialized payload (chunked or passthrough)."""
@@ -131,25 +136,17 @@ class _InputChannel:
         """Number of locally buffered (already-dequeued) payloads."""
         return len(self._buf)
 
-    def requeue_buffered(self, should_stop=None):
+    def requeue_buffered(self):
         """Return locally buffered payloads to the shared queue (as one Chunk).
 
         MUST be called before a worker exits early (WorkerStop): buffered
         payloads are already off the shared queue and would otherwise be
-        silently lost. Retries forever like every put (see _OutputChannel);
-        `should_stop` is accepted for call-site symmetry but a graceful stop
-        must still deliver these items."""
+        silently lost. Retries forever — a graceful stop must still deliver
+        these items."""
         if not self._buf:
             return
-        pending = list(self._buf)
-        self._buf.clear()
-        msg = Chunk(pending)
-        while True:
-            try:
-                self.queue.put(msg, timeout=0.1)
-                return
-            except Full:
-                time.sleep(0.01)
+        self._buf, pending = [], list(self._buf)
+        _put_retry(self.queue, Chunk(pending))
 
     def put(self, msg, **kwargs):
         """Pass-through so requeue paths (e.g. re-putting `WorkerStop`) work."""

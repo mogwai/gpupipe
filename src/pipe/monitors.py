@@ -98,6 +98,9 @@ def _queue_bar(qsize, qmax, width=10):
     return f"[{color}]\\[{bar}][/{color}] {qsize}/{qmax}"
 
 
+_UNBOUNDED_QMAX = 1_000_000
+
+
 def _collect_stats(pipe_instance):
     stages = {}
     td = pipe_instance.timing_dict
@@ -118,8 +121,8 @@ def _collect_stats(pipe_instance):
         try:
             qsize = q.qsize()
             qmax = q._maxsize if hasattr(q, "_maxsize") else 0
-            if qmax > 1000000:
-                qmax = 0
+            if qmax > _UNBOUNDED_QMAX:
+                qmax = 0  # torch mp queues report a huge maxsize when unbounded
         except Exception:
             qsize = 0
             qmax = 0
@@ -211,7 +214,7 @@ def _stats_monitor_thread(pipe_instance, stop_event, interval_seconds=30):
 
             prev_time, prev_items = prev_snapshot.get(idx, (now, items))
             dt = now - prev_time
-            if dt > 0 and prev_time != now:
+            if dt > 0:
                 instant_rate = (items - prev_items) / dt
                 old_rate = rates.get(idx, instant_rate)
                 rates[idx] = EMA_ALPHA * instant_rate + (1 - EMA_ALPHA) * old_rate

@@ -12,10 +12,10 @@ from queue import Empty, Full
 
 import torch
 
-from .types import End, WorkerStop
-from .utils import _log
 from .queues import _InputChannel, _OutputChannel
 from .shm import _item_from_shm, _item_to_shm
+from .types import End, WorkerStop
+from .utils import _log
 
 
 def _cpu_chunk(cpu_pool, worker_idx, num_workers):
@@ -396,12 +396,13 @@ def _worker_run(
 
 
     while not should_stop.value and not _has_custom_run:
-        now = time.time()
-        if now - last_fd_check > fd_check_interval:
-            fd_info = _get_fd_info()
-            if sequential:
-                print(f"Worker {worker_desc} FD check: {fd_info['fd_count']}/{fd_info['soft_limit']} (items: {items_processed})")
-            last_fd_check = now
+        if sequential:
+            now = time.time()
+            if now - last_fd_check > fd_check_interval:
+                fd_info = _get_fd_info()
+                print(f"Worker {worker_desc} FD check: {fd_info['fd_count']}/{fd_info['soft_limit']} "
+                      f"(items: {items_processed})")
+                last_fd_check = now
 
         if out_ch is not None:
             out_ch.maybe_flush()
@@ -494,7 +495,7 @@ def _worker_run(
                     _log(f"Worker {worker_id} received stop signal, exiting gracefully")
                     # Items already unpacked from a chunk belong back on the shared
                     # queue — siblings must process them, we're leaving the pool.
-                    in_ch.requeue_buffered(should_stop)
+                    in_ch.requeue_buffered()
                     # And a partial output chunk must reach downstream.
                     if out_ch is not None:
                         out_ch.flush()
@@ -797,7 +798,9 @@ def _threaded_worker_run(
                     # Handle generator results
                     if inspect.isgenerator(result):
                         for gen_item in result:
-                            if should_stop.value or thread_stop.is_set() or (drain_event is not None and drain_event.is_set()):
+                            if should_stop.value or thread_stop.is_set() or (
+                                drain_event is not None and drain_event.is_set()
+                            ):
                                 break
                             if gen_item is None or _is_end(gen_item):
                                 continue
@@ -809,6 +812,13 @@ def _threaded_worker_run(
                         # Generator exhausted = done
                         if timing_dict is not None and worker_id is not None:
                             local_time += time.time() - start_time
+                            timing_dict[worker_id] = {
+                                "items": local_items,
+                                "total_time": local_time,
+                                "avg_time": local_time / local_items if local_items else 0,
+                                "audio_duration": local_audio,
+                                "start_wall_time": worker_start_wall_time,
+                            }
                         thread_stop.set()
                         return
 
@@ -850,7 +860,7 @@ def _threaded_worker_run(
                     if should_stop.value:
                         with contextlib.suppress(Full):
                             in_queue.put(item)
-                        in_ch.requeue_buffered(should_stop)
+                        in_ch.requeue_buffered()
                         return
 
                     # Inert graceful early-exit primitive (see _worker_run above);
@@ -858,7 +868,7 @@ def _threaded_worker_run(
                     if _is_worker_stop(item):
                         _log(f"Thread {worker_id} received stop signal")
                         # Return chunk-buffered items to the shared queue for siblings.
-                        in_ch.requeue_buffered(should_stop)
+                        in_ch.requeue_buffered()
                         # Just exit - coordination is skipped for stopped workers
                         # (count is decremented by whatever signalled the stop)
                         return

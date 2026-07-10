@@ -8,7 +8,6 @@ import torch
 import torch.multiprocessing as mp
 from torch.multiprocessing import Event, Queue, Value
 
-
 from .lifecycle import LifecycleMixin
 from .monitors import _collect_stats
 from .queues import InstrumentedQueue, PipeIterator, _InputChannel  # noqa: F401 (kept importable from pipe.pipe)
@@ -186,7 +185,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 )
 
         is_gpu_stage = gpu_list is not None
-        if gpu_list is not None:
+        if is_gpu_stage:
             actual_workers = workers * len(gpu_list)
             _log(
                 f"GPU pool {gpu_list} for '{stage_name}': {workers} worker(s)/GPU "
