@@ -16,8 +16,8 @@ from conftest import (
     SlowWorker,
     run_pipeline,
 )
-from pipe import Pipe
 
+from pipe import Pipe
 
 # === DEEP PIPELINE TESTS ===
 

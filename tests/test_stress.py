@@ -3,8 +3,7 @@
 Run with: pytest tests/test_stress.py -n auto
 """
 import pytest
-
-from conftest import BatchGenerator, Batcher, Collector, FastWorker, Generator, SlowWorker, run_pipeline
+from conftest import Batcher, BatchGenerator, Collector, FastWorker, Generator, SlowWorker, run_pipeline
 
 
 @pytest.mark.parametrize("run", range(5))

@@ -8,9 +8,9 @@ import time
 
 import pytest
 import torch
-
 from conftest import Collector
-from pipe import Pipe, End
+
+from pipe import End, Pipe
 
 HAS_CUDA = torch.cuda.is_available()
 N_GPU = torch.cuda.device_count() if HAS_CUDA else 0

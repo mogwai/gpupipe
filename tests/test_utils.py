@@ -4,9 +4,8 @@ Run with: pytest test_utils.py -q
 """
 import time
 
-from pipe import Pipe, End
+from pipe import End, Pipe
 from pipe.utils import AsyncPoolWorker, Batcher, BufferAndShuffle
-
 
 # === Batcher ===
 

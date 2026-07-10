@@ -7,7 +7,6 @@ import time
 os.environ.setdefault("PIPE_DRAIN_GRACE", "1.0")
 import hashlib
 import random
-import pytest
 
 # planned/ holds suites for preserved-but-unwired features (see PLANNED.md).
 # collect_ignore is anchored to this conftest's directory, so the exclusion
@@ -22,8 +21,7 @@ except ImportError:
     HAS_TORCH = False
     torch = None
 
-from pipe import Pipe, End
-
+from pipe import End, Pipe
 
 # === BASIC WORKER CLASSES ===
 

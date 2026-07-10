@@ -9,11 +9,12 @@ Re-enable alongside re-integrating the feature.
 
 Run with: pytest test_autoscale.py -n auto
 """
-import time
 import random
+import time
+
 import pytest
 
-from pipe import Pipe, End
+from pipe import End, Pipe
 
 pytestmark = pytest.mark.skip(
     reason="autoscaling is a planned feature, not currently wired into Pipe"
@@ -707,13 +708,14 @@ def test_autoscale_global_with_override():
 
     assert pipe.jobs[2]["autoscale"] == False, f"Stage 2 should have autoscale=False from explicit override, got {pipe.jobs[2]['autoscale']}"
 
-    assert pipe.jobs[3]["autoscale"] == True, f"Stage 3 should inherit global autoscale=True"
+    assert pipe.jobs[3]["autoscale"] == True, "Stage 3 should inherit global autoscale=True"
 
 
 def test_cpu_metric_accuracy():
     """Test that _get_cpu_usage accurately reflects actual CPU load."""
-    import subprocess
     import os
+    import subprocess
+
     # _get_cpu_usage moved out of the live pipe.monitors with the feature
     from pipe._planned.autoscale import _get_cpu_usage
 
@@ -1048,8 +1050,8 @@ def test_scale_down_worker_count_coordination():
     Verifies that when a worker receives stop signal, the coordination
     between stage_worker_count and stage_end_counter remains correct.
     """
-    from multiprocessing import Value
     import ctypes
+    from multiprocessing import Value
 
     # Simulate the bug scenario directly
     stage_worker_count = Value(ctypes.c_int, 2)  # Start with 2 workers

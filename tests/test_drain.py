@@ -1,7 +1,8 @@
 """Test drain mode: first Ctrl+C drains queues, second force-stops."""
 import time
 from queue import Empty
-from pipe import Pipe, End
+
+from pipe import End, Pipe
 
 
 class SlowRoot:
@@ -104,8 +105,10 @@ def test_drain_param_rejects_gap():
         raised = True
         assert "contiguous prefix" in str(e), f"unexpected msg: {e}"
     finally:
-        try: p._stop(force=True)
-        except Exception: pass
+        try:
+            p._stop(force=True)
+        except Exception:
+            pass
     assert raised, "expected ValueError for non-contiguous drain=False prefix"
     print("PASS: drain=False gap rejected")
 
