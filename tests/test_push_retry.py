@@ -4,9 +4,17 @@ Models the real use case: a downstream check (WER) that, on failure, pushes the
 item back to an earlier stage (render) for another attempt, bounded by a retry
 counter on the item.
 """
+import os
+
+# push()-back tests need the full production drain window: with a short
+# PIPE_DRAIN_GRACE (set for speed in conftest) the push target can drain and
+# exit before retried items land, leaving the pusher spinning on a full queue.
+os.environ["PIPE_DRAIN_GRACE"] = "3.0"
+
 import time
 
-from conftest import Generator, Collector
+from conftest import Collector, Generator
+
 from pipe import Pipe
 
 
