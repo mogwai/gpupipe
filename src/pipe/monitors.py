@@ -100,7 +100,8 @@ def _queue_bar(qsize, qmax, width=10):
 
 def _collect_stats(pipe_instance):
     stages = {}
-    for worker_id, stats in dict(pipe_instance.timing_dict).items():
+    td = pipe_instance.timing_dict
+    for worker_id, stats in (dict(td) if td is not None else {}).items():
         match = re.match(r"stage_(\d+)", worker_id)
         stage_idx = int(match.group(1)) if match else -1
         if stage_idx not in stages:

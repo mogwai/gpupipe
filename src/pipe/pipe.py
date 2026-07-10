@@ -80,9 +80,11 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.gpus = self._get_gpu_count()
         self.expected_consumers = expected_consumers
 
-        import multiprocessing
-        self.manager = multiprocessing.Manager()
-        self.timing_dict = self.manager.dict()
+        # Manager (for timing_dict) is created lazily in start(): only for
+        # multiprocessing runs with stats enabled. Sequential runs and
+        # stats_interval=0 runs never pay for the manager process.
+        self.manager = None
+        self.timing_dict = None
 
         self.stage_end_counters = []
         self.stage_worker_counts = []

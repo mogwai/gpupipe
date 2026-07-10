@@ -1,5 +1,10 @@
 """Shared worker classes and helper functions for pipe tests."""
+import os
 import time
+
+# Shave per-test shutdown latency: workers drain for this long (seconds) after
+# upstream completes before exiting (production default: 3.0).
+os.environ.setdefault("PIPE_DRAIN_GRACE", "1.0")
 import hashlib
 import random
 import pytest
