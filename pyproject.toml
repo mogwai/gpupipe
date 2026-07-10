@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pipe"
 dynamic = ["version"]
-description = "Multiprocessing pipeline framework"
+description = "Get the most out of your CPUs and GPUs without leaving Python: streaming multiprocessing pipelines"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -50,3 +50,18 @@ python_files = ["test_*.py"]
 #
 # [tool.uv.sources]
 # torch = { index = "pytorch-cu130" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/F (pycodestyle errors, pyflakes) + I (import sorting)
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# conftest sets env/collect_ignore before imports; test_tensor gates on torch
+"tests/conftest.py" = ["E402"]
+"tests/test_tensor.py" = ["E402"]
+# preserved-but-unwired feature code, linted when re-integrated (see PLANNED.md)
+"tests/planned/*" = ["E", "F", "I"]

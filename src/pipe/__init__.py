@@ -1,8 +1,8 @@
+from ._version import version as __version__
 from .pipe import Pipe, PipeIterator
 from .types import End
-from .utils import AsyncPoolWorker, Batcher, BufferAndShuffle, RetrieveSQL, SQLConnection, RTF, print_above
+from .utils import RTF, AsyncPoolWorker, Batcher, BufferAndShuffle, RetrieveSQL, SQLConnection, print_above
 from .web import PipeServer, SerializerWorker, serve_pipe
-from ._version import version as __version__
 
 __all__ = [
     "Pipe",

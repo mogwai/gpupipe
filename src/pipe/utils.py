@@ -6,7 +6,6 @@ import time
 
 from .types import End
 
-
 # Pinned stats line (tqdm-style). The text stats monitor repaints one line in
 # place on a TTY; print_above() writes messages on their own line above it.
 # Module state only exists in the process that runs the monitor (the main

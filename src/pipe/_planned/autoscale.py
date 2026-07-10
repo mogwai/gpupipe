@@ -168,7 +168,8 @@ def _autoscaler_thread(
                     if high_pressure_counts[stage_idx] >= scale_up_samples:
                         high_pressure_counts[stage_idx] = 0
                         last_scale_time[stage_idx] = current_time
-                        _log(f"   Autoscale UP: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers + 1} workers")
+                        _log(f"   Autoscale UP: stage {stage_idx} ({job.get('name', '?')}) "
+                             f"in_fill={in_fill:.0%} -> {active_workers + 1} workers")
                         _spawn_additional_worker(pipe_instance, stage_idx, job)
 
                 elif active_workers > min_workers and in_fill <= scale_down_threshold:
@@ -178,7 +179,8 @@ def _autoscaler_thread(
                     if low_pressure_counts[stage_idx] >= scale_down_samples:
                         low_pressure_counts[stage_idx] = 0
                         last_scale_time[stage_idx] = current_time
-                        _log(f"   Autoscale DOWN: stage {stage_idx} ({job.get('name', '?')}) in_fill={in_fill:.0%} -> {active_workers - 1} workers")
+                        _log(f"   Autoscale DOWN: stage {stage_idx} ({job.get('name', '?')}) "
+                             f"in_fill={in_fill:.0%} -> {active_workers - 1} workers")
                         _signal_worker_to_stop(pipe_instance, stage_idx)
                 else:
                     high_pressure_counts[stage_idx] = 0

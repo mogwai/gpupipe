@@ -18,10 +18,7 @@ class SequentialMixin:
 
         workers = [job["func"] for job in self.jobs]
 
-        run_stages = set()
-        for i, (w, job) in enumerate(zip(workers, self.jobs)):
-            if hasattr(w, "run") and i > 0:
-                run_stages.add(i)
+        run_stages = {i for i, w in enumerate(workers) if i > 0 and hasattr(w, "run")}
 
         for worker in workers:
             if hasattr(worker, "load"):
@@ -35,30 +32,31 @@ class SequentialMixin:
         # an item back to an earlier stage). Resolves a stage name to its index.
         seq_stage_names = [job["name"] for job in self.jobs]
 
-        def _make_seq_push():
-            def _push(stage, item, block=True):
-                if item is None:
-                    return
-                if isinstance(stage, bool):
-                    raise TypeError("push: stage must be an index, name, or class")
-                if isinstance(stage, int):
-                    idx = stage
-                else:
-                    name = (
-                        stage if isinstance(stage, str)
-                        else (stage if isinstance(stage, type) else type(stage)).__name__
-                    )
-                    idx = seq_stage_names.index(name)
-                if idx <= 0 or idx >= len(workers):
-                    raise ValueError(
-                        f"push: stage {stage!r} (idx {idx}) has no input to push to"
-                    )
-                pending_items.append((idx, item))
-            return _push
+        def _seq_push(stage, item, block=True, timeout=None):
+            # Mirrors the multiprocessing worker.push API (incl. the bool
+            # result); in-process there is no queue so it always lands.
+            if item is None:
+                return False
+            if isinstance(stage, bool):
+                raise TypeError("push: stage must be an index, name, or class")
+            if isinstance(stage, int):
+                idx = stage
+            else:
+                name = (
+                    stage if isinstance(stage, str)
+                    else (stage if isinstance(stage, type) else type(stage)).__name__
+                )
+                idx = seq_stage_names.index(name)
+            if idx <= 0 or idx >= len(workers):
+                raise ValueError(
+                    f"push: stage {stage!r} (idx {idx}) has no input to push to"
+                )
+            pending_items.append((idx, item))
+            return True
 
         for i, worker in enumerate(workers):
             if i > 0:
-                worker.push = _make_seq_push()
+                worker.push = _seq_push
 
         def _add_result(result, next_stage):
             if result is None:
@@ -188,4 +186,4 @@ class SequentialMixin:
             except Exception as e:
                 if self.raise_errors:
                     raise
-                continue
+                print(f"Error in worker at stage {stage_idx}: {e}, continuing...")

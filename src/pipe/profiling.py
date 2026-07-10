@@ -74,5 +74,9 @@ def print_profile_summary(profile_dir, profile_rss, worker_info):
         print()
 
     print(f"Profile data saved to: {profile_dir}")
-    print(f"Inspect with: python -c \"import pstats; p = pstats.Stats('{profile_dir}/<worker>.prof'); p.sort_stats('cumulative').print_stats(20)\"")
+    print(
+        f"Inspect with: python -c \"import pstats; "
+        f"p = pstats.Stats('{profile_dir}/<worker>.prof'); "
+        f"p.sort_stats('cumulative').print_stats(20)\""
+    )
     print()
