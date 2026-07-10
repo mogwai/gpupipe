@@ -78,6 +78,13 @@ class LifecycleMixin:
             _log("Sequential mode - skipping multiprocessing setup")
             return self
 
+        if self.manager is not None and self.stats_interval > 0:
+            pass  # reusing existing manager (restart path)
+        elif self.stats_interval > 0:
+            import multiprocessing
+            self.manager = multiprocessing.Manager()
+            self.timing_dict = self.manager.dict()
+
         if self.profile:
             self.profile_dir = _profile_dir()
             print(f"Profiling enabled, saving to {self.profile_dir}")
@@ -248,13 +255,7 @@ class LifecycleMixin:
     def restart(self, reason="ConnectionError"):
         self._stop(force=True)
 
-        if self.stats_interval > 0:
-            import multiprocessing
-
-            self.manager = multiprocessing.Manager()
-            self.timing_dict = self.manager.dict()
-
-        self.start()
+        self.start()  # recreates the manager lazily if stats are enabled
         _log(f"Pipeline restarted due to {reason}")
 
     def stop(self, force=False):
@@ -319,6 +320,7 @@ class LifecycleMixin:
             try:
                 self.manager.shutdown()
                 self.manager = None
+                self.timing_dict = None
             except Exception as e:
                 print(f"Error shutting down manager: {e}")
 

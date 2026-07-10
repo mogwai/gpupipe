@@ -390,7 +390,9 @@ def _worker_run(
     last_fd_check = time.time()
     fd_check_interval = 30
     consecutive_empty = 0
-    EMPTY_THRESHOLD = 30
+    # Consecutive empty 0.1s polls after upstream_done before exiting.
+    # 3s default; tests set PIPE_DRAIN_GRACE lower to shave shutdown latency.
+    EMPTY_THRESHOLD = max(1, int(float(os.environ.get("PIPE_DRAIN_GRACE", "3.0")) / 0.1))
 
 
     while not should_stop.value and not _has_custom_run:
@@ -752,7 +754,9 @@ def _threaded_worker_run(
         local_time = 0.0
         local_audio = 0.0
         consecutive_empty = 0
-        EMPTY_THRESHOLD = 30
+        # Consecutive empty 0.1s polls after upstream_done before exiting.
+        # 3s default; tests set PIPE_DRAIN_GRACE lower to shave shutdown latency.
+        EMPTY_THRESHOLD = max(1, int(float(os.environ.get("PIPE_DRAIN_GRACE", "3.0")) / 0.1))
         # Per-thread channels: neither the input chunk buffer nor the output
         # pending list is thread-safe, so each thread owns its own. A chunk
         # grabbed by one thread is processed wholly by that thread.
