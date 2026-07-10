@@ -7,6 +7,7 @@ Runnable as-is (stdlib + torch only):
 | [retry_downloader.py](retry_downloader.py) | Capped retries via `worker.push()`; permanent vs transient failure handling |
 | [group_by_key.py](group_by_key.py) | Stateful grouping stage (`workers=1`) with `flush()` for the stream tail |
 | [ddp_training.py](ddp_training.py) | One shared pipeline feeding N DDP ranks: `expected_consumers` + `PipeIterator` |
+| [demo.py](demo.py) | Multi-stage demo: fetch → download → CPU-bound process → collect |
 
 Templates (need your own S3 bucket / DB — adapt the config):
 
@@ -18,3 +19,5 @@ Templates (need your own S3 bucket / DB — adapt the config):
 | [gpu_inference.py](gpu_inference.py) | GPU inference with `pergpu=True` and batching |
 | [multi_stage_encode.py](multi_stage_encode.py) | Full audio pipeline: download → chunk → GPU encode → reassemble → save |
 | [training_dataloader.py](training_dataloader.py) | Pipe as a training dataloader: `BufferAndShuffle` + `Batcher` |
+
+`planned/` holds demos for preserved-but-unwired features (see [PLANNED.md](../PLANNED.md)).

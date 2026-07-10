@@ -178,5 +178,5 @@ pytest tests/test_basic.py -v
 
 - [`PIPE_REFERENCE.md`](PIPE_REFERENCE.md) - the full reference: worker types, return-value
   semantics, completion signaling, tensor handling, DDP, env vars, pitfalls
-- [`docs/examples/`](docs/examples/) - runnable examples and job templates
+- [`examples/`](examples/) - runnable examples and job templates
 - [`PLANNED.md`](PLANNED.md) - designed-but-unwired features (autoscaling)
