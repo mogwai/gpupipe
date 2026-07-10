@@ -18,6 +18,32 @@ from .types import End, WorkerStop
 from .utils import _log
 
 
+def _resolve_physical_gpu(gpu_id, inherited_cvd):
+    """Map a LOGICAL gpu index to the PHYSICAL id string to pin via CUDA_VISIBLE_DEVICES.
+
+    Stage gpu pools are logical: the parent builds them from torch.cuda.device_count()
+    (pergpu) or validates user `gpus=`/`gpu_id=` against it — and device_count() already
+    honours any CUDA_VISIBLE_DEVICES the process was launched with. A worker isolates
+    itself by REWRITING CUDA_VISIBLE_DEVICES to a single device, so it must compose with
+    that inherited restriction instead of clobbering it: logical index `gpu_id` refers to
+    the gpu_id-th entry of the inherited visible list. Writing str(gpu_id) blindly
+    reinterpreted the logical index as physical, so e.g.
+    `CUDA_VISIBLE_DEVICES=4,5,6,7 ... pergpu=True` pinned every worker onto physical GPUs
+    0..3 (the excluded cards) -> OOM / contention. Returns the physical id as a string.
+
+    inherited_cvd is os.environ's CUDA_VISIBLE_DEVICES (None/"" when unrestricted, in
+    which case logical == physical and we return str(gpu_id) unchanged)."""
+    inherited = (inherited_cvd or "").strip()
+    if not inherited:
+        return str(gpu_id)
+    visible = [d.strip() for d in inherited.split(",") if d.strip()]
+    if 0 <= gpu_id < len(visible):
+        return visible[gpu_id]
+    # Out of range vs the inherited set (shouldn't happen: parent validates against
+    # device_count()). Fall back to the raw id rather than crash the worker.
+    return str(gpu_id)
+
+
 def _cpu_chunk(cpu_pool, worker_idx, num_workers):
     """Split a stage's `cpus=` pool into per-worker contiguous slices.
 
@@ -305,8 +331,9 @@ def _worker_run(
             # Safe because this is one process per GPU; the *threaded* GPU worker
             # keeps set_device() (CUDA_VISIBLE_DEVICES is process-global, so it can't
             # isolate co-resident GPU threads).
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            torch.cuda.set_device(0)  # logical 0 == physical gpu_id
+            physical = _resolve_physical_gpu(gpu_id, os.environ.get("CUDA_VISIBLE_DEVICES"))
+            os.environ["CUDA_VISIBLE_DEVICES"] = physical
+            torch.cuda.set_device(0)  # logical 0 == physical `physical`
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
 
