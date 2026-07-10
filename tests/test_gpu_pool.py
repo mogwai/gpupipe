@@ -1,9 +1,11 @@
 """Tests for per-stage GPU pinning via add(gpus=[...]).
 
-Each worker reports torch.cuda.current_device(); pinning is correct iff the set of
-devices the stage ran on equals the requested pool. (set_device/current_device
-don't allocate, so this is light on the GPUs.)
+Each worker reports the PHYSICAL device it was pinned to; pinning is correct iff the
+set of devices the stage ran on equals the requested pool. A process worker isolates
+itself with CUDA_VISIBLE_DEVICES=<one physical id>, so torch.cuda.current_device() is
+always logical 0 inside it — we read the env var to recover the physical id instead.
 """
+import os
 import time
 
 import pytest
@@ -40,7 +42,14 @@ class GpuReporter:
 
     def __call__(self, item):
         time.sleep(0.004)  # spread work so every worker in the pool gets some
-        item["device"] = torch.cuda.current_device() if HAS_CUDA else -1
+        if not HAS_CUDA:
+            item["device"] = -1
+            return item
+        # The process worker pinned itself to exactly one physical GPU by rewriting
+        # CUDA_VISIBLE_DEVICES; current_device() is logical 0, so read the env to get
+        # the physical id we actually landed on.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        item["device"] = int(cvd.split(",")[0]) if cvd else torch.cuda.current_device()
         return item
 
 
@@ -142,6 +151,27 @@ def test_pergpu_no_cuda_falls_back_to_cpu():
     job = p.jobs[-1]
     assert job["gpus"] is None and not job["is_gpu_stage"]
     assert job["num_workers"] == 2
+
+
+# --- logical->physical resolution (no GPUs needed) ---
+# A worker pins itself by rewriting CUDA_VISIBLE_DEVICES to one device. When the
+# process was LAUNCHED with a restricted CUDA_VISIBLE_DEVICES, its logical gpu ids
+# must be resolved back through that visible set — otherwise `CVD=4,5,6,7 pergpu=True`
+# pins workers onto physical 0..3 (the excluded cards).
+@pytest.mark.parametrize("gpu_id,inherited,expected", [
+    (0, "4,5,6,7", "4"),   # regression: was "0"
+    (3, "4,5,6,7", "7"),
+    (1, "2,3", "3"),
+    (0, None, "0"),        # unrestricted -> logical == physical
+    (5, "", "5"),
+    (2, "0,1,2,3,4,5,6,7", "2"),
+    (0, "6", "6"),         # single inherited device
+    (0, " 4 , 5 ", "4"),   # tolerate whitespace
+    (9, "4,5", "9"),       # out-of-range -> fall back to raw id, don't crash
+])
+def test_resolve_physical_gpu(gpu_id, inherited, expected):
+    from pipe.workers import _resolve_physical_gpu
+    assert _resolve_physical_gpu(gpu_id, inherited) == expected
 
 
 @pytest.mark.skipif(N_GPU < 1, reason="need a GPU")
