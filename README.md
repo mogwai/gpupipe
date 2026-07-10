@@ -6,10 +6,10 @@ Get the most out of your CPUs and GPUs without leaving Python: streaming pipelin
 
 ```bash
 # With uv
-uv add git+https://github.com/mogwai/gpupipe.git
+uv add gpupipe
 
 # Or pip
-pip install git+https://github.com/mogwai/gpupipe.git
+pip install gpupipe
 ```
 
 The distribution is `gpupipe`; the module you import is `pipe` (sklearn-style):
