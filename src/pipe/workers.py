@@ -282,6 +282,104 @@ def _finish_worker(stage_end_counter, stage_worker_count, out_queue, stage_done,
         _log(f"All workers finished at {stage_desc}, signaling downstream")
 
 
+def _scavenge_hold_wait(hold, should_stop, upstream_done, in_queue,
+                        stage_end_counter, stage_worker_count, worker_desc):
+    """Block a held scavenge worker BEFORE load(), so no CUDA state exists
+    while its GPU belongs to someone else. Returns True when the scavenger
+    releases the hold (proceed to load()), False when the stream ended first
+    (skip straight to the finisher — counters and End sentinels stay correct).
+
+    End-of-stream for a worker that owns no GPU: once upstream is done and
+    every sibling has finished, this worker drains stray End sentinels itself;
+    a real item left on the queue means work is waiting for this GPU, so it
+    keeps holding until the scavenger frees it."""
+    while hold.value:
+        if should_stop.value:
+            return False
+        if upstream_done is not None and upstream_done.is_set():
+            if in_queue is None:
+                return False
+            only_unfinished = (
+                stage_end_counter is not None
+                and stage_worker_count is not None
+                and stage_end_counter.value >= stage_worker_count.value - 1
+            )
+            if only_unfinished:
+                try:
+                    raw = in_queue.get_nowait()
+                except Empty:
+                    return False
+                is_end = raw is End
+                if not is_end and os.environ.get("PIPE_NO_SHM") == "1":
+                    # Safe to deserialize for inspection only when the shm
+                    # layer is off (deserializing may otherwise consume refs).
+                    is_end = _is_end(_item_from_shm(raw))
+                if is_end:
+                    continue
+                in_queue.put(raw)  # real work — hold until the GPU frees
+        time.sleep(0.25)
+    _log(f"Worker {worker_desc} released from scavenge hold")
+    return True
+
+
+def _maybe_park(park, worker, emit, should_stop, worker_desc, out_ch=None):
+    """Cooperative park: hand the GPU back by RELEASING memory rather than
+    copying it to host RAM.
+
+    Checkpointing preserves state perfectly but costs a full VRAM->host copy
+    (~15s for a 30 GB worker). A stage that can rebuild its GPU state doesn't
+    need that fidelity, so if it implements on_park() we just ask it to let go
+    — which for a big-KV-cache model is a few free()s and an empty_cache().
+
+    on_park() may return items (like flush()) — anything it had to finish
+    before releasing gets emitted downstream, so nothing is lost. on_unpark()
+    (or load(), if that's all there is) rebuilds when the GPU comes back.
+
+    park: 0 = run, 1 = park requested, 2 = parked (GPU released),
+          3 = refused (could not release safely — checkpoint instead).
+
+    If on_park() raises we must NOT free the GPU: whatever it was holding is
+    then dropped, and downstream a single missing item can strand its whole
+    parent work unit. Refusing hands the job to the checkpoint path, which
+    preserves the process byte-for-byte. Slower, never lossy.
+    """
+    if park is None or park.value != 1:
+        return
+    _log(f"Worker {worker_desc} parking: releasing GPU")
+    try:
+        items = worker.on_park()
+    except Exception as e:  # noqa: BLE001
+        print(f"Worker {worker_desc} on_park() failed, refusing to release "
+              f"the GPU (will be checkpointed instead): {e}")
+        traceback.print_exc()
+        park.value = 3
+        return
+    if items:
+        for it in items:
+            if it is not None and not _is_end(it):
+                emit(it)
+    # Anything on_park() handed back must be downstream before the GPU goes,
+    # so a park can never strand work in a half-flushed output buffer.
+    if out_ch is not None:
+        out_ch.flush()
+    park.value = 2  # ack: the scavenger may now hand the GPU over
+
+    while park.value == 2 and not should_stop.value:
+        time.sleep(0.1)
+    if should_stop.value:
+        return
+
+    _log(f"Worker {worker_desc} unparking: rebuilding GPU state")
+    try:
+        if hasattr(worker, "on_unpark"):
+            worker.on_unpark()
+        elif hasattr(worker, "load"):
+            worker.load()
+    except Exception as e:  # noqa: BLE001
+        print(f"Worker {worker_desc} on_unpark() failed: {e}")
+        traceback.print_exc()
+
+
 def _worker_run(
     worker,
     in_queue=None,
@@ -309,6 +407,8 @@ def _worker_run(
     cpu_threads=None,
     out_chunk=0,
     out_chunk_ms=10.0,
+    scavenge_hold=None,
+    scavenge_park=None,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -333,7 +433,12 @@ def _worker_run(
             # isolate co-resident GPU threads).
             physical = _resolve_physical_gpu(gpu_id, os.environ.get("CUDA_VISIBLE_DEVICES"))
             os.environ["CUDA_VISIBLE_DEVICES"] = physical
-            torch.cuda.set_device(0)  # logical 0 == physical `physical`
+            # Setting the env var is free; set_device() is what actually
+            # creates the ~500 MB primary context. A scavenge worker that
+            # starts held defers it until released, so a parked worker owns no
+            # GPU memory at all and needs no checkpoint to give the GPU up.
+            if scavenge_hold is None or not scavenge_hold.value:
+                torch.cuda.set_device(0)  # logical 0 == physical `physical`
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
 
@@ -402,11 +507,29 @@ def _worker_run(
     if all_queues is not None and not is_root:
         worker.push = _make_push(all_queues, stage_names, should_stop)
 
-    if hasattr(worker, "load"):
+    # Scavenge stages: a worker whose GPU was claimed at spawn time starts
+    # held — no load(), no CUDA context — until the scavenger releases it.
+    # If the stream ends first it skips straight to the finisher below.
+    stream_over = False
+    if scavenge_hold is not None and scavenge_hold.value:
+        _log(f"Worker {worker_desc} starting held (GPU busy)")
+        stream_over = not _scavenge_hold_wait(
+            scavenge_hold, should_stop, upstream_done, in_queue,
+            stage_end_counter, stage_worker_count, worker_desc,
+        )
+        # Deferred from the GPU setup above: claim the device only now that
+        # it is ours (skipped entirely if the stream ended while we waited).
+        if not stream_over and gpu_id is not None:
+            try:
+                torch.cuda.set_device(0)
+            except Exception as e:  # noqa: BLE001
+                print(f"Failed to set GPU {gpu_id} after scavenge hold: {e}")
+
+    if hasattr(worker, "load") and not stream_over:
         _log(f"Worker {worker_desc} calling load()")
         worker.load()
 
-    if _has_custom_run:
+    if _has_custom_run and not stream_over:
         print(f"Worker {worker_desc} using custom run()")
         worker.run()
 
@@ -422,7 +545,7 @@ def _worker_run(
     EMPTY_THRESHOLD = max(1, int(float(os.environ.get("PIPE_DRAIN_GRACE", "3.0")) / 0.1))
 
 
-    while not should_stop.value and not _has_custom_run:
+    while not should_stop.value and not _has_custom_run and not stream_over:
         if sequential:
             now = time.time()
             if now - last_fd_check > fd_check_interval:
@@ -437,6 +560,11 @@ def _worker_run(
         try:
             if should_stop.value == 1:
                 break
+
+            # Between items is the safe point to hand the GPU over: nothing is
+            # mid-flight, so releasing GPU state can't corrupt a partial result.
+            _maybe_park(scavenge_park, worker, _emit, should_stop, worker_desc,
+                        out_ch)
 
             if (not drain) and drain_event is not None and drain_event.is_set():
                 break
@@ -631,7 +759,7 @@ def _worker_run(
             if raise_errors:
                 raise e
 
-    if not _has_custom_run and hasattr(worker, "flush") and out_queue:
+    if not _has_custom_run and not stream_over and hasattr(worker, "flush") and out_queue:
         try:
             flushed_items = list(worker.flush())
             if flushed_items:

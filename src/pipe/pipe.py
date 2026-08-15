@@ -42,6 +42,8 @@ class Pipe(LifecycleMixin, SequentialMixin):
         use_shm=False,
         output_shm=False,
         profile=False,
+        scavenge_poll=1.0,
+        scavenge_free_secs=30.0,
     ):
         # Set env vars for shm control (inherited by spawned workers)
         if not use_shm:
@@ -71,6 +73,13 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.health_monitor_stop_event = threading.Event()
         self.stats_monitor_thread = None
         self.stats_monitor_stop_event = threading.Event()
+        # GPU scavenging (see scavenge.py): per-worker slots built in start(),
+        # monitor thread drives hold/freeze/thaw of workers on claimed GPUs.
+        self.scavenge_poll = scavenge_poll
+        self.scavenge_free_secs = scavenge_free_secs
+        self.scavenge_slots = []
+        self.scavenger_thread = None
+        self.scavenger_stop_event = threading.Event()
         self.stats_interval = stats_interval
         self.stats_mode = stats_mode
         self.profile = profile
@@ -114,6 +123,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
         drain=True,
         chunk=None,
         chunk_ms=10.0,
+        scavenge=False,
     ):
         if hasattr(func, "__name__"):
             stage_name = func.__name__
@@ -134,6 +144,24 @@ class Pipe(LifecycleMixin, SequentialMixin):
             )
             workers = 1
             pergpu = False
+
+        # Scavenge mode (scavenge.py): only run this stage's workers on GPUs no
+        # other process is using, and freeze them in place (cuda-checkpoint) the
+        # moment a foreign process claims their GPU. Checked before the GPU pool
+        # is resolved so a misuse reports itself, not a device-id error.
+        # Cooperative hold/freeze can't reach into threads sharing a process,
+        # and a root stage can't pause without stalling the whole source.
+        if scavenge:
+            if thread:
+                raise ValueError(
+                    f"{stage_name}: scavenge=True is not supported with "
+                    f"thread=True (freeze targets whole processes)"
+                )
+            if is_root_stage:
+                raise ValueError(
+                    f"{stage_name}: scavenge=True is not supported on the "
+                    f"root stage"
+                )
 
         gpu_count = self.gpus
 
@@ -183,6 +211,14 @@ class Pipe(LifecycleMixin, SequentialMixin):
                     f"{stage_name}: gpus/gpu_id reference GPU(s) {bad}, but the box "
                     f"has {gpu_count} CUDA GPU(s) ({avail})"
                 )
+
+        # Scavenge needs a real GPU pool to have anything to yield.
+        if scavenge and gpu_list is None:
+            print(
+                f"WARNING: '{stage_name}' requested scavenge=True but has "
+                f"no GPU pool; ignoring."
+            )
+            scavenge = False
 
         is_gpu_stage = gpu_list is not None
         if is_gpu_stage:
@@ -239,6 +275,9 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 "cpus": cpu_list,  # canonical CPU pool (chunked per worker), or None
                 "cpu_threads": cpu_threads,  # explicit per-worker thread count, or None
                 "is_gpu_stage": is_gpu_stage,
+                # Opportunistic GPU use: workers hold/freeze when a foreign
+                # process claims their GPU (see scavenge.py).
+                "scavenge": scavenge,
                 "batch": batch,
                 "drain": drain,
                 # Output-edge chunking: bundle N serialized items into one queue
