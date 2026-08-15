@@ -4,6 +4,7 @@ monitor threads, per-worker and per-stage restart, and graceful/forced shutdown.
 Mixed into `Pipe` (methods keep operating on `self`); split out to keep pipe.py
 focused on the public API (init/add/iterate)."""
 import contextlib
+import os
 import threading
 import time
 from queue import Full
@@ -133,6 +134,19 @@ class LifecycleMixin:
         # target by name as well as by index.
         stage_names_all = [job["name"] for job in self.jobs]
 
+        # Scavenge stages: probe GPU occupancy ONCE before spawning so workers
+        # whose GPU is already claimed start held (they wait before load() and
+        # touch no CUDA state). Rebuilt from scratch on every start()/restart.
+        self.scavenge_slots = []
+        any_scavenge = any(job.get("scavenge") for job in self.jobs)
+        busy_at_start = set()
+        if any_scavenge:
+            from .scavenge import busy_physical_gpus, physical_gpu
+
+            busy_at_start = busy_physical_gpus({os.getpid()})
+            if busy_at_start:
+                _log(f"Scavenge: GPUs {sorted(busy_at_start)} busy at start")
+
         for i, job in enumerate(self.jobs):
             # Everything the worker run-loops take, by PARAMETER NAME. Spawning
             # with kwargs (not positional tuples) means adding a parameter can't
@@ -193,11 +207,39 @@ class LifecycleMixin:
                     worker_id = f"stage_{i}_worker_{worker_idx}"
                     if gpu_id is not None:
                         worker_id += f"_gpu_{gpu_id}"
+                    scavenge_hold = scavenge_park = None
+                    if job.get("scavenge") and gpu_id is not None:
+                        phys = physical_gpu(gpu_id)
+                        scavenge_hold = Value("i", 1 if phys in busy_at_start else 0)
+                        if scavenge_hold.value:
+                            _log(
+                                f"Scavenge: {worker_id} starting held "
+                                f"(GPU {phys} busy)"
+                            )
+                        # A stage that can release and rebuild its own GPU
+                        # state gives the GPU back in seconds instead of
+                        # paying a full VRAM->host checkpoint copy.
+                        supports_park = hasattr(job["func"], "on_park")
+                        scavenge_park = Value("i", 0) if supports_park else None
+                        self.scavenge_slots.append({
+                            "stage_name": job["name"],
+                            "worker_id": worker_id,
+                            "gpu": gpu_id,
+                            "physical": phys,
+                            "hold": scavenge_hold,
+                            "park": scavenge_park,
+                            "supports_park": supports_park,
+                            "parked": False,
+                            "frozen": False,
+                            "frozen_mib": 0,
+                        })
                     self._spawn_and_register(_worker_run, dict(
                         common,
                         gpu_id=gpu_id,
                         worker_id=worker_id,
                         cpu_affinity=_cpu_chunk(job.get("cpus"), worker_idx, job["num_workers"]),
+                        scavenge_hold=scavenge_hold,
+                        scavenge_park=scavenge_park,
                     ))
 
         if self.health_check_interval > 0:
@@ -215,6 +257,26 @@ class LifecycleMixin:
             )
             self.health_monitor_thread.start()
             _log("Health monitor thread started")
+
+        if self.scavenge_slots:
+            from .scavenge import _scavenger_thread
+
+            self.scavenger_stop_event.clear()
+            self.scavenger_thread = threading.Thread(
+                target=_scavenger_thread,
+                args=(
+                    self,
+                    self.scavenger_stop_event,
+                    self.scavenge_poll,
+                    self.scavenge_free_secs,
+                ),
+                daemon=True,
+            )
+            self.scavenger_thread.start()
+            _log(
+                f"Scavenger thread started ({len(self.scavenge_slots)} slot(s), "
+                f"poll {self.scavenge_poll}s)"
+            )
 
         if self.stats_interval > 0 and self.stats_mode != "external":
             if self.stats_mode == "text":
@@ -277,6 +339,11 @@ class LifecycleMixin:
             self.stats_monitor_stop_event.set()
             self.stats_monitor_thread.join(timeout=2)
             self.stats_monitor_thread = None
+
+        if self.scavenger_thread is not None and self.scavenger_thread.is_alive():
+            self.scavenger_stop_event.set()
+            self.scavenger_thread.join(timeout=2)
+            self.scavenger_thread = None
 
         if force:
             _log("Force stopping all processes...")
