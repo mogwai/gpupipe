@@ -304,6 +304,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             job.get("chunk_ms", 10.0),
             None,  # scavenge_hold: GPU stages never autoscale
             None,  # scavenge_park: ditto
+            None,  # scavenge_ipc: ditto
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 

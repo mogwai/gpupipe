@@ -415,6 +415,123 @@ def test_missing_checkpoint_binary_warns_once(monkeypatch):
     assert slot["hold"].value == 1
 
 
+# === CHECKPOINT SAFETY GUARD ===
+#
+# Checkpointing a process whose device memory is shared with another does not
+# fail safely — the driver leaves a half-done checkpoint and the job can die.
+# Skipping costs one GPU we wanted to hand back; getting it wrong kills work.
+
+
+def test_cpu_output_is_not_flagged():
+    import torch
+
+    from pipe.workers import _has_cuda_tensor
+
+    cpu = torch.zeros(4)
+    assert _has_cuda_tensor({"mel": cpu}) is False
+    assert _has_cuda_tensor({"text": "hi", "n": 3}) is False
+    assert _has_cuda_tensor([cpu, cpu]) is False
+    assert _has_cuda_tensor({"a": {"b": cpu}}) is False
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="needs a GPU"
+)
+def test_cuda_output_is_flagged():
+    import torch
+
+    from pipe.workers import _has_cuda_tensor
+
+    gpu = torch.zeros(4, device="cuda")
+    assert _has_cuda_tensor(gpu) is True
+    assert _has_cuda_tensor({"mel": gpu}) is True
+    assert _has_cuda_tensor([{"mel": gpu}]) is True
+    # Depth-limited: deeper than 2 levels is not worth the per-item cost.
+    assert _has_cuda_tensor({"a": {"b": {"c": gpu}}}) is False
+
+
+def test_hazard_none_for_a_lone_worker(monkeypatch):
+    monkeypatch.setattr(sc, "_has_checkpoint_job_file", lambda pid: False)
+    slot = _slot(physical=0)
+    apps = [(0, 500, 6000), (0, 900, 1000)]  # 900 is foreign, not ours
+    assert sc._checkpoint_hazard(slot, 500, apps, {500}) is None
+
+
+def test_hazard_when_our_workers_share_a_gpu(monkeypatch):
+    """Two of our own processes on one GPU may share device memory."""
+    monkeypatch.setattr(sc, "_has_checkpoint_job_file", lambda pid: False)
+    slot = _slot(physical=0)
+    apps = [(0, 500, 6000), (0, 501, 6000)]
+    hazard = sc._checkpoint_hazard(slot, 500, apps, {500, 501})
+    assert hazard and "shares GPU 0" in hazard and "[501]" in hazard
+
+
+def test_job_file_makes_a_shared_gpu_safe(monkeypatch):
+    """cuda-checkpoint --launch-job makes a multi-process job checkpointable
+    as a unit, so the shared-GPU objection no longer applies."""
+    monkeypatch.setattr(sc, "_has_checkpoint_job_file", lambda pid: True)
+    slot = _slot(physical=0)
+    apps = [(0, 500, 6000), (0, 501, 6000)]
+    assert sc._checkpoint_hazard(slot, 500, apps, {500, 501}) is None
+
+
+def test_hazard_when_worker_exports_cuda_tensors(monkeypatch):
+    monkeypatch.setattr(sc, "_has_checkpoint_job_file", lambda pid: False)
+    slot = _slot(physical=0)
+    slot["ipc"] = mp.Value("i", 1)
+    hazard = sc._checkpoint_hazard(slot, 500, [(0, 500, 6000)], {500})
+    assert hazard and "CUDA IPC" in hazard
+
+
+def test_scavenger_skips_an_unsafe_worker_instead_of_freezing(monkeypatch):
+    slot = _slot(physical=0)
+    slot["ipc"] = mp.Value("i", 1)
+    fake = _FakePipe([slot], {"w0": 500})
+    calls = []
+    monkeypatch.setattr(sc, "_has_checkpoint_job_file", lambda pid: False)
+    _run_scavenger(
+        fake, monkeypatch,
+        apps="GPU-aaaa, 500, 25000\nGPU-aaaa, 900, 1000", calls=calls, polls=6)
+
+    assert _ckpt_actions(calls) == [], "checkpointed a worker that was unsafe"
+    assert slot["frozen"] is False
+    warnings = [m for m in fake.messages if "cannot be checkpointed" in m]
+    assert len(warnings) == 1, "should warn exactly once, not every poll"
+
+
+def test_unsafe_worker_can_still_park(monkeypatch):
+    """The guard gates only the checkpoint fallback — a stage releasing its
+    own memory never touches the driver's checkpoint path."""
+    slot = _park_slot(physical=0)
+    slot["ipc"] = mp.Value("i", 1)
+    fake = _FakePipe([slot], {"w0": 500})
+    calls = []
+    state = {"apps": "GPU-aaaa, 500, 25000\nGPU-aaaa, 900, 1000"}
+
+    def acker():
+        while slot["park"].value != 1:
+            time.sleep(0.01)
+        state["apps"] = "GPU-aaaa, 900, 1000"
+        slot["park"].value = 2
+
+    threading.Thread(target=acker, daemon=True).start()
+    monkeypatch.setattr(
+        sc, "_run", lambda cmd, timeout=sc.ACTION_TIMEOUT_S: (
+            _fake_run(state["apps"], log=calls)(cmd, timeout)))
+    monkeypatch.setattr(sc, "_find_cuda_checkpoint", lambda: "/fake/cuda-checkpoint")
+    monkeypatch.setattr(sc, "_host_available_mib", lambda: 999_999)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=sc._scavenger_thread, args=(fake, stop, 0.05, 0.0), daemon=True)
+    t.start()
+    time.sleep(0.6)
+    stop.set()
+    t.join(timeout=5)
+
+    assert slot["parked"] is True
+    assert _ckpt_actions(calls) == []
+
+
 # === COOPERATIVE PARK ===
 
 

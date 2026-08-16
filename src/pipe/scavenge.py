@@ -195,6 +195,53 @@ def _gpu_free_mib(physical_idx):
     return None
 
 
+def _has_checkpoint_job_file(pid):
+    """True when the process was launched via `cuda-checkpoint --launch-job`,
+    which is what makes a multi-process CUDA job checkpointable as a unit."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return b"CUDA_CHECKPOINT_JOB_FILE=" in f.read()
+    except OSError:
+        return False
+
+
+def _checkpoint_hazard(slot, pid, apps, our_pids):
+    """Why this worker must not be checkpointed, or None if it's safe.
+
+    Checkpointing a process whose device memory is shared with another process
+    does NOT fail safely: the driver does not roll back a half-done checkpoint,
+    and a two-process job sharing a CUDA tensor has been measured to die
+    outright on the failed attempt. Skipping costs us one GPU we wanted to
+    give back; getting it wrong kills the job.
+
+    Cooperative parking is unaffected — a stage releasing its own memory never
+    goes near the driver's checkpoint path — so this gates only the fallback.
+    """
+    if _has_checkpoint_job_file(pid):
+        return None  # launched as a job: the driver can checkpoint it as a unit
+
+    ipc = slot.get("ipc")
+    if ipc is not None and ipc.value:
+        return (
+            "it sends CUDA tensors downstream (CUDA IPC memory), which "
+            "cannot be checkpointed safely — give the stage an on_park() "
+            "hook, move its output to CPU, or run the pipe with use_shm=True"
+        )
+
+    peers = sorted(
+        p
+        for g, p, _ in apps
+        if g == slot["physical"] and p in our_pids and p != pid
+    )
+    if peers:
+        return (
+            f"it shares GPU {slot['physical']} with our own worker(s) {peers} "
+            f"and the job has no cuda-checkpoint job file, so they may share "
+            f"device memory"
+        )
+    return None
+
+
 def _pid_gpu_mib(pid):
     """Current GPU memory held by a pid, right now. Returns None if unknown."""
     apps = _gpu_compute_apps()
@@ -370,6 +417,18 @@ def _scavenger_thread(pipe_instance, stop_event, poll, free_secs):
                     fresh = _pid_gpu_mib(pid)
                     if fresh is not None:
                         used_by_pid[pid] = fresh
+
+                hazard = _checkpoint_hazard(slot, pid, apps, our_pids)
+                if hazard:
+                    if not slot.get("hazard_logged"):
+                        slot["hazard_logged"] = True
+                        say(
+                            f"scavenge: GPU {g} claimed, but "
+                            f"{slot['worker_id']} cannot be checkpointed — "
+                            f"{hazard}. Leaving it running."
+                        )
+                    continue
+
                 if not slot["hold"].value:
                     # Hold first: if the worker hasn't created a CUDA context
                     # yet this alone parks it (it waits before load()).
