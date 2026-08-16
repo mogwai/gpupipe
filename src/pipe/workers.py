@@ -322,6 +322,23 @@ def _scavenge_hold_wait(hold, should_stop, upstream_done, in_queue,
     return True
 
 
+def _has_cuda_tensor(obj, _depth=0):
+    """Shallow scan for a CUDA tensor in an outgoing item.
+
+    Sending one through a queue exports CUDA IPC memory, which makes the
+    owning process unsafe to checkpoint (see scavenge._checkpoint_hazard).
+    Depth-limited: nesting deeper than this isn't worth the per-item cost."""
+    if torch.is_tensor(obj):
+        return obj.is_cuda
+    if _depth >= 2:
+        return False
+    if isinstance(obj, dict):
+        return any(_has_cuda_tensor(v, _depth + 1) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_cuda_tensor(v, _depth + 1) for v in obj)
+    return False
+
+
 def _maybe_park(park, worker, emit, should_stop, worker_desc, out_ch=None):
     """Cooperative park: hand the GPU back by RELEASING memory rather than
     copying it to host RAM.
@@ -409,6 +426,7 @@ def _worker_run(
     out_chunk_ms=10.0,
     scavenge_hold=None,
     scavenge_park=None,
+    scavenge_ipc=None,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -464,7 +482,20 @@ def _worker_run(
         if out_queue is not None else None
     )
 
+    # A scavenge worker samples its own output: if it ever sends a CUDA tensor
+    # it has exported IPC memory and can no longer be checkpointed safely.
+    # Bounded so this costs nothing after the first few items — a stage that
+    # emits GPU tensors does so from the start.
+    ipc_checks_left = 32 if scavenge_ipc is not None else 0
+
     def _emit(obj):
+        nonlocal ipc_checks_left
+        if ipc_checks_left:
+            ipc_checks_left -= 1
+            if _has_cuda_tensor(obj):
+                scavenge_ipc.value = 1
+                ipc_checks_left = 0
+                _log(f"Worker {worker_desc} emits CUDA tensors: checkpointing disabled")
         out_ch.send(_item_to_shm(obj, skip=_skip_shm_for_output(is_final_stage)))
 
     # Inject pull/put for workers with run()

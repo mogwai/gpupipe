@@ -207,7 +207,7 @@ class LifecycleMixin:
                     worker_id = f"stage_{i}_worker_{worker_idx}"
                     if gpu_id is not None:
                         worker_id += f"_gpu_{gpu_id}"
-                    scavenge_hold = scavenge_park = None
+                    scavenge_hold = scavenge_park = scavenge_ipc = None
                     if job.get("scavenge") and gpu_id is not None:
                         phys = physical_gpu(gpu_id)
                         scavenge_hold = Value("i", 1 if phys in busy_at_start else 0)
@@ -221,6 +221,9 @@ class LifecycleMixin:
                         # paying a full VRAM->host checkpoint copy.
                         supports_park = hasattr(job["func"], "on_park")
                         scavenge_park = Value("i", 0) if supports_park else None
+                        # Set by the worker if it ever emits a CUDA tensor,
+                        # which rules out the checkpoint fallback for it.
+                        scavenge_ipc = Value("i", 0)
                         self.scavenge_slots.append({
                             "stage_name": job["name"],
                             "worker_id": worker_id,
@@ -229,6 +232,7 @@ class LifecycleMixin:
                             "hold": scavenge_hold,
                             "park": scavenge_park,
                             "supports_park": supports_park,
+                            "ipc": scavenge_ipc,
                             "parked": False,
                             "frozen": False,
                             "frozen_mib": 0,
@@ -240,6 +244,7 @@ class LifecycleMixin:
                         cpu_affinity=_cpu_chunk(job.get("cpus"), worker_idx, job["num_workers"]),
                         scavenge_hold=scavenge_hold,
                         scavenge_park=scavenge_park,
+                        scavenge_ipc=scavenge_ipc,
                     ))
 
         if self.health_check_interval > 0:
