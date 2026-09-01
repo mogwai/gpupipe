@@ -1,4 +1,6 @@
 import contextlib
+import gc
+import multiprocessing
 import inspect
 import os
 import pickle
@@ -397,6 +399,103 @@ def _maybe_park(park, worker, emit, should_stop, worker_desc, out_ch=None):
         traceback.print_exc()
 
 
+def _release_pool_on_stall():
+    """A worker stuck on a full downstream queue is not computing: give the
+    caching allocator's free blocks back to the driver until it can put again.
+
+    This is the other half of the drain problem. The End-park release only runs
+    after the LAST item has been emitted, and on a slow CPU tail that last put
+    IS the stall -- the old uvr2 separator sat on a full 16-deep queue for most
+    of every drain with its pool intact. The model stays (more work may come);
+    the pool regrows on the next allocation at cudaMalloc cost, nothing against
+    a multi-second stall. Fires once per stall (see queues._put_retry).
+    """
+    if not torch.cuda.is_initialized():
+        return
+    before = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    _log(f"stalled on a full output queue: GPU pool {before / 2**30:.2f} -> "
+         f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB reserved")
+
+
+def _park_release_gpu(worker, worker_desc, emit=None, out_ch=None):
+    """Phase 1 of releasing a finished worker's GPU before it parks.
+
+    Workers park after End (see the callers) so the CPU tensors they put on the
+    torch.multiprocessing queues stay valid until every consumer is done. Only
+    the PROCESS has to survive for that. Left alone, a GPU worker that finishes
+    early in a drain keeps its weights, compiled graphs and the whole caching-
+    allocator pool (20-30 GB per card on the uvr2 pipe) until the last item of
+    the last stage lands, with nothing left to compute.
+
+    Two things stop a plain `worker = None` from working, and this handles both:
+
+    * Only the stage knows about GPU state Python cannot see (C++ KV caches,
+      cudagraph pools). Same contract as scavenge parking: if it implements
+      on_park() we ask it to let go. Unlike scavenge there is no unpark after
+      End, so a failing or missing hook just means we fall through to dropping
+      the object, which is always safe here.
+    * The framework itself holds the stage: in a spawned child, Process.run()
+      keeps `self._kwargs` (the target's kwargs, including `worker`) alive for
+      the life of the target, so no rebinding inside it can free the stage.
+      Clearing that dict in place also empties _profiled_worker's view of it.
+
+    The caller must then rebind its own `worker` to None (a parameter is one
+    more reference) and call _free_cuda_pool(). Guarded on is_initialized() so
+    a CPU worker never creates a context here.
+    """
+    if not torch.cuda.is_initialized():
+        return
+    if hasattr(worker, "on_park"):
+        try:
+            items = worker.on_park()
+        except Exception as e:  # noqa: BLE001 - at End we can still just drop it
+            print(f"Worker {worker_desc} on_park() failed at End ({e}); dropping the stage instead")
+            items = None
+        if items:
+            n = 0
+            for it in items:
+                if it is None or _is_end(it):
+                    continue
+                if emit is None:
+                    n += 1
+                else:
+                    emit(it)
+            if n:
+                print(f"Worker {worker_desc} on_park() returned {n} items after End with "
+                      f"no output channel; they were DISCARDED")
+            if out_ch is not None:
+                out_ch.flush()
+    try:
+        cp = multiprocessing.current_process()
+        if isinstance(getattr(cp, "_kwargs", None), dict):
+            cp._kwargs.clear()
+        if getattr(cp, "_args", None):
+            cp._args = ()
+    except Exception as e:  # noqa: BLE001
+        print(f"Worker {worker_desc} could not clear Process kwargs: {e}")
+
+
+def _free_cuda_pool(worker_desc):
+    """Phase 2: with every reference to the stage gone, hand the pool back.
+
+    The primary context (~0.5 GB) stays until exit; nothing short of leaving the
+    process releases it.
+    """
+    if not torch.cuda.is_initialized():
+        return
+    try:
+        before = torch.cuda.memory_reserved()
+        gc.collect()  # the stage may sit in a cycle (bound methods on self)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_reserved()
+        _log(f"Worker {worker_desc} parked: GPU pool {before / 2**30:.2f} -> "
+             f"{after / 2**30:.2f} GiB reserved")
+    except Exception as e:  # noqa: BLE001 - cleanup must never take the worker down
+        print(f"Worker {worker_desc} GPU release failed: {e}")
+
+
 def _worker_run(
     worker,
     in_queue=None,
@@ -478,7 +577,8 @@ def _worker_run(
     # serialized payloads into ONE queue message (size-OR-timeout flush); with
     # out_chunk=0 it is a plain blocking put — identical to the old inline loops.
     out_ch = (
-        _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms)
+        _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms,
+                       on_stall=_release_pool_on_stall)
         if out_queue is not None else None
     )
 
@@ -812,7 +912,11 @@ def _worker_run(
                    stage_name or f"stage_{stage_idx}", worker_id)
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
-    # Without this, tensors in queues become invalid when worker exits
+    # Without this, tensors in queues become invalid when worker exits.
+    # That needs the PROCESS alive, not its CUDA state: release the GPU first.
+    _park_release_gpu(worker, worker_desc, _emit, out_ch)
+    worker = None  # the last reference; must be dropped in THIS frame
+    _free_cuda_pool(worker_desc)
     while should_stop is not None and not should_stop.value:
         time.sleep(0.1)
 
@@ -904,7 +1008,8 @@ def _threaded_worker_run(
     _put_ch = None
     if _has_custom_run and out_queue is not None:
         # run() is invoked once (single-threaded), so one output channel is safe.
-        _put_ch = _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms)
+        _put_ch = _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms,
+                       on_stall=_release_pool_on_stall)
 
         def _put(item):
             if item is None:
@@ -949,7 +1054,8 @@ def _threaded_worker_run(
         # grabbed by one thread is processed wholly by that thread.
         in_ch = _InputChannel(in_queue) if in_queue is not None else None
         out_ch = (
-            _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms)
+            _OutputChannel(out_queue, chunk_size=out_chunk, chunk_ms=out_chunk_ms,
+                       on_stall=_release_pool_on_stall)
             if out_queue is not None else None
         )
 
@@ -1188,6 +1294,12 @@ def _threaded_worker_run(
         _log(f"Threaded worker {worker_desc} shutdown complete")
 
     # Stay alive until pipeline stops - keeps tensor file descriptors valid
+    # (the PROCESS, not its CUDA state: release the GPU first). _emit/out_ch
+    # live inside the per-thread closures here, so on_park() output cannot be
+    # forwarded; the helper reports it if that ever happens.
+    _park_release_gpu(worker, worker_desc)
+    worker = None  # the last reference; must be dropped in THIS frame
+    _free_cuda_pool(worker_desc)
     while should_stop is not None and not should_stop.value:
         time.sleep(0.1)
 

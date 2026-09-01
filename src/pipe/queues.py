@@ -32,13 +32,29 @@ class Chunk:
         self.items = state
 
 
-def _put_retry(queue, msg):
-    """Blocking put that retries forever on Full (0.1s put timeout + 10ms backoff)."""
+def _put_retry(queue, msg, on_stall=None, stall_s=2.0):
+    """Blocking put that retries forever on Full (0.1s put timeout + 10ms backoff).
+
+    `on_stall` fires once per put that has waited longer than `stall_s`. A worker
+    blocked on a full downstream queue has nothing to compute, so GPU stages use
+    it to hand their cached pool back for the duration (workers.
+    _release_pool_on_stall). Never raises: a failing hook must not lose the put.
+    """
+    t0 = None
     while True:
         try:
             queue.put(msg, timeout=0.1)
             return
         except Full:
+            if on_stall is not None:
+                if t0 is None:
+                    t0 = time.monotonic()
+                elif time.monotonic() - t0 >= stall_s:
+                    try:
+                        on_stall()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"on_stall hook failed: {e}")
+                    on_stall = None  # once per stall
             time.sleep(0.01)
 
 
@@ -57,15 +73,16 @@ class _OutputChannel:
     once the consumer frees queue space (see test_should_stop_does_not_drop_
     inflight_put). Force stop terminates worker processes outright."""
 
-    def __init__(self, queue, chunk_size=0, chunk_ms=10.0):
+    def __init__(self, queue, chunk_size=0, chunk_ms=10.0, on_stall=None):
         self.queue = queue
         self.chunk_size = chunk_size
+        self.on_stall = on_stall  # see _put_retry
         self.chunk_s = chunk_ms / 1000.0
         self._pending = []
         self._oldest = 0.0  # monotonic time of first pending item
 
     def _blocking_put(self, msg):
-        _put_retry(self.queue, msg)
+        _put_retry(self.queue, msg, on_stall=self.on_stall)
 
     def send(self, payload):
         """Queue one serialized payload (chunked or passthrough)."""
