@@ -78,6 +78,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.scavenge_poll = scavenge_poll
         self.scavenge_free_secs = scavenge_free_secs
         self.scavenge_slots = []
+        self.hang_watch = {}  # worker_id -> (busy_since Value, hang_timeout)
         self.scavenger_thread = None
         self.scavenger_stop_event = threading.Event()
         self.stats_interval = stats_interval
@@ -124,6 +125,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
         chunk=None,
         chunk_ms=10.0,
         scavenge=False,
+        hang_timeout=None,
     ):
         if hasattr(func, "__name__"):
             stage_name = func.__name__
@@ -161,6 +163,29 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 raise ValueError(
                     f"{stage_name}: scavenge=True is not supported on the "
                     f"root stage"
+                )
+
+        # Hang detection: the health monitor SIGKILLs a worker stuck inside one
+        # call for longer than hang_timeout seconds, and the crash path restarts
+        # it. Awake seconds only (CLOCK_MONOTONIC stops during system suspend),
+        # so a long sleep never counts — but a CUDA context that never recovers
+        # from the resume (worker alive, spinning in a stream sync forever) does.
+        # Killing needs a whole process, and a root stage's one call IS the source.
+        if hang_timeout is not None:
+            if thread:
+                raise ValueError(
+                    f"{stage_name}: hang_timeout is not supported with "
+                    f"thread=True (a hung thread can't be killed)"
+                )
+            if is_root_stage:
+                raise ValueError(
+                    f"{stage_name}: hang_timeout is not supported on the "
+                    f"root stage"
+                )
+            if hang_timeout <= 0:
+                raise ValueError(
+                    f"{stage_name}: hang_timeout must be > 0 seconds, got "
+                    f"{hang_timeout}"
                 )
 
         gpu_count = self.gpus
@@ -278,6 +303,9 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 # Opportunistic GPU use: workers hold/freeze when a foreign
                 # process claims their GPU (see scavenge.py).
                 "scavenge": scavenge,
+                # Seconds one call may run before the worker is killed and
+                # restarted (see health monitor), or None.
+                "hang_timeout": hang_timeout,
                 "batch": batch,
                 "drain": drain,
                 # Output-edge chunking: bundle N serialized items into one queue

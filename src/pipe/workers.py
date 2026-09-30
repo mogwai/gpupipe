@@ -341,6 +341,18 @@ def _has_cuda_tensor(obj, _depth=0):
     return False
 
 
+def _timed_call(worker, arg, busy_since):
+    """Run one worker call, stamping when it started so the health monitor can
+    spot a call that never returns (see Pipe.add(hang_timeout=))."""
+    if busy_since is None:
+        return worker(arg)
+    busy_since.value = time.monotonic()
+    try:
+        return worker(arg)
+    finally:
+        busy_since.value = 0.0
+
+
 def _maybe_park(park, worker, emit, should_stop, worker_desc, out_ch=None):
     """Cooperative park: hand the GPU back by RELEASING memory rather than
     copying it to host RAM.
@@ -526,6 +538,7 @@ def _worker_run(
     scavenge_hold=None,
     scavenge_park=None,
     scavenge_ipc=None,
+    busy_since=None,
 ):
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
@@ -819,13 +832,13 @@ def _worker_run(
                             continue
                         batch.append(raw)
                     start_time = time.time()
-                    result = worker(batch)
+                    result = _timed_call(worker, batch, busy_since)
                     process_time = time.time() - start_time
                     n_items = len(batch)
                     input_audio = sum(extract_audio_duration(b) for b in batch)
                 else:
                     start_time = time.time()
-                    result = worker(item)
+                    result = _timed_call(worker, item, busy_since)
                     process_time = time.time() - start_time
                     n_items = 1
                     input_audio = extract_audio_duration(item)

@@ -7,6 +7,7 @@ import glob
 import os
 import time
 
+import pytest
 from conftest import Collector, FastWorker, Generator, SlowWorker
 
 from pipe import Pipe
@@ -97,6 +98,64 @@ def test_health_monitor_restarts_crashed_worker(tmp_path):
     # must process the rest (>= proves detection + restart happened)
     assert len(results) >= 25, f"only {len(results)} items — worker not restarted?"
     assert all(r.get("survived") for r in results)
+
+
+
+class HangOnce:
+    """Wedges its process on the first item, exactly once: alive, burning CPU,
+    never returning, like a CUDA context spinning in a stream sync that never
+    completes after a suspend/resume (flag file lets the restart proceed)."""
+
+    def __init__(self, flag_path):
+        self.flag_path = flag_path
+
+    def __call__(self, item):
+        if not os.path.exists(self.flag_path):
+            open(self.flag_path, "w").write("hung")
+            while True:
+                pass
+        item["survived"] = True
+        return item
+
+
+def test_health_monitor_restarts_hung_worker(tmp_path):
+    flag = str(tmp_path / "hung.flag")
+    pipe = Pipe(stats_interval=0, health_check_interval=0.5, raise_errors=False)
+    pipe.add(Generator(30, delay=0.05), outqn=5)
+    pipe.add(HangOnce(flag), workers=1, outqn=50, hang_timeout=1)
+    pipe.add(Collector(), workers=1, outqn=0)
+
+    results = list(pipe)
+
+    assert os.path.exists(flag), "worker never hung — test is vacuous"
+    # the hung call's item dies with the worker; the restart processes the rest
+    assert len(results) >= 25, f"only {len(results)} items — hung worker not restarted?"
+    assert all(r.get("survived") for r in results)
+
+
+def test_hang_timeout_is_per_call_not_cumulative():
+    """A worker that keeps returning is never killed, however long the run."""
+    pipe = Pipe(stats_interval=0, health_check_interval=0.2, raise_errors=False)
+    pipe.add(Generator(10), outqn=5)
+    pipe.add(SlowWorker(delay=0.3), workers=1, outqn=50, hang_timeout=1)
+    pipe.add(Collector(), workers=1, outqn=0)
+
+    results = list(pipe)
+
+    # 3s of work under a 1s timeout; a kill would have lost an in-flight item
+    assert len(results) == 10
+    assert all(r.get("processed") for r in results)
+
+
+def test_hang_timeout_rejected_where_it_cannot_kill():
+    pipe = Pipe(stats_interval=0)
+    with pytest.raises(ValueError, match="root stage"):
+        pipe.add(Generator(1), hang_timeout=5)
+    pipe.add(Generator(1))
+    with pytest.raises(ValueError, match="thread=True"):
+        pipe.add(Collector(), thread=True, hang_timeout=5)
+    with pytest.raises(ValueError, match="> 0"):
+        pipe.add(Collector(), hang_timeout=0)
 
 
 # === push(timeout=): bounded, returns False instead of deadlocking ===

@@ -4,6 +4,37 @@ import time
 from .utils import _is_tty, _log, _pin_stats_line, _unpin_stats_line
 
 
+def _kill_hung_workers(pipe_instance):
+    """SIGKILL workers stuck inside one call for longer than their stage's
+    hang_timeout; the crash scan that follows restarts them.
+
+    Measured on CLOCK_MONOTONIC, which stops during system suspend, so time
+    asleep never counts. A scavenge-frozen worker is legitimately stalled
+    mid-call, so it is left alone.
+    """
+    held = {
+        s["worker_id"]
+        for s in pipe_instance.scavenge_slots
+        if s["frozen"] or s.get("parked")
+    }
+    now = time.monotonic()
+    for proc, worker_id, stage_name in pipe_instance.worker_info:
+        watch = pipe_instance.hang_watch.get(worker_id)
+        if watch is None or worker_id in held or not proc.is_alive():
+            continue
+        busy_since, timeout = watch
+        started = busy_since.value
+        if started and now - started > timeout:
+            pipe_instance.print(
+                f"HEALTH CHECK: {worker_id} ({stage_name}) stuck in one call "
+                f"for {now - started:.0f}s (hang_timeout={timeout:g}s) — "
+                f"killing it for restart"
+            )
+            busy_since.value = 0.0
+            proc.kill()
+            proc.join(timeout=5)
+
+
 def _health_monitor_thread(
     pipe_instance,
     should_stop,
@@ -21,6 +52,8 @@ def _health_monitor_thread(
 
         if should_stop.value or stop_event.is_set():
             break
+
+        _kill_hung_workers(pipe_instance)
 
         crashed_workers = []
 

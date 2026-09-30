@@ -305,6 +305,7 @@ def _spawn_additional_worker(pipe_instance, stage_idx, job):
             None,  # scavenge_hold: GPU stages never autoscale
             None,  # scavenge_park: ditto
             None,  # scavenge_ipc: ditto
+            None,  # busy_since: hang_timeout isn't wired for autoscaled workers
         )
         proc = Process(target=_worker_run, args=args, daemon=True)
 

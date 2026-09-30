@@ -369,6 +369,9 @@ def _scavenger_thread(pipe_instance, stop_event, poll, free_secs):
                 warned_no_smi = True
             stop_event.wait(poll)
             continue
+        if warned_no_smi:
+            say("scavenge: nvidia-smi back — scavenging resumed")
+            warned_no_smi = False
 
         # Live pid per worker_id (restart may have respawned a worker).
         pid_by_wid = {

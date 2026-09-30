@@ -138,6 +138,7 @@ class LifecycleMixin:
         # whose GPU is already claimed start held (they wait before load() and
         # touch no CUDA state). Rebuilt from scratch on every start()/restart.
         self.scavenge_slots = []
+        self.hang_watch = {}
         any_scavenge = any(job.get("scavenge") for job in self.jobs)
         busy_at_start = set()
         if any_scavenge:
@@ -237,6 +238,10 @@ class LifecycleMixin:
                             "frozen": False,
                             "frozen_mib": 0,
                         })
+                    busy_since = None
+                    if job.get("hang_timeout"):
+                        busy_since = Value("d", 0.0)
+                        self.hang_watch[worker_id] = (busy_since, job["hang_timeout"])
                     self._spawn_and_register(_worker_run, dict(
                         common,
                         gpu_id=gpu_id,
@@ -245,6 +250,7 @@ class LifecycleMixin:
                         scavenge_hold=scavenge_hold,
                         scavenge_park=scavenge_park,
                         scavenge_ipc=scavenge_ipc,
+                        busy_since=busy_since,
                     ))
 
         if self.health_check_interval > 0:
