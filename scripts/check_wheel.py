@@ -31,7 +31,7 @@ finally:
 
 st = ext.Store(64 << 20, 4 << 20)
 try:
-    blk, _ = st.alloc(1 << 20)
+    blk = st.alloc(1 << 20)
     memoryview(blk)[:3] = b"abc"
     assert bytes(memoryview(st.adopt(*blk.share()))[:3]) == b"abc"
 finally:

@@ -102,17 +102,25 @@ class PayloadStore:
         self.core = Store(limit, seg_bytes or min(64 << 20, max(1 << 20, limit // 8)))
         self.name = self.core.name
         _attached[self.name] = self.core
-        resource_tracker.register(self.name, "shared_memory")
-        self._finalizer = weakref.finalize(self, _close, self.core)
+        # Register every name the store can ever create, here in the owner:
+        # segments are created by whichever worker needs room first, and a
+        # worker registering its own raced the owner's unregister at stop (a
+        # worker killed in between left the tracker a KeyError). One process
+        # registering and unregistering one list can't race. Regular segments
+        # are capped by limit // seg_bytes; dedicated ones are unlinked by
+        # whoever frees them and swept by close().
+        names = [self.name, *self.core.segment_names(self.core.limit // self.core.seg_bytes)]
+        for n in names:
+            resource_tracker.register(n, "shared_memory")
+        self._finalizer = weakref.finalize(self, _close, self.core, names)
 
     def close(self):
         self._finalizer()
 
 
-def _close(core):
-    names = core.segment_names()
+def _close(core, registered):
     core.unlink()
-    for n in [core.name, *names]:
+    for n in registered:
         resource_tracker.unregister(n, "shared_memory")
 
 
@@ -130,10 +138,7 @@ def _alloc(st, nbytes):
                        f"{st.limit >> 20} MiB in use; raise PIPE_STORE_MB, or --shm-size in Docker)")
             print(f"WARNING: {why}: copying large arrays until shared memory frees up")
         return None
-    blk, new_segment = got
-    if new_segment is not None:
-        resource_tracker.register(new_segment, "shared_memory")
-    return blk
+    return got
 
 
 def alloc_bytes(st, data):

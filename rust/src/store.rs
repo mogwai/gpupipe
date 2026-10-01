@@ -302,30 +302,29 @@ impl Store {
     }
 
     /// A fresh block with room for `nbytes` (one reference, owned by the
-    /// returned Block), plus the name of a regular segment this call had to
-    /// create (for the resource tracker); None if the store is full.
-    fn alloc(&self, py: Python<'_>, nbytes: u64) -> PyResult<Option<(Block, Option<String>)>> {
+    /// returned Block); None if the store is full.
+    fn alloc(&self, py: Python<'_>, nbytes: u64) -> PyResult<Option<Block>> {
         let inner = &self.inner;
         let c = inner.ctl();
         let total = BLK_HDR + nbytes;
         if total > inner.max_class_block() {
-            return Ok(self.alloc_dedicated(nbytes)?.map(|b| (b, None)));
+            return self.alloc_dedicated(nbytes);
         }
         let (cls, size) = class_of(total);
         lock(py, &c.lock.0, inner.pid);
-        let got = (|| -> PyResult<Option<(u64, u64, Option<String>)>> {
+        let got = (|| -> PyResult<Option<(u64, u64)>> {
             let head = c.free[cls].load(Ordering::Relaxed);
             if head != 0 {
                 let (seg, off) = unpack(head - 1);
                 let m = inner.segment(seg, false)?;
                 c.free[cls].store(hdr(&m, off).next.load(Ordering::Relaxed), Ordering::Relaxed);
-                return Ok(Some((seg, off, None)));
+                return Ok(Some((seg, off)));
             }
             let cur = c.cur.load(Ordering::Relaxed);
             let bump = c.bump.load(Ordering::Relaxed);
             if cur != u64::MAX && bump + size <= c.seg_bytes {
                 c.bump.store(bump + size, Ordering::Relaxed);
-                return Ok(Some((cur, bump, None)));
+                return Ok(Some((cur, bump)));
             }
             if c.used.load(Ordering::Relaxed) + c.seg_bytes > c.limit {
                 return Ok(None);
@@ -344,10 +343,10 @@ impl Store {
             c.used.fetch_add(c.seg_bytes, Ordering::Relaxed);
             c.cur.store(id, Ordering::Relaxed);
             c.bump.store(size, Ordering::Relaxed);
-            Ok(Some((id, 0, Some(name))))
+            Ok(Some((id, 0)))
         })();
         unlock(&c.lock.0);
-        let Some((seg, off, created)) = got? else {
+        let Some((seg, off)) = got? else {
             return Ok(None);
         };
         let m = inner.segment(seg, false)?;
@@ -355,7 +354,7 @@ impl Store {
         h.rc.store(1, Ordering::Relaxed);
         h.class.store(cls as u32, Ordering::Relaxed);
         h.len.store(nbytes, Ordering::Relaxed);
-        Ok(Some((self.block(m, seg, off, false), created)))
+        Ok(Some(self.block(m, seg, off, false)))
     }
 
     /// Wrap a reference that arrived in a handle (from Block.share()).
@@ -367,9 +366,19 @@ impl Store {
         Ok(self.block(m, seg, off, dedicated))
     }
 
-    /// Names of the regular segments created so far (resource tracker).
-    fn segment_names(&self) -> Vec<String> {
-        (0..self.inner.ctl().nreg.load(Ordering::Relaxed)).map(|i| seg_name(&self.inner.name, i, false)).collect()
+    /// Names of regular segments 0..count (default: those created so far).
+    /// The owner registers every name the store could create up front, so
+    /// workers never touch the resource tracker (see shmstore.PayloadStore).
+    #[pyo3(signature = (count=None))]
+    fn segment_names(&self, count: Option<u64>) -> Vec<String> {
+        let n = count.unwrap_or_else(|| self.inner.ctl().nreg.load(Ordering::Relaxed));
+        (0..n).map(|i| seg_name(&self.inner.name, i, false)).collect()
+    }
+
+    /// Bytes per regular segment (after rounding).
+    #[getter]
+    fn seg_bytes(&self) -> u64 {
+        self.inner.ctl().seg_bytes
     }
 
     /// Remove every name the store created. Mapped blocks stay valid; no new
