@@ -345,6 +345,16 @@ def _thaw_worker(ckpt_bin, pid, physical_idx, frozen_mib, say):
     return True
 
 
+def _keep_acked_park(slot):
+    """A worker that acked a park but whose residual could not be checkpointed
+    (no cuda-checkpoint binary, a checkpoint hazard, or a failed freeze) is
+    still waiting on `park`: track it as parked, or the free-GPU path never
+    tells it to rebuild and it sits parked for the rest of the run."""
+    park = slot.get("park")
+    if park is not None and park.value == 2:
+        slot["parked"] = True
+
+
 def _scavenger_thread(pipe_instance, stop_event, poll, free_secs):
     """Parent-side monitor driving hold/freeze/thaw for every scavenge slot.
 
@@ -430,6 +440,7 @@ def _scavenger_thread(pipe_instance, stop_event, poll, free_secs):
                             f"{slot['worker_id']} cannot be checkpointed — "
                             f"{hazard}. Leaving it running."
                         )
+                    _keep_acked_park(slot)
                     continue
 
                 if not slot["hold"].value:
@@ -445,6 +456,7 @@ def _scavenger_thread(pipe_instance, stop_event, poll, free_secs):
                                 "workers (see `cryo doctor`)"
                             )
                             warned_no_ckpt = True
+                        _keep_acked_park(slot)
                         continue
                     mib = used_by_pid[pid]
                     say(
@@ -460,6 +472,8 @@ def _scavenger_thread(pipe_instance, stop_event, poll, free_secs):
                             f"scavenge: froze {slot['worker_id']} in "
                             f"{time.time() - t0:.1f}s, {mib} MiB released"
                         )
+                    else:
+                        _keep_acked_park(slot)
             elif free_streak.get(g, 0) >= need_free_polls:
                 if slot.get("parked"):
                     say(

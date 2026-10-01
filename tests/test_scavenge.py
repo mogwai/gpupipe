@@ -776,3 +776,44 @@ def test_free_streak_required_before_release(monkeypatch):
     _run_scavenger(fake, monkeypatch, apps="", calls=calls, polls=3, free_secs=10.0)
 
     assert slot["hold"].value == 1, "released before the free window elapsed"
+
+
+def _run_scavenger_without_ckpt(fake, monkeypatch, apps, calls, polls=4, free_secs=0.0):
+    monkeypatch.setattr(sc, "_run", _fake_run(apps, None, log=calls))
+    monkeypatch.setattr(sc, "_find_cuda_checkpoint", lambda: None)
+    monkeypatch.setattr(sc, "_host_available_mib", lambda: 999_999)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=sc._scavenger_thread, args=(fake, stop, 0.05, free_secs), daemon=True
+    )
+    t.start()
+    time.sleep(0.05 * polls + 0.3)
+    stop.set()
+    t.join(timeout=5)
+
+
+def test_partial_park_without_cuda_checkpoint_still_resumes(monkeypatch):
+    """On a host with no cuda-checkpoint: a brief foreign claim parked the
+    stage, a bare CUDA context (~900 MiB) stayed behind and could not be
+    checkpointed, and once the GPU was free again the worker was never told to
+    rebuild — it sat parked for the rest of the run."""
+    slot = _park_slot(physical=0)
+    fake = _FakePipe([slot], {"w0": 500})
+
+    def acker():
+        while slot["park"].value != 1:
+            time.sleep(0.01)
+        slot["park"].value = 2  # acked; a residual context stays on the card
+
+    threading.Thread(target=acker, daemon=True).start()
+    calls = []
+    _run_scavenger_without_ckpt(
+        fake, monkeypatch, apps="GPU-aaaa, 500, 906\nGPU-aaaa, 900, 1000", calls=calls)
+    assert slot["park"].value == 2
+    assert slot["parked"] is True, "an acked park must be tracked even when the residual can't be checkpointed"
+
+    # The foreign process leaves: the worker must be resumed.
+    _run_scavenger_without_ckpt(fake, monkeypatch, apps="GPU-aaaa, 500, 906", calls=calls)
+    assert slot["parked"] is False
+    assert slot["park"].value == 0, "worker must be told to rebuild"
+    assert slot["hold"].value == 0
