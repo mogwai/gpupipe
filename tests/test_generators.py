@@ -257,3 +257,36 @@ def test_yield_stress_threaded(run):
     ]
     results = run_pipeline(stages, sequential=False)
     assert len(results) == n_items * factor
+
+
+# === a generator source is never restarted ===
+
+class _GenWithUnsendableItem:
+    """Item 7 can't be pickled (a lambda): sending it fails."""
+
+    def __call__(self):
+        for i in range(20):
+            yield {"id": i, "f": (lambda: 0)} if i == 7 else {"id": i}
+
+
+class _GenRaisesMidway:
+    def __call__(self):
+        for i in range(10):
+            yield {"id": i}
+        raise ValueError("source broke")
+
+
+def test_unsendable_item_is_dropped_not_restarting_the_generator():
+    pipe = Pipe(stats_interval=0)
+    pipe.add(_GenWithUnsendableItem(), outqn=8)
+    ids = [r["id"] for r in pipe]
+    # Before: the failed send re-called the stage, restarting the generator
+    # from item 0 (duplicates, and an endless loop if the item recurred).
+    assert sorted(ids) == [i for i in range(20) if i != 7]
+
+
+def test_generator_that_raises_ends_its_stream():
+    pipe = Pipe(stats_interval=0)
+    pipe.add(_GenRaisesMidway(), outqn=8)
+    pipe.add(Collector(), workers=2, outqn=8)
+    assert sorted(r["id"] for r in pipe) == list(range(10))

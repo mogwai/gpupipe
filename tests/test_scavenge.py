@@ -5,7 +5,6 @@ No GPU and no cuda-checkpoint binary needed — nvidia-smi and every
 cuda-checkpoint action are stubbed at the subprocess boundary, so these run on
 any machine (including a mac laptop).
 """
-import os
 import threading
 import time
 
@@ -16,11 +15,6 @@ from pipe import Pipe
 from pipe import scavenge as sc
 from pipe.types import End
 from pipe.workers import _scavenge_hold_wait
-
-# The hold gate inspects raw queue payloads; keep the shm layer off so a real
-# item is recognisable (mirrors Pipe(use_shm=False), the default).
-os.environ.setdefault("PIPE_NO_SHM", "1")
-
 
 # === GPU PROBING ===
 

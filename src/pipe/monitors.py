@@ -48,7 +48,10 @@ def _health_monitor_thread(
     MAX_CRASHES_IN_WINDOW = 3
 
     while not should_stop.value and not stop_event.is_set():
-        time.sleep(health_check_interval)
+        # Wait on the event, not sleep: _stop() joins this thread for only 2s,
+        # and a sleeping monitor outlived it, then saw the event cleared by the
+        # next start() and kept running beside the new one.
+        stop_event.wait(health_check_interval)
 
         if should_stop.value or stop_event.is_set():
             break

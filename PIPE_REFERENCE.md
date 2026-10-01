@@ -356,14 +356,91 @@ pipe.add(worker,
 - Small (10-50): Tight backpressure, low memory, good for large items (audio tensors)
 - Large (200-1024): Smooth throughput, higher memory, good for small items (metadata dicts)
 
+## Queue transport
+
+Edges between stages are `pipe.shmqueue.ShmQueue`: a bounded ring in POSIX
+shared memory, written in Rust (`rust/`, built as `pipe._rustq`). A put is one
+memcpy into a ring every attached process maps and a get is one memcpy out;
+the kernel is only entered when a worker has to sleep. There is no feeder
+thread, pipe, or semaphore, so puts are visible to consumers immediately. On
+small items that is 2.8-4.5x the end-to-end item rate of
+`torch.multiprocessing.Queue` (`bench/bench_pipe_overhead.py`), so most
+pipelines no longer need `chunk=` to go fast.
+
+Your stages don't change: items are still pickled with multiprocessing's
+ForkingPickler, so CUDA tensors still travel by IPC handle and large CPU
+tensors by torch's fd/file_system sharing. CPU tensors up to
+`PIPE_INLINE_TENSOR_BYTES` (1 MiB) that fit the ring are copied inline
+instead — 8-14x faster than torch's per-tensor shm + fd handoff on Linux
+(`bench/bench_shmqueue.py tensors`). The consumer gets its own copy, not
+memory shared with the producer.
+
+- **Capacity** is exactly `outqn` items, as before: an item too big for the
+  ring's free space travels through its own shm object instead of blocking.
+- **Memory**: each edge's ring (1-16 MiB, from `outqn`; 8 MiB unbounded) is
+  reserved in `/dev/shm` up front on Linux, so shared memory never runs out
+  mid-write (no SIGBUS). Rings are unlinked on `stop()`, spilled messages
+  included, and registered with the resource tracker, so a killed parent
+  doesn't leak them.
+- **Small `/dev/shm` (Docker's default is 64 MiB)**: pipe warns once and
+  sizes down to fit — all rings together take at most a quarter of free
+  `/dev/shm`, the payload store half, in segments scaled to its size. When
+  shared memory is full anyway, an oversized message is written to a file in
+  the temp dir instead of waiting (waiting could deadlock: every worker can
+  hold the memory the others need), and arrays that don't fit the store are
+  copied. Everything keeps working, just slower: give the container
+  `--shm-size=8g` (or more) for full speed.
+- **Crash tolerance**: a worker SIGKILLed while holding the ring lock (e.g. by
+  `hang_timeout`) does not deadlock its siblings: waiters take the lock over
+  from a dead holder.
+- **Fallback**: without the compiled extension (a source install with no
+  Rust toolchain), or if a ring can't be created, pipe warns once and uses
+  `torch.multiprocessing.Queue`. `PIPE_QUEUE=mp` forces that;
+  `PIPE_QUEUE=rust` makes it an error instead.
+
+## Payload store (large arrays pass by handle)
+
+Most of an item's bytes usually ride through a pipeline unchanged: the
+array a loader produced passes through several stages
+that each only add a few fields. Each pipeline therefore gets one shared
+payload store (`pipe.shmstore`, Rust `Store`). A numpy array or CPU tensor of
+at least `PIPE_STORE_MIN_BYTES` (64 KiB) is written into shared memory once,
+the first time it is put on a queue. The message carries a ~100-byte handle,
+the next stage receives a zero-copy view, and putting that view (or a slice
+of it) on the next queue re-sends the handle, so no hop after the first
+copies the data. A 1 MiB array through three pass-through stages runs ~17x
+faster than with `torch.multiprocessing.Queue`; at 8 MiB it is 26-36x
+(`bench/bench_passthrough.py`).
+
+**Semantics — read-only numpy.** numpy arrays from the store arrive
+read-only: an in-place write raises `ValueError: assignment destination is
+read-only` instead of silently changing data another item or stage shares.
+Take a private writable copy with `a = a.copy()` (or build a new array, e.g.
+`a = a * 0.5`, which allocates anyway). CPU tensors arrive writable and
+shared, as torch.multiprocessing already shares them; clone before an
+in-place op if anything upstream still holds the tensor. Arrays smaller than
+the threshold, object arrays, and `bytes` are pickled as before.
+
+- **Lifetime**: blocks are refcounted across processes and reused once every
+  view is gone. The store grows in 64 MiB segments, each reserved in
+  `/dev/shm` when created, up to `PIPE_STORE_MB` (default: half of
+  `/dev/shm`'s free space, at most 16 GiB; 2 GiB on macOS). Arrays bigger
+  than 16 MiB get their own segment, released when freed.
+- **Full store**: puts fall back to copying (one warning) — nothing blocks.
+  Holding on to many results in the consumer keeps their blocks in use.
+- **Cleanup**: `stop()` unlinks the store; views already handed out stay
+  valid until dropped. Names are registered with the resource tracker, so a
+  killed parent doesn't leak them.
+- `PIPE_STORE=0` turns the store off (arrays are pickled per hop again).
+
 ## Chunked transport (chunk= / chunk_ms=)
 
 Every `put`/`get` on an mp.Queue costs a lock acquisition, a pipe write, and a
 consumer wakeup — and under multi-worker contention the single queue lock
 serializes. `chunk=N` bundles N **already-serialized** items into ONE queue
-message (a `Chunk`), amortizing that cost by N. Items inside a chunk are still
-independent `_item_to_shm` payloads, so **torch fd-sharing / shm-refs are
-unchanged** — only the message count drops.
+message (a `Chunk`), amortizing that cost by N. Items inside a chunk pickle
+exactly as they would alone, so **payload-store handles and torch fd-sharing
+are unchanged** — only the message count drops.
 
 **Auto mode (default):** an edge feeding a `batch=B` stage chunks at B, so one
 queue message = one downstream batch, and the batch collector fills from a
@@ -413,8 +490,8 @@ pipe = Pipe(
                                 # one per PipeIterator reader (see DDP section)
     raise_errors=None,          # if None, defaults to sequential mode; True raises exceptions
     allow_full_restart=True,    # allow restarting entire pipeline on repeated crashes
-    use_shm=False,              # use shared memory for tensor serialization
-    output_shm=False,           # output items use shared memory encoding
+    use_shm=False,              # obsolete, ignored (large arrays use the payload store)
+    output_shm=False,           # obsolete, ignored
     profile=False,              # run every worker under cProfile + track peak RSS
 )
 ```
@@ -483,62 +560,35 @@ Background thread checks `process.is_alive()` every `health_check_interval`:
 
 ## Tensor Handling
 
-**Default (`use_shm=False`): torch's `file_descriptor` sharing.** Items containing torch tensors are passed via PyTorch's built-in `file_descriptor` strategy — the producer holds the tensor's shared-memory fd open and the queue carries a lightweight handle. This is the fast path and the recommended default. Workers deliberately stay alive until the whole pipeline stops (see the keep-alive loop in `_worker_run`), so a producing process never exits while its tensors are still in flight — which removes the "producer dies, fd is gone" failure that torch's fd strategy is sometimes criticised for. In practice this is faster and simpler than the shm path below.
+How a value crosses a stage edge depends on what it is:
 
-**Opt-in (`use_shm=True`): `/dev/shm` files.** Tensors are serialized to named `/dev/shm/pipe_<pid>_<uuid>` files and the queue carries only a path reference (~60 bytes). Only reach for this when a producer may genuinely die mid-flight (e.g. crash-prone workers) and you need already-queued tensors to outlive the producer — the files persist regardless of process state. Tradeoffs: per-item file create/mmap/unlink syscalls (slower than fd sharing for small items), and **CPU tensors only** (move tensors to CPU before emitting). Scope it to specific output stages with `output_shm=True`.
+| Value | Transport |
+|-------|-----------|
+| numpy array / CPU tensor ≥ 64 KiB | **payload store**: written to shared memory once, passed by handle; later hops copy nothing (see "Payload store") |
+| CPU tensor < 64 KiB | copied inline through the queue ring |
+| CUDA tensor | torch's CUDA IPC handle (the producing worker stays alive until the pipeline stops, so the handle stays valid) |
+| everything else (dicts, strings, `bytes`, small arrays) | pickled into the queue ring; a message too big for the ring rides in a recycled store block |
 
-**How `use_shm=True` works:**
-1. Producer: `_item_to_shm(item)` → writes tensors + pickled metadata to `/dev/shm/pipe_<pid>_<uuid>`
-2. Queue carries: `{"__shm__": "/dev/shm/pipe_12345_abcdef"}` (tiny)
-3. Consumer: `_item_from_shm(ref)` → mmaps file, reconstructs tensors, unlinks file
+numpy arrays from the store arrive **read-only** (`a.copy()` for a private
+writable array); CPU tensors arrive writable and shared. With `PIPE_STORE=0`
+large arrays are pickled on every hop instead, and with `PIPE_QUEUE=mp` the
+edges are plain `torch.multiprocessing.Queue`s (torch's `file_descriptor`
+sharing for tensors).
 
-**File format:** `[4B header_len][JSON header][field bytes...]`
-- Tensors: raw numpy bytes at offsets (bfloat16 stored as uint16)
-- Non-tensor fields: pickled at offsets
-- Header maps field names → type, dtype, shape, offset, size
+The old `use_shm=True` / `output_shm=True` mode (one `/dev/shm/pipe_*` file
+per item, written and re-read at every hop) is gone; the payload store is the
+"ShmPool with pass-through" it was planned to become. Both arguments are still
+accepted, and ignored with a warning.
 
-**Performance (round-trip serialize + deserialize):**
-
-| Item size | Overhead | vs typical processing |
-|-----------|----------|----------------------|
-| 64KB (1s audio @16kHz) | 0.1ms | <0.1% |
-| 640KB (10s audio) | 0.4ms | ~0.4% |
-| 1.9MB (30s audio) | 2.7ms | ~1% |
-| 58MB (10min audio) | 118ms | significant |
-| 346MB (1hr audio) | 715ms | bottleneck |
-
-**Current cost breakdown:** each stage boundary copies ALL tensor fields, even if the worker only read metadata. A 5-stage pipeline with 10s audio = 5 × 0.4ms = 2ms total serialization overhead.
-
-**Best practice:** drop tensor fields once no longer needed:
+**Best practice:** drop big fields once no stage needs them — they then stop
+occupying the store:
 ```python
 def __call__(self, item):
     result = self.model(item["audio"])
-    item["audio"] = None  # stop serializing audio downstream
+    item["audio"] = None  # downstream stages never needed it
     item["result"] = result
     return item
 ```
-
-**Stale file cleanup:** `_cleanup_stale_shm()` runs on `Pipe()` init, removes any `/dev/shm/pipe_*` files from previous crashed runs.
-
-### Future: ShmPool (not yet implemented)
-
-Pre-allocated pool of shared memory slots with cached handles per worker process. Eliminates per-item file create/open/mmap/unlink syscalls.
-
-**Benchmarks vs current file approach (with cached handles):**
-
-| Item size | File (current) | Pool | Speedup |
-|-----------|---------------|------|---------|
-| 64KB | 0.10ms | 0.10ms | 1x |
-| 640KB | 0.42ms | 0.11ms | 3.9x |
-| 1.9MB | 2.7ms | 0.19ms | 14x |
-
-**Pass-through optimization:** stages that don't access tensor fields can forward the slot reference without any copy. A 5-stage pipeline where only 1 stage reads audio: 4 stages × 0.001ms + 1 stage × 0.11ms = 0.1ms total (vs 2ms current).
-
-**Tradeoffs:**
-- Requires reserving memory upfront: pool_size = sum(all outqn) × slot_size
-- Slot size must fit largest expected item (fallback to file-based for oversized)
-- Pool grows on demand (new slots allocated if free queue empty)
-- Slots released by final consumer, not intermediate stages
 
 ## Common Patterns
 
@@ -692,7 +742,7 @@ for result in pipe:
 2. **`__init__()` must be picklable** - no lambdas, CUDA tensors, open files, boto3 clients
 3. **Workers never see End** - framework handles End sentinel internally, workers never receive it
 4. **`flush()` method for batchers** - framework calls this at shutdown to emit remaining buffered items
-5. **thread=True for IO-bound** - downloads, DB queries. Shares memory, no pickle needed, GIL-friendly for IO waits
+5. **thread=True for IO-bound** - downloads, DB queries. Shares memory, no pickle needed, GIL-friendly for IO waits. CPU-bound Python stays on processes: 8 threads ran a pure-Python stage at ~30% of 8 processes' rate with the GIL. On free-threaded Python (3.13t+, where pipe's Rust extension runs GIL-free) it was ~80%, so threads become an option there when per-process memory (a model or CUDA context per worker) is the constraint
 6. **pergpu=True / gpus=[...]** - GPU pinning. `pergpu` runs one worker on *every*
    GPU; `gpus=[5,6]` pins a stage to a *specific* pool (round-robin per worker, with
    `workers` as a per-GPU multiplier). Each worker's process is `set_device`-pinned —
@@ -743,9 +793,13 @@ Both fall back to plain `print()` when stdout is not a TTY (piped logs, tests). 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `PIPE_VERBOSE=1` | off | informational prints (startup, worker lifecycle, signals) |
-| `PIPE_DRAIN_GRACE` | `3.0` | seconds a worker keeps polling an empty input queue after upstream completes before exiting; lower it in tests for faster shutdown, raise it on heavily loaded boxes (mp.Queue's feeder thread can delay put() visibility) |
-| `PIPE_NO_SHM=1` | set unless `use_shm=True` | disable /dev/shm tensor serialization (managed by `Pipe()`, not usually set by hand) |
-| `PIPE_NO_SHM_OUTPUT=1` | set unless `output_shm=True` | disable shm encoding on the final output queue (managed by `Pipe()`) |
+| `PIPE_DRAIN_GRACE` | `3.0` | seconds a worker keeps polling an empty input queue after upstream completes before exiting; lower it in tests for faster shutdown, raise it on heavily loaded boxes (with `PIPE_QUEUE=mp`, mp.Queue's feeder thread can delay put() visibility) |
+| `PIPE_QUEUE` | `auto` | edge transport: `auto` = shared-memory ring if available, else `torch.multiprocessing.Queue`; `mp` = always the latter; `rust` = ring or error (see Queue transport) |
+| `PIPE_RING_MB` | from `outqn` | size of each edge's shared-memory ring (reserved in `/dev/shm` on Linux) |
+| `PIPE_INLINE_TENSOR_BYTES` | `1048576` | CPU tensors up to this size are copied through the ring instead of torch's shm + fd sharing; `0` disables |
+| `PIPE_STORE` | on | `0` disables the payload store (large arrays are pickled on every hop) |
+| `PIPE_STORE_MB` | half of free `/dev/shm`, ≤16 GiB | cap on the payload store's shared memory |
+| `PIPE_STORE_MIN_BYTES` | `65536` | numpy arrays / CPU tensors at least this big go through the payload store (smaller ones are pickled) |
 
 ## Common Pitfalls
 

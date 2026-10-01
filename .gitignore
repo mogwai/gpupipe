@@ -12,3 +12,5 @@ venv/
 .env
 uv.lock
 src/pipe/_version.py
+rust/target/
+src/pipe/_rustq*.so

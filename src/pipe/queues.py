@@ -1,22 +1,65 @@
-"""Queue wrappers: an instrumented multiprocessing Queue (transit-latency stats),
-the chunked-transport primitives (Chunk / _OutputChannel / _InputChannel), and the
-lightweight iterator used to read a pipeline's final output queue."""
+"""Queue wrappers: the inter-stage queue factory (make_queue), an instrumented
+multiprocessing Queue (transit-latency stats), the chunked-transport primitives
+(Chunk / _OutputChannel / _InputChannel), and the lightweight iterator used to
+read a pipeline's final output queue."""
+import os
 import time
 from collections import deque
 from queue import Empty, Full
 
-from torch.multiprocessing import Value
+from torch.multiprocessing import Queue, Value
 
-from .shm import _item_from_shm
 from .types import End
+
+_fallback_warned = False
+
+
+def make_store():
+    """The pipeline's shared payload store (shmstore.PayloadStore), or None
+    when edges won't be shared-memory rings or PIPE_STORE=0. Large arrays put
+    on the edges are then written to shared memory once and passed by handle."""
+    if os.environ.get("PIPE_QUEUE") == "mp" or os.environ.get("PIPE_STORE") == "0":
+        return None
+    try:
+        from .shmstore import PayloadStore, warn_if_small_shm
+
+        warn_if_small_shm()
+        return PayloadStore()
+    except (ImportError, OSError):
+        return None  # make_queue reports why shared memory is unavailable
+
+
+def make_queue(maxsize=0, store=None, n_edges=1):
+    """A queue for one pipeline edge.
+
+    The Rust shared-memory ring (shmqueue.ShmQueue) when the extension is
+    built, else torch.multiprocessing.Queue. PIPE_QUEUE=mp forces the latter;
+    PIPE_QUEUE=rust turns a missing extension or a failed ring (e.g. /dev/shm
+    too small to reserve it) into an error instead of a one-time warning.
+    `store` (from make_store) routes large arrays through shared memory;
+    `n_edges` (the pipeline's edge count) shares out /dev/shm between rings."""
+    global _fallback_warned
+    mode = os.environ.get("PIPE_QUEUE", "auto")
+    if mode != "mp":
+        try:
+            from .shmqueue import ShmQueue, edge_ring_bytes
+
+            return ShmQueue(maxsize, edge_ring_bytes(maxsize, n_edges), store=store)
+        except (ImportError, OSError) as e:
+            if mode == "rust":
+                raise
+            if not _fallback_warned:
+                _fallback_warned = True
+                print(f"WARNING: shared-memory queue unavailable ({e}); using torch.multiprocessing.Queue")
+    return Queue(maxsize=maxsize)
 
 
 class Chunk:
-    """Wire marker: N already-serialized payloads bundled into ONE queue message.
+    """Wire marker: N items bundled into ONE queue message.
 
-    Amortizes the per-message queue cost (lock, pipe write, consumer wakeup) across
-    N items; each payload inside is still an independent `_item_to_shm` output, so
-    shm-refs and torch fd-sharing behave exactly as unchunked items. Sentinels
+    Amortizes the per-message queue cost (lock, wakeup) across N items; each item
+    inside pickles exactly as it would alone, so payload-store handles and torch
+    fd-sharing behave as for unchunked items. Sentinels
     (`End`, `WorkerStop`) are never placed inside a Chunk. A dedicated class (not
     a bare list) because worker payloads may themselves be lists."""
 
@@ -238,7 +281,6 @@ class PipeIterator:
         while True:
             try:
                 item = self.queue.get(timeout=1.0)
-                item = _item_from_shm(item)
                 if item is End:
                     raise StopIteration
                 return item

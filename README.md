@@ -12,6 +12,14 @@ uv add gpupipe
 pip install gpupipe
 ```
 
+Queues between stages run on a shared-memory ring written in Rust (`rust/`), and large
+numpy arrays / CPU tensors are written to shared memory once and passed from stage to stage
+by handle, never copied again. **numpy arrays of 64 KiB+ therefore arrive read-only** —
+`.copy()` before writing in place (see "Payload store" in `PIPE_REFERENCE.md`). A source
+install compiles the Rust part if a toolchain is present (https://rustup.rs); without one,
+pipe falls back to `torch.multiprocessing.Queue` and pickled arrays, and works the same,
+only slower.
+
 The distribution is `gpupipe`; the module you import is `pipe` (sklearn-style):
 
 ```python

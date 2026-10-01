@@ -80,9 +80,9 @@ except Exception as e:
     continue
 ```
 
-### Interaction with shm
+### Interaction with the payload store
 
-The re-queued item is the deserialized Python object (already unpacked from shm). When another worker gets it, the wrapper dict doesn't contain `__shm__`, so `_item_from_shm` passes it through. The `__pipe_retry` wrapper is stripped before the worker sees it.
+The re-queued item is the deserialized Python object. Large arrays in it are still views of the shared payload store, so re-queueing pickles their handles again (no copy). The `__pipe_retry` wrapper is stripped before the worker sees it.
 
 ### Interaction with autoscaler
 

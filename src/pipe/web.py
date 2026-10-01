@@ -32,7 +32,6 @@ except ImportError:
 
 from .pipe import Pipe
 from .queues import _InputChannel
-from .shm import _item_from_shm
 from .types import End
 
 
@@ -135,8 +134,7 @@ class PipeServer:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         raise Empty
-                    raw = self._out_ch.get(timeout=remaining)
-                    item = _item_from_shm(raw)
+                    item = self._out_ch.get(timeout=remaining)
                     if item is End:
                         continue  # skip completion sentinel, keep waiting for a real item
                     break

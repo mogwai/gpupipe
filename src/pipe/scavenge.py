@@ -225,7 +225,7 @@ def _checkpoint_hazard(slot, pid, apps, our_pids):
         return (
             "it sends CUDA tensors downstream (CUDA IPC memory), which "
             "cannot be checkpointed safely — give the stage an on_park() "
-            "hook, move its output to CPU, or run the pipe with use_shm=True"
+            "hook, or move its output to CPU (.cpu()) before returning it"
         )
 
     peers = sorted(

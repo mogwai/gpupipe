@@ -15,7 +15,6 @@ from queue import Empty, Full
 import torch
 
 from .queues import _InputChannel, _OutputChannel
-from .shm import _item_from_shm, _item_to_shm
 from .types import End, WorkerStop
 from .utils import _log
 
@@ -99,11 +98,6 @@ def _setup_cpu(cpu_affinity, cpu_threads, worker_desc):
     os.environ["OPENBLAS_NUM_THREADS"] = s
 
 
-def _skip_shm_for_output(is_final_stage):
-    """Check if shm should be skipped for output queue."""
-    return bool(is_final_stage and os.environ.get("PIPE_NO_SHM_OUTPUT"))
-
-
 def _make_push(all_queues, stage_names, should_stop):
     """Build the worker.push(stage, item) primitive.
 
@@ -150,17 +144,16 @@ def _make_push(all_queues, stage_names, should_stop):
                 f"push: stage {stage!r} (idx {idx}) has no input queue to push to"
             )
         target = all_queues[idx - 1]  # input queue of stage idx == output of idx-1
-        serialized = _item_to_shm(item, skip=False)
         if not block:
             try:
-                target.put_nowait(serialized)
+                target.put_nowait(item)
                 return True
             except Full:
                 return False
         deadline = None if timeout is None else time.monotonic() + timeout
         while not (should_stop is not None and should_stop.value):
             try:
-                target.put(serialized, timeout=0.1)
+                target.put(item, timeout=0.1)
                 return True
             except Full:
                 if deadline is not None and time.monotonic() >= deadline:
@@ -273,9 +266,8 @@ def _finish_worker(stage_end_counter, stage_worker_count, out_queue, stage_done,
     if out_queue is not None:
         n_ends = expected_consumers if is_final_stage else 1
         try:
-            serialized = _item_to_shm(End, skip=_skip_shm_for_output(is_final_stage))
             for _ in range(n_ends):
-                out_queue.put(serialized, timeout=1.0)
+                out_queue.put(End, timeout=1.0)
             _log(f"Put {n_ends} End sentinel(s) on queue for {stage_desc}")
         except Full:
             print(f"Warning: Could not put End sentinel on queue for {stage_desc}")
@@ -311,12 +303,7 @@ def _scavenge_hold_wait(hold, should_stop, upstream_done, in_queue,
                     raw = in_queue.get_nowait()
                 except Empty:
                     return False
-                is_end = raw is End
-                if not is_end and os.environ.get("PIPE_NO_SHM") == "1":
-                    # Safe to deserialize for inspection only when the shm
-                    # layer is off (deserializing may otherwise consume refs).
-                    is_end = _is_end(_item_from_shm(raw))
-                if is_end:
+                if _is_end(raw):
                     continue
                 in_queue.put(raw)  # real work — hold until the GPU frees
         time.sleep(0.25)
@@ -339,6 +326,41 @@ def _has_cuda_tensor(obj, _depth=0):
     if isinstance(obj, (list, tuple)):
         return any(_has_cuda_tensor(v, _depth + 1) for v in obj)
     return False
+
+
+def _drain_source_generator(gen, emit, stop, on_item, worker_desc, raise_errors):
+    """Send every item of a root stage's generator downstream.
+
+    The generator IS the stream: calling the stage again would restart it
+    from item 0 and duplicate everything already sent. So a failed send drops
+    just that item, and a generator that raises ends the stream; both are
+    reported (raise_errors=True still raises). Connection errors propagate to
+    the caller's pipeline-restart handling."""
+    try:
+        for gen_item in gen:
+            if stop():
+                break
+            if gen_item is None or _is_end(gen_item):
+                continue
+            on_item(gen_item)
+            if emit is None:
+                continue
+            try:
+                emit(gen_item)
+            except (ConnectionError, FileNotFoundError):
+                raise
+            except Exception as e:
+                if raise_errors:
+                    raise
+                print(f"Worker {worker_desc} could not send an item downstream; dropped it: {e}")
+                traceback.print_exc()
+    except (ConnectionError, FileNotFoundError):
+        raise
+    except Exception as e:
+        if raise_errors:
+            raise
+        print(f"Worker {worker_desc} source generator raised; ending its stream: {e}")
+        traceback.print_exc()
 
 
 def _timed_call(worker, arg, busy_since):
@@ -609,7 +631,7 @@ def _worker_run(
                 scavenge_ipc.value = 1
                 ipc_checks_left = 0
                 _log(f"Worker {worker_desc} emits CUDA tensors: checkpointing disabled")
-        out_ch.send(_item_to_shm(obj, skip=_skip_shm_for_output(is_final_stage)))
+        out_ch.send(obj)
 
     # Inject pull/put for workers with run()
     if _has_custom_run and in_queue is not None:
@@ -628,7 +650,6 @@ def _worker_run(
                 if _is_worker_stop(raw):
                     in_ch.put(WorkerStop)
                     break
-                raw = _item_from_shm(raw)
                 if _is_end(raw):
                     continue
                 items.append(raw)
@@ -723,16 +744,17 @@ def _worker_run(
 
                 # Handle generator results - iterate and emit items one by one
                 if inspect.isgenerator(result):
-                    for gen_item in result:
-                        if should_stop.value or (drain_event is not None and drain_event.is_set()):
-                            break
-                        if gen_item is None or _is_end(gen_item):
-                            continue
+                    def _count(gen_item):
+                        nonlocal items_processed, total_audio_duration
                         if timing_dict is not None and worker_id is not None:
                             items_processed += 1
                             total_audio_duration += extract_audio_duration(gen_item)
-                        if out_queue:
-                            _emit(gen_item)
+
+                    _drain_source_generator(
+                        result, _emit if out_queue else None,
+                        lambda: should_stop.value or (drain_event is not None and drain_event.is_set()),
+                        _count, worker_desc, raise_errors,
+                    )
                     # Generator exhausted = done
                     if timing_dict is not None and worker_id is not None:
                         total_process_time += time.time() - start_time
@@ -804,7 +826,6 @@ def _worker_run(
                         time.sleep(0.1)
                     return
 
-                item = _item_from_shm(item)
 
                 # Check for End sentinel from upstream - skip it and continue draining
                 # The upstream_done event + empty threshold will signal exit
@@ -827,7 +848,6 @@ def _worker_run(
                         if _is_worker_stop(raw):
                             in_ch.put(WorkerStop)
                             break
-                        raw = _item_from_shm(raw)
                         if _is_end(raw):
                             continue
                         batch.append(raw)
@@ -1011,7 +1031,6 @@ def _threaded_worker_run(
                 if _is_worker_stop(raw):
                     _pull_ch.put(WorkerStop)
                     break
-                raw = _item_from_shm(raw)
                 if _is_end(raw):
                     continue
                 items.append(raw)
@@ -1027,7 +1046,7 @@ def _threaded_worker_run(
         def _put(item):
             if item is None:
                 return
-            _put_ch.send(_item_to_shm(item, skip=_skip_shm_for_output(is_final_stage)))
+            _put_ch.send(item)
         worker.put = _put
 
     # push(stage, item): send an item BACK to an earlier stage (see _make_push).
@@ -1053,7 +1072,6 @@ def _threaded_worker_run(
 
     worker_start_wall_time = time.time()
 
-
     def thread_fn():
         local_items = 0
         local_time = 0.0
@@ -1073,7 +1091,7 @@ def _threaded_worker_run(
         )
 
         def _emit(obj):
-            out_ch.send(_item_to_shm(obj, skip=_skip_shm_for_output(is_final_stage)))
+            out_ch.send(obj)
 
         try:
             _thread_loop(in_ch, out_ch, _emit, local_items, local_time, local_audio,
@@ -1102,18 +1120,19 @@ def _threaded_worker_run(
 
                     # Handle generator results
                     if inspect.isgenerator(result):
-                        for gen_item in result:
-                            if should_stop.value or thread_stop.is_set() or (
-                                drain_event is not None and drain_event.is_set()
-                            ):
-                                break
-                            if gen_item is None or _is_end(gen_item):
-                                continue
+                        def _count(gen_item):
+                            nonlocal local_items, local_audio
                             if timing_dict is not None and worker_id is not None:
                                 local_items += 1
                                 local_audio += extract_audio_duration(gen_item)
-                            if out_queue:
-                                _emit(gen_item)
+
+                        _drain_source_generator(
+                            result, _emit if out_queue else None,
+                            lambda: should_stop.value or thread_stop.is_set() or (
+                                drain_event is not None and drain_event.is_set()
+                            ),
+                            _count, worker_desc, raise_errors,
+                        )
                         # Generator exhausted = done
                         if timing_dict is not None and worker_id is not None:
                             local_time += time.time() - start_time
@@ -1178,7 +1197,6 @@ def _threaded_worker_run(
                         # (count is decremented by whatever signalled the stop)
                         return
 
-                    item = _item_from_shm(item)
 
                     # Check for End sentinel from upstream - skip it and continue draining
                     # The upstream_done event + empty threshold will signal exit
@@ -1201,7 +1219,6 @@ def _threaded_worker_run(
                             if _is_worker_stop(raw):
                                 in_ch.put(WorkerStop)
                                 break
-                            raw = _item_from_shm(raw)
                             if _is_end(raw):
                                 continue
                             batch.append(raw)
@@ -1296,8 +1313,7 @@ def _threaded_worker_run(
         if hasattr(worker, "flush") and out_queue:
             try:
                 for item in worker.flush():
-                    serialized = _item_to_shm(item, skip=_skip_shm_for_output(is_final_stage))
-                    out_queue.put(serialized, timeout=1)
+                    out_queue.put(item, timeout=1)
             except Exception as e:
                 print(f"Threaded worker {worker_desc} flush error: {e}")
 

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel", "setuptools-scm"]
+requires = ["setuptools", "wheel", "setuptools-scm", "setuptools-rust>=1.7"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -45,6 +45,35 @@ where = ["src"]
 # PLANNED.md). Shipping it is deliberate: it is inert unless explicitly
 # imported, and excluding it would break `import pipe._planned` under strict
 # editable installs, which tests/test_planned_preserved.py relies on.
+
+[[tool.setuptools-rust.ext-modules]]
+# The shared-memory ring under pipe's queues (rust/, wrapped by pipe.shmqueue).
+# Optional: without a Rust toolchain the build skips it and pipe falls back to
+# torch.multiprocessing.Queue. Release even for editable installs — a debug
+# build is ~10x slower and would distort every benchmark.
+target = "pipe._rustq"
+path = "rust/Cargo.toml"
+binding = "PyO3"
+optional = true
+debug = false
+
+[tool.cibuildwheel]
+# CPython 3.10-3.14 plus free-threaded 3.14t, Linux (manylinux) and macOS.
+# No musllinux (torch ships no musl wheels); no Windows (the extension's
+# wait/wake is futex/ulock: Linux and macOS only).
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+skip = "*-musllinux_* *_i686"
+# Torch-free smoke test of the built extension (see the script); no-deps so
+# each wheel's test env doesn't download torch.
+test-command = "python {project}/scripts/check_wheel.py"
+test-environment = { PIP_NO_DEPS = "1" }
+
+[tool.cibuildwheel.linux]
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "11.0"  # Rust's minimum is above CPython's
 
 [tool.setuptools_scm]
 write_to = "src/pipe/_version.py"

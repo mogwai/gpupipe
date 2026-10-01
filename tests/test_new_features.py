@@ -371,8 +371,10 @@ def test_debug_transit_latency():
 
 def test_debug_transit_nowait():
     """InstrumentedQueue.get_nowait tracks transit."""
-    from torch.multiprocessing import Queue
-    q = InstrumentedQueue(Queue(maxsize=10))
+    # The queue pipe builds: its puts are visible at once. A bare mp.Queue
+    # flushes through a feeder thread that can miss the 10ms below under load.
+    from pipe.queues import make_queue
+    q = InstrumentedQueue(make_queue(10))
 
     q.put("a")
     q.put("b")

@@ -11,7 +11,7 @@ from queue import Full
 
 import torch
 import torch.multiprocessing as mp
-from torch.multiprocessing import Event, Queue, Value
+from torch.multiprocessing import Event, Value
 
 from .monitors import (
     _health_monitor_thread,
@@ -19,7 +19,7 @@ from .monitors import (
     _stats_monitor_thread_text,
 )
 from .profiling import _profile_dir, _profiled_worker, print_profile_summary
-from .queues import InstrumentedQueue
+from .queues import InstrumentedQueue, make_queue, make_store
 from .types import End
 from .utils import _log
 from .workers import _cpu_chunk, _threaded_worker_run, _worker_run
@@ -92,6 +92,16 @@ class LifecycleMixin:
 
         _log("Setting up multiprocessing...")
 
+        # One payload store shared by every edge: large arrays are written to
+        # shared memory once and pass between stages by handle (shmstore.py).
+        self.store = make_store()
+        # Per-stage sync objects are rebuilt from scratch: restart() comes back
+        # through here, and appending to the old lists handed new workers the
+        # stale objects at index i while the iterator watched the new [-1].
+        self.stage_end_counters = []
+        self.stage_worker_counts = []
+        self.stage_done_events = []
+
         for i, job in enumerate(self.jobs):
             # Resolve output-edge chunking. Explicit chunk= wins (0 = force off);
             # otherwise auto-adopt the DOWNSTREAM stage's batch size, so an edge
@@ -116,7 +126,7 @@ class LifecycleMixin:
             outq_size = job.get("outqn") or 0
             if outq_size and job["chunk_eff"] > 1:
                 outq_size = max(1, outq_size // job["chunk_eff"])
-            q = Queue(maxsize=outq_size)
+            q = make_queue(outq_size, self.store, n_edges=len(self.jobs))
             self.queues.append(InstrumentedQueue(q) if self.debug else q)
             self.stage_end_counters.append(Value("i", 0))
             self.stage_done_events.append(Event())
@@ -408,6 +418,9 @@ class LifecycleMixin:
                 q.close()
             except Exception as e:
                 print(f"Error closing queue: {e}")
+        if self.store is not None:
+            self.store.close()
+            self.store = None
 
         if self.profile and self.profile_dir and self.worker_info:
             rss_resolved = {}

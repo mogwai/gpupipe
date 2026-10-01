@@ -26,13 +26,12 @@ from pipe import End, Pipe
 MOD = 5  # item `i` must be retried (i % MOD) times before it passes
 
 
-def _run(stages, sequential=False, use_shm=False, timeout=120):
+def _run(stages, sequential=False, timeout=120):
     pipe = Pipe(
         sequential=sequential,
         raise_errors=True,
         stats_interval=0,
         health_check_interval=0,
-        use_shm=use_shm,
     )
     for stage, kwargs in stages:
         pipe.add(stage, **kwargs)
@@ -326,11 +325,14 @@ def test_push_invalid_stage_raises(bad_stage):
 
 def test_large_job_realistic_retry_rate():
     """Large job in the PRODUCTION regime: 5000 items, many workers, a low retry
-    fraction (~1/8 fail, up to 3x). Default-sized queues; proves no loss/dup at
-    scale with a back-edge under realistic load."""
+    fraction (~1/8 fail, up to 3x); proves no loss/dup at scale with a back-edge
+    under realistic load. The back-edge landing queue (Gen.outqn) must hold all
+    n items: Gen outpaces Stamp and keeps a smaller one full, and the blocking
+    push() then deadlocks the cycle (Gen->Stamp and Stamp->Check both full) —
+    seen under load with either queue transport."""
     n = 5000
     stages = [
-        (Gen(n), {"workers": 1, "outqn": 256}),
+        (Gen(n), {"workers": 1, "outqn": 8192}),
         (Stamp(), {"workers": 4, "outqn": 256}),
         (SparseCheck(), {"workers": 4, "outqn": 256}),
         (Collector(), {"workers": 1, "outqn": None}),

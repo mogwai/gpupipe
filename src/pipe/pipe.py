@@ -6,13 +6,12 @@ from queue import Empty
 
 import torch
 import torch.multiprocessing as mp
-from torch.multiprocessing import Event, Queue, Value
+from torch.multiprocessing import Event, Queue, RawValue
 
 from .lifecycle import LifecycleMixin
 from .monitors import _collect_stats
 from .queues import InstrumentedQueue, PipeIterator, _InputChannel  # noqa: F401 (kept importable from pipe.pipe)
 from .sequential import SequentialMixin
-from .shm import _cleanup_stale_shm, _item_from_shm
 from .utils import _log, print_above
 from .workers import _check_picklable, _is_end
 
@@ -45,29 +44,30 @@ class Pipe(LifecycleMixin, SequentialMixin):
         scavenge_poll=1.0,
         scavenge_free_secs=30.0,
     ):
-        # Set env vars for shm control (inherited by spawned workers)
-        if not use_shm:
-            os.environ["PIPE_NO_SHM"] = "1"
-        elif "PIPE_NO_SHM" in os.environ:
-            del os.environ["PIPE_NO_SHM"]
-        if not output_shm:
-            os.environ["PIPE_NO_SHM_OUTPUT"] = "1"
-        elif "PIPE_NO_SHM_OUTPUT" in os.environ:
-            del os.environ["PIPE_NO_SHM_OUTPUT"]
-        _cleanup_stale_shm()
+        if use_shm or output_shm:
+            # The old per-item /dev/shm file transport is gone: the payload
+            # store (shmstore.py) carries large arrays by handle on every edge.
+            print(
+                "WARNING: use_shm/output_shm are obsolete and ignored: large arrays and "
+                "tensors already cross stages through the shared payload store "
+                "(see 'Payload store' in PIPE_REFERENCE.md)"
+            )
         self.sequential = sequential
         self.debug = debug
-        self.use_shm = use_shm
         self.raise_errors = raise_errors if raise_errors is not None else sequential
         self.health_check_interval = health_check_interval
         self.allow_full_restart = allow_full_restart
         self.jobs = []
         self.queues: list[Queue] = []
+        self.store = None  # shared payload store, created per start()
         self.processes = []
         self.worker_info = []
         self.worker_configs = {}
         self.started = False
-        self.should_stop = Value("i", 0)
+        # Polled several times per item by every worker: a synchronized Value
+        # would take a cross-process lock on each read (~5us on macOS). Plain
+        # shared int; writers only ever store whole values.
+        self.should_stop = RawValue("i", 0)
         self.drain_event = Event()
         self.health_monitor_thread = None
         self.health_monitor_stop_event = threading.Event()
@@ -384,7 +384,6 @@ class Pipe(LifecycleMixin, SequentialMixin):
                 try:
                     item = out_ch.get(timeout=0.1)
                     consecutive_empty = 0
-                    item = _item_from_shm(item)
 
                     if _is_end(item):
                         continue

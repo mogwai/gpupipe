@@ -166,14 +166,24 @@ def test_should_stop_does_not_drop_inflight_put():
     With the fix: item 3 stays in the put loop until we drain item 1 or 2,
     then lands in the queue (we get [1, 2, 3]).
     """
-    from pipe.shm import _item_from_shm
 
     p = Pipe(sequential=False, stats_interval=0, health_check_interval=0)
     p.add(FastSeqRoot(n=20), workers=1, outqn=2)
     p.start()
 
-    # Wait for spawn (~2s) and root to fill its queue + block in put-retry on item 3.
-    time.sleep(3.0)
+    # Wait until the root has filled the queue (spawn time varies with load;
+    # a fixed sleep let the stop below land before the root ever ran), then
+    # give it a moment to block in the put-retry loop on item 3.
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            if p.queues[-1].qsize() >= 2:
+                break
+        except NotImplementedError:  # mp.Queue on macOS: no qsize
+            time.sleep(3.0)
+            break
+        time.sleep(0.05)
+    time.sleep(0.3)
 
     # Signal graceful stop. Without the fix, the put-retry loop will exit on
     # its next iteration (after the 0.1s put timeout) and drop the in-flight item.
@@ -196,7 +206,7 @@ def test_should_stop_does_not_drop_inflight_put():
                 break
             continue
         raws.append(repr(raw)[:80])
-        item = _item_from_shm(raw)
+        item = raw
         if item is End or item is None:
             continue
         results.append(item)
