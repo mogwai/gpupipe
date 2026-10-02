@@ -5,11 +5,11 @@ No GPU and no cuda-checkpoint binary needed — nvidia-smi and every
 cuda-checkpoint action are stubbed at the subprocess boundary, so these run on
 any machine (including a mac laptop).
 """
+import multiprocessing as mp
 import threading
 import time
 
 import pytest
-import torch.multiprocessing as mp
 
 from pipe import Pipe
 from pipe import scavenge as sc
@@ -417,7 +417,7 @@ def test_missing_checkpoint_binary_warns_once(monkeypatch):
 
 
 def test_cpu_output_is_not_flagged():
-    import torch
+    torch = pytest.importorskip("torch")
 
     from pipe.workers import _has_cuda_tensor
 
@@ -428,11 +428,10 @@ def test_cpu_output_is_not_flagged():
     assert _has_cuda_tensor({"a": {"b": cpu}}) is False
 
 
-@pytest.mark.skipif(
-    not __import__("torch").cuda.is_available(), reason="needs a GPU"
-)
 def test_cuda_output_is_flagged():
-    import torch
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
 
     from pipe.workers import _has_cuda_tensor
 

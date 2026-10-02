@@ -17,8 +17,8 @@ os.environ["PIPE_DRAIN_GRACE"] = "3.0"
 
 import time
 
+import numpy as np
 import pytest
-import torch
 from conftest import Collector
 
 from pipe import End, Pipe
@@ -139,7 +139,7 @@ class TensorGen:
     def __call__(self):
         if self._i >= self.n:
             return End
-        it = {"id": self._i, "x": torch.tensor([float(self._i)]), "retries": 0}
+        it = {"id": self._i, "x": np.array([float(self._i)]), "retries": 0}
         self._i += 1
         return [it, End] if self._i >= self.n else it
 

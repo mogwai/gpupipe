@@ -1,7 +1,7 @@
 """A finished GPU worker must release its VRAM while the pipeline is still running.
 
 Workers park after End until the whole pipe stops (so tensors they put on the
-torch.mp queues stay valid). Only the process needs to survive for that. Before
+queues stay valid). Only the process needs to survive for that. Before
 the fix a parked GPU worker also kept its weights and the caching allocator's
 whole reserved pool until the last stage finished -- 20-30 GB per card sitting
 idle through every drain.
@@ -13,15 +13,15 @@ memory from nvidia-smi (keyed by pid -- the only view of a child's usage from
 outside it) while the pipe is still producing, and require that it drops to
 context-only before the run ends. Unpatched, it stays at ~1.1 GiB throughout.
 """
-import os
 import shutil
 import subprocess
 import time
 
 import pytest
-import torch
 
 from pipe import End, Pipe
+
+torch = pytest.importorskip("torch")
 
 HAS_CUDA = torch.cuda.is_available()
 HAS_SMI = shutil.which("nvidia-smi") is not None

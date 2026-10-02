@@ -1,7 +1,8 @@
 """The Rust shared-memory queue (pipe.shmqueue.ShmQueue) under pipe's edges:
 mp.Queue semantics, capacity, spill, cross-process/thread delivery, tensor
-transport, crash recovery, and the make_queue fallback."""
+transport, crash recovery, and make_queue."""
 import mmap
+import multiprocessing as mp
 import os
 import pickle
 import signal
@@ -12,15 +13,20 @@ import time
 from collections import Counter
 from queue import Empty, Full
 
+import numpy as np
 import pytest
-import torch
-import torch.multiprocessing as mp
 
 pytest.importorskip("pipe._rustq")
 
 from pipe import Pipe  # noqa: E402
 from pipe.queues import make_queue  # noqa: E402
 from pipe.shmqueue import ShmQueue  # noqa: E402
+
+try:  # torch is optional: tensor tests skip without it
+    import torch
+except ImportError:
+    torch = None
+needs_torch = pytest.mark.skipif(torch is None, reason="needs PyTorch")
 
 
 def _producer(q, start, n, size):
@@ -194,15 +200,20 @@ def test_attach_by_pickle_and_owner_unlink():
         pickle.loads(pickle.dumps(q))
 
 
-@pytest.mark.parametrize("t", [
-    torch.arange(12, dtype=torch.float32).reshape(3, 4),
-    torch.arange(12, dtype=torch.float32).reshape(3, 4).t(),  # non-contiguous
-    torch.randn(5).to(torch.bfloat16),
-    torch.tensor([True, False, True]),
-    torch.tensor(7, dtype=torch.int64),  # 0-dim
-    torch.empty(0, 3),
-])
-def test_small_cpu_tensors_round_trip_inline(t):
+_SMALL_TENSORS = {
+    "2d": lambda tc: tc.arange(12, dtype=tc.float32).reshape(3, 4),
+    "non-contiguous": lambda tc: tc.arange(12, dtype=tc.float32).reshape(3, 4).t(),
+    "bfloat16": lambda tc: tc.randn(5).to(tc.bfloat16),
+    "bool": lambda tc: tc.tensor([True, False, True]),
+    "0-dim": lambda tc: tc.tensor(7, dtype=tc.int64),
+    "empty": lambda tc: tc.empty(0, 3),
+}
+
+
+@needs_torch
+@pytest.mark.parametrize("make", list(_SMALL_TENSORS.values()), ids=list(_SMALL_TENSORS))
+def test_small_cpu_tensors_round_trip_inline(make):
+    t = make(torch)
     q = ShmQueue()
     q.put({"t": t})
     r = q.get()["t"]
@@ -210,6 +221,7 @@ def test_small_cpu_tensors_round_trip_inline(t):
     assert not t.is_shared()  # inline copy: the producer's tensor is untouched
 
 
+@needs_torch
 def test_tensors_inline_only_up_to_the_ring_fast_path():
     q = ShmQueue(maxsize=4, ring_bytes=1 << 20)  # payloads > 256 KiB spill
     small, big = torch.zeros(32 << 10, dtype=torch.uint8), torch.zeros(512 << 10, dtype=torch.uint8)
@@ -220,6 +232,7 @@ def test_tensors_inline_only_up_to_the_ring_fast_path():
     assert big.is_shared()  # torch's reducer moved it to shared memory
 
 
+@needs_torch
 def test_requires_grad_leaf_preserved_and_non_leaf_refused():
     q = ShmQueue()
     leaf = torch.ones(3, requires_grad=True)
@@ -230,6 +243,7 @@ def test_requires_grad_leaf_preserved_and_non_leaf_refused():
         q.put(leaf * 2)  # same refusal torch's reducer gives
 
 
+@needs_torch
 def test_large_and_small_tensors_cross_process():
     q = ShmQueue()
     read = mp.Event()
@@ -264,35 +278,26 @@ def test_lock_held_by_dead_process_is_recovered():
     assert time.monotonic() - t0 < 2.0
 
 
-def test_make_queue_default_and_override(monkeypatch):
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
+def test_make_queue_builds_a_shm_ring():
     assert isinstance(make_queue(4), ShmQueue)
-    monkeypatch.setenv("PIPE_QUEUE", "mp")
-    assert not isinstance(make_queue(4), ShmQueue)
 
 
-def test_make_queue_falls_back_when_ring_cannot_be_created(monkeypatch, capsys):
-    import pipe.queues
+def test_ring_creation_failure_is_an_error(monkeypatch):
+    """There is no second transport to fall back to: say so."""
     import pipe.shmqueue
 
     def boom(*a, **k):
         raise OSError("no space left")
 
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
     monkeypatch.setattr(pipe.shmqueue, "ShmQueue", boom)
-    monkeypatch.setattr(pipe.queues, "_fallback_warned", False)
-    q = make_queue(4)
-    assert not isinstance(q, ShmQueue)
-    assert "shared-memory queue unavailable" in capsys.readouterr().out
-    monkeypatch.setenv("PIPE_QUEUE", "rust")
-    with pytest.raises(OSError):
+    with pytest.raises(OSError, match="no space left"):
         make_queue(4)
 
 
 class _Numbers:
     def __call__(self):
         for i in range(3000):
-            yield {"id": i, "t": torch.full((4,), float(i))}
+            yield {"id": i, "t": np.full((4,), float(i))}
 
 
 class _Double:
@@ -301,8 +306,7 @@ class _Double:
         return item
 
 
-def test_pipeline_runs_on_shm_queues(monkeypatch):
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
+def test_pipeline_runs_on_shm_queues():
     pipe = Pipe(stats_interval=0)
     pipe.add(_Numbers(), outqn=64)
     pipe.add(_Double(), workers=3, outqn=64)
@@ -311,7 +315,7 @@ def test_pipeline_runs_on_shm_queues(monkeypatch):
     assert all(isinstance(q, ShmQueue) for q in pipe.queues)
     got = {item["id"]: item["t"] for item in pipe}
     assert sorted(got) == list(range(3000))
-    assert all(torch.equal(t, torch.full((4,), 4.0 * i)) for i, t in got.items())
+    assert all((t == 4.0 * i).all() for i, t in got.items())
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="shm reservation (fallocate) is Linux-only")
@@ -344,8 +348,17 @@ def test_large_reservations_survive_signals():
 
 
 def _spills_of(pids):
-    prefixes = tuple(f"gpqs{p:x}_" for p in pids)
-    return sorted(n for n in os.listdir("/dev/shm") if n.startswith(prefixes))
+    """Spill objects written by `pids`: "<ring name>s<writer pid>_<n>" on Linux
+    (sweepable with their ring), "gpqs<writer pid>_..." on macOS."""
+    import re
+
+    hexes = {f"{p:x}" for p in pids}
+    out = []
+    for n in os.listdir("/dev/shm"):
+        m = re.match(r"^gpq.+s([0-9a-f]+)_[0-9a-f]+$", n)
+        if (m and m.group(1) in hexes) or any(n.startswith(f"gpqs{h}_") for h in hexes):
+            out.append(n)
+    return sorted(out)
 
 
 def test_close_removes_unread_spilled_messages():
@@ -372,7 +385,6 @@ class _Forward:
 
 @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs /dev/shm to list shm objects")
 def test_force_stop_leaves_no_spilled_messages(monkeypatch):
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
     monkeypatch.setenv("PIPE_STORE", "0")  # big messages take the ring's own spill path
     pipe = Pipe(stats_interval=0)
     pipe.add(_BigBlobs(), outqn=8)
@@ -470,3 +482,13 @@ def test_writer_killed_holding_a_disk_spill_leaves_nothing():
     p.join()
     q._core.unlink()
     assert not os.path.exists(_spill_dir(q))
+
+
+def test_missing_extension_fails_loudly(monkeypatch):
+    """A build without the Rust extension says how to get it."""
+    import pipe
+
+    monkeypatch.setitem(sys.modules, "pipe.shmqueue", None)  # import now fails
+    monkeypatch.delattr(pipe, "shmqueue", raising=False)
+    with pytest.raises(RuntimeError, match="not built"):
+        make_queue(4)

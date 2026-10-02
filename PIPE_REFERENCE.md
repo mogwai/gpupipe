@@ -83,6 +83,12 @@ class Source:
             yield row
 ```
 
+If the generator raises, pipe reports it and calls the stage again after a
+backoff (`PIPE_SOURCE_RETRY_S`, default 1s, doubling to 60s, reset once a
+call makes progress) — keep the cursor on `self` so the new call resumes
+rather than starting over. An item that can't be sent downstream (e.g. it
+can't be pickled) is dropped and reported; the generator keeps going.
+
 ### Processor (receives items from upstream)
 
 Workers never see `End` - the framework handles it. Just process items:
@@ -363,8 +369,8 @@ shared memory, written in Rust (`rust/`, built as `pipe._rustq`). A put is one
 memcpy into a ring every attached process maps and a get is one memcpy out;
 the kernel is only entered when a worker has to sleep. There is no feeder
 thread, pipe, or semaphore, so puts are visible to consumers immediately. On
-small items that is 2.8-4.5x the end-to-end item rate of
-`torch.multiprocessing.Queue` (`bench/bench_pipe_overhead.py`), so most
+small items that is 2.8-4.5x the end-to-end item rate of the
+`torch.multiprocessing.Queue` edges it replaced (`bench/bench_pipe_overhead.py`), so most
 pipelines no longer need `chunk=` to go fast.
 
 Your stages don't change: items are still pickled with multiprocessing's
@@ -390,13 +396,19 @@ memory shared with the producer.
   hold the memory the others need), and arrays that don't fit the store are
   copied. Everything keeps working, just slower: give the container
   `--shm-size=8g` (or more) for full speed.
+- **Memory cap**: shared memory (RAM) stays within the rings plus the
+  payload store's cap: once the store is full, oversized messages spill to
+  files in the temp dir rather than to new shared-memory objects.
 - **Crash tolerance**: a worker SIGKILLed while holding the ring lock (e.g. by
   `hang_timeout`) does not deadlock its siblings: waiters take the lock over
-  from a dead holder.
-- **Fallback**: without the compiled extension (a source install with no
-  Rust toolchain), or if a ring can't be created, pipe warns once and uses
-  `torch.multiprocessing.Queue`. `PIPE_QUEUE=mp` forces that;
-  `PIPE_QUEUE=rust` makes it an error instead.
+  from a dead holder. Workers exit when the pipeline's parent process dies,
+  instead of running on as orphans. On Linux, starting a pipeline removes
+  shared memory and spill files left by pipelines whose owner died in this
+  pid namespace (containers sharing `/dev/shm` never touch each other's).
+- **Missing extension**: a build without `pipe._rustq` (a source install with
+  no Rust toolchain) raises when a pipeline starts, with instructions. There
+  is no second transport: if a ring can't be created, `start()` raises the
+  `OSError`.
 
 ## Payload store (large arrays pass by handle)
 
@@ -409,8 +421,8 @@ the first time it is put on a queue. The message carries a ~100-byte handle,
 the next stage receives a zero-copy view, and putting that view (or a slice
 of it) on the next queue re-sends the handle, so no hop after the first
 copies the data. A 1 MiB array through three pass-through stages runs ~17x
-faster than with `torch.multiprocessing.Queue`; at 8 MiB it is 26-36x
-(`bench/bench_passthrough.py`).
+faster than with the `torch.multiprocessing.Queue` edges it replaced; at
+8 MiB it is 26-36x (`bench/bench_passthrough.py`).
 
 **Semantics — read-only numpy.** numpy arrays from the store arrive
 read-only: an in-place write raises `ValueError: assignment destination is
@@ -435,9 +447,8 @@ the threshold, object arrays, and `bytes` are pickled as before.
 
 ## Chunked transport (chunk= / chunk_ms=)
 
-Every `put`/`get` on an mp.Queue costs a lock acquisition, a pipe write, and a
-consumer wakeup — and under multi-worker contention the single queue lock
-serializes. `chunk=N` bundles N **already-serialized** items into ONE queue
+Every `put`/`get` costs a lock acquisition, and often a consumer wakeup —
+and under multi-worker contention the single queue lock serializes. `chunk=N` bundles N **already-serialized** items into ONE queue
 message (a `Chunk`), amortizing that cost by N. Items inside a chunk pickle
 exactly as they would alone, so **payload-store handles and torch fd-sharing
 are unchanged** — only the message count drops.
@@ -571,9 +582,7 @@ How a value crosses a stage edge depends on what it is:
 
 numpy arrays from the store arrive **read-only** (`a.copy()` for a private
 writable array); CPU tensors arrive writable and shared. With `PIPE_STORE=0`
-large arrays are pickled on every hop instead, and with `PIPE_QUEUE=mp` the
-edges are plain `torch.multiprocessing.Queue`s (torch's `file_descriptor`
-sharing for tensors).
+large arrays are pickled on every hop instead.
 
 The old `use_shm=True` / `output_shm=True` mode (one `/dev/shm/pipe_*` file
 per item, written and re-read at every hop) is gone; the payload store is the
@@ -793,8 +802,8 @@ Both fall back to plain `print()` when stdout is not a TTY (piped logs, tests). 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `PIPE_VERBOSE=1` | off | informational prints (startup, worker lifecycle, signals) |
-| `PIPE_DRAIN_GRACE` | `3.0` | seconds a worker keeps polling an empty input queue after upstream completes before exiting; lower it in tests for faster shutdown, raise it on heavily loaded boxes (with `PIPE_QUEUE=mp`, mp.Queue's feeder thread can delay put() visibility) |
-| `PIPE_QUEUE` | `auto` | edge transport: `auto` = shared-memory ring if available, else `torch.multiprocessing.Queue`; `mp` = always the latter; `rust` = ring or error (see Queue transport) |
+| `PIPE_DRAIN_GRACE` | `3.0` | seconds a worker keeps polling an empty input queue after upstream completes before exiting; lower it in tests for faster shutdown, raise it on heavily loaded boxes |
+| `PIPE_SOURCE_RETRY_S` | `1.0` | first backoff before calling a root stage again after its generator raised (doubles to 60s) |
 | `PIPE_RING_MB` | from `outqn` | size of each edge's shared-memory ring (reserved in `/dev/shm` on Linux) |
 | `PIPE_INLINE_TENSOR_BYTES` | `1048576` | CPU tensors up to this size are copied through the ring instead of torch's shm + fd sharing; `0` disables |
 | `PIPE_STORE` | on | `0` disables the payload store (large arrays are pickled on every hop) |

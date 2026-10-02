@@ -5,53 +5,50 @@ read a pipeline's final output queue."""
 import os
 import time
 from collections import deque
+from multiprocessing import Value
 from queue import Empty, Full
-
-from torch.multiprocessing import Queue, Value
 
 from .types import End
 
-_fallback_warned = False
+
+def _transport():
+    """The compiled shared-memory transport modules, or an error saying how to
+    get them."""
+    try:
+        from . import shmqueue, shmstore
+    except ImportError as e:
+        raise RuntimeError(
+            "gpupipe's shared-memory transport (pipe._rustq) is not built. Install a "
+            "prebuilt wheel (pip install gpupipe), or a Rust toolchain "
+            "(https://rustup.rs) and reinstall from source."
+        ) from e
+    return shmqueue, shmstore
 
 
 def make_store():
     """The pipeline's shared payload store (shmstore.PayloadStore), or None
-    when edges won't be shared-memory rings or PIPE_STORE=0. Large arrays put
-    on the edges are then written to shared memory once and passed by handle."""
-    if os.environ.get("PIPE_QUEUE") == "mp" or os.environ.get("PIPE_STORE") == "0":
+    with PIPE_STORE=0. Large arrays put on the edges are written to shared
+    memory once and passed by handle. Also sweeps what crashed pipelines left."""
+    if os.environ.get("PIPE_STORE") == "0":
         return None
+    _, shmstore = _transport()
+    n = shmstore.sweep_dead_owners()
+    if n:
+        print(f"Removed {n} shared-memory objects left by crashed pipelines")
+    shmstore.warn_if_small_shm()
     try:
-        from .shmstore import PayloadStore, warn_if_small_shm
-
-        warn_if_small_shm()
-        return PayloadStore()
-    except (ImportError, OSError):
-        return None  # make_queue reports why shared memory is unavailable
+        return shmstore.PayloadStore()
+    except OSError as e:
+        print(f"WARNING: payload store unavailable ({e}); large arrays will be copied")
+        return None
 
 
 def make_queue(maxsize=0, store=None, n_edges=1):
-    """A queue for one pipeline edge.
-
-    The Rust shared-memory ring (shmqueue.ShmQueue) when the extension is
-    built, else torch.multiprocessing.Queue. PIPE_QUEUE=mp forces the latter;
-    PIPE_QUEUE=rust turns a missing extension or a failed ring (e.g. /dev/shm
-    too small to reserve it) into an error instead of a one-time warning.
-    `store` (from make_store) routes large arrays through shared memory;
-    `n_edges` (the pipeline's edge count) shares out /dev/shm between rings."""
-    global _fallback_warned
-    mode = os.environ.get("PIPE_QUEUE", "auto")
-    if mode != "mp":
-        try:
-            from .shmqueue import ShmQueue, edge_ring_bytes
-
-            return ShmQueue(maxsize, edge_ring_bytes(maxsize, n_edges), store=store)
-        except (ImportError, OSError) as e:
-            if mode == "rust":
-                raise
-            if not _fallback_warned:
-                _fallback_warned = True
-                print(f"WARNING: shared-memory queue unavailable ({e}); using torch.multiprocessing.Queue")
-    return Queue(maxsize=maxsize)
+    """A queue for one pipeline edge: the Rust shared-memory ring
+    (shmqueue.ShmQueue). `store` (from make_store) routes large arrays through
+    shared memory; `n_edges` shares out /dev/shm between the rings."""
+    shmqueue, _ = _transport()
+    return shmqueue.ShmQueue(maxsize, shmqueue.edge_ring_bytes(maxsize, n_edges), store=store)
 
 
 class Chunk:

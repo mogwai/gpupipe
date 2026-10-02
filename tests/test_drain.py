@@ -176,11 +176,7 @@ def test_should_stop_does_not_drop_inflight_put():
     # give it a moment to block in the put-retry loop on item 3.
     deadline = time.time() + 60
     while time.time() < deadline:
-        try:
-            if p.queues[-1].qsize() >= 2:
-                break
-        except NotImplementedError:  # mp.Queue on macOS: no qsize
-            time.sleep(3.0)
+        if p.queues[-1].qsize() >= 2:
             break
         time.sleep(0.05)
     time.sleep(0.3)

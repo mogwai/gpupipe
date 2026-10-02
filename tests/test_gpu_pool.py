@@ -9,10 +9,11 @@ import os
 import time
 
 import pytest
-import torch
 from conftest import Collector
 
 from pipe import End, Pipe
+
+torch = pytest.importorskip("torch")
 
 HAS_CUDA = torch.cuda.is_available()
 N_GPU = torch.cuda.device_count() if HAS_CUDA else 0

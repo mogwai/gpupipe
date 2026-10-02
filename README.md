@@ -12,13 +12,26 @@ uv add gpupipe
 pip install gpupipe
 ```
 
+PyTorch is optional. CPU pipelines need only `gpupipe` and never import torch, in the
+parent or the workers. GPU stages (`gpus=`, `pergpu=`, `scavenge=`) and `pipe.web` need it:
+
+```bash
+pip install 'gpupipe[torch]'          # torch from PyPI (on Linux, the CUDA build)
+
+# CPU-only torch, for stages that use tensors on a machine without a GPU
+pip install gpupipe torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+There is one `torch` extra rather than a CPU and a CUDA one: which torch build you get
+depends on the index you install from, not on the package name, and any torch 2.x build
+satisfies it.
+
 Queues between stages run on a shared-memory ring written in Rust (`rust/`), and large
 numpy arrays / CPU tensors are written to shared memory once and passed from stage to stage
 by handle, never copied again. **numpy arrays of 64 KiB+ therefore arrive read-only** —
-`.copy()` before writing in place (see "Payload store" in `PIPE_REFERENCE.md`). A source
-install compiles the Rust part if a toolchain is present (https://rustup.rs); without one,
-pipe falls back to `torch.multiprocessing.Queue` and pickled arrays, and works the same,
-only slower.
+`.copy()` before writing in place (see "Payload store" in `PIPE_REFERENCE.md`). Wheels
+include the Rust part; a source install needs a Rust toolchain (https://rustup.rs). If it
+is missing, starting a pipeline raises with instructions.
 
 The distribution is `gpupipe`; the module you import is `pipe` (sklearn-style):
 

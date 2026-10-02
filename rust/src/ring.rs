@@ -61,8 +61,8 @@ fn align8(n: u64) -> u64 {
 /// (u64 length + name). The consumer unlinks it after reading.
 /// Errors keep their OS code: "no space" (is_no_space) is backpressure for
 /// the caller, anything else is a real failure.
-fn spill_write(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let name = unique_name("gpqs");
+fn spill_write(ring: &str, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let name = spill_object_name(ring);
     let m = shm_map_io(&name, Some(data.len().max(1)))?;
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), m.base, data.len());
@@ -70,6 +70,23 @@ fn spill_write(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut rec = (data.len() as u64).to_le_bytes().to_vec();
     rec.extend_from_slice(name.as_bytes());
     Ok(rec)
+}
+
+/// Name for a spill object. On Linux it extends the ring's name, so owner
+/// teardown (and a crash sweep) can find every spill of a ring by prefix,
+/// including one a killed writer never got into a record. macOS can't list
+/// shm objects and caps names at 31 chars: short names, pending table.
+fn spill_object_name(ring: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!("{ring}s{:x}_{:x}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ring;
+        unique_name("gpqs")
+    }
 }
 
 fn spill_name(rec: &[u8]) -> &str {
@@ -384,7 +401,24 @@ impl RingQueue {
             shm_unlink(n);
         }
         let _ = std::fs::remove_dir_all(self.spill_dir()); // disk spills, unread or orphaned
-        names.len() + files
+        // Linux: every spill object of this ring, by name prefix — catches one
+        // a writer killed mid-wait never put in a record (names there are too
+        // long for the pending table, which serves macOS).
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut swept = 0;
+        #[cfg(target_os = "linux")]
+        if let Ok(dir) = std::fs::read_dir("/dev/shm") {
+            let prefix = format!("{}s", self.name.trim_start_matches('/'));
+            for e in dir.flatten() {
+                if let Some(n) = e.file_name().to_str() {
+                    if n.starts_with(&prefix) && !names.iter().any(|x| x.trim_start_matches('/') == n) {
+                        shm_unlink(&format!("/{n}"));
+                        swept += 1;
+                    }
+                }
+            }
+        }
+        names.len() + files + swept
     }
 
     #[getter]
@@ -419,8 +453,11 @@ impl RingQueue {
 
     /// Put one payload. Returns False if it could not be placed (non-blocking
     /// and full, or the timeout passed); the caller raises queue.Full.
-    #[pyo3(signature = (data, block=true, timeout=None))]
-    fn put(&self, py: Python<'_>, data: &[u8], block: bool, timeout: Option<f64>) -> PyResult<bool> {
+    /// `disk`: if the payload has to spill, put it in a file rather than a
+    /// new shm object (the caller's payload store is full, and spills would
+    /// otherwise grow shared memory past its cap).
+    #[pyo3(signature = (data, block=true, timeout=None, disk=false))]
+    fn put(&self, py: Python<'_>, data: &[u8], block: bool, timeout: Option<f64>, disk: bool) -> PyResult<bool> {
         let deadline = deadline_of(block, timeout)?;
         let s = self.sh();
         let mut spilled: Option<(u32, Vec<u8>)> = None;
@@ -435,10 +472,10 @@ impl RingQueue {
         let mut pending: Option<usize> = None;
         loop {
             if must_spill && spilled.is_none() {
-                let in_shm = if self.force_disk.load(Ordering::Relaxed) {
+                let in_shm = if disk || self.force_disk.load(Ordering::Relaxed) {
                     Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
                 } else {
-                    spill_write(data)
+                    spill_write(&self.name, data)
                 };
                 match in_shm {
                     Ok(rec) => spilled = Some((KIND_SPILL, rec)),

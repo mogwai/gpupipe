@@ -22,14 +22,13 @@ from contextlib import asynccontextmanager, suppress
 from queue import Empty
 from typing import Any
 
-import torch
-
 try:
     import lz4.frame
     HAS_LZ4 = True
 except ImportError:
     HAS_LZ4 = False
 
+from . import _torch
 from .pipe import Pipe
 from .queues import _InputChannel
 from .types import End
@@ -44,6 +43,7 @@ def _validate_compression(compression):
 
 def _serialize(item, compression):
     """torch-serialize an item, optionally lz4-compressed. Returns bytes."""
+    torch = _torch.required("pipe.web (serializes with torch.save)")
     buffer = io.BytesIO()
     torch.save(item, buffer)
     data = buffer.getvalue()

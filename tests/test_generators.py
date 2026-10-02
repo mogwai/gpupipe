@@ -269,11 +269,35 @@ class _GenWithUnsendableItem:
             yield {"id": i, "f": (lambda: 0)} if i == 7 else {"id": i}
 
 
-class _GenRaisesMidway:
+class _ResumableSource:
+    """Keeps its cursor on self, like a DB loader, and hits one transient
+    error mid-stream."""
+
+    def __init__(self):
+        self.i = 0
+        self.failed = False
+
     def __call__(self):
-        for i in range(10):
-            yield {"id": i}
-        raise ValueError("source broke")
+        while self.i < 10:
+            if self.i == 5 and not self.failed:
+                self.failed = True
+                raise TimeoutError("transient DB error")
+            yield {"id": self.i}
+            self.i += 1
+
+
+class _FlakySource:
+    def __init__(self):
+        self.i = 0
+        self.fails = 0
+
+    def __call__(self):
+        while self.i < 6:
+            if self.i == 3 and self.fails < 2:
+                self.fails += 1
+                raise RuntimeError("still flaky")
+            yield {"id": self.i}
+            self.i += 1
 
 
 def test_unsendable_item_is_dropped_not_restarting_the_generator():
@@ -285,8 +309,21 @@ def test_unsendable_item_is_dropped_not_restarting_the_generator():
     assert sorted(ids) == [i for i in range(20) if i != 7]
 
 
-def test_generator_that_raises_ends_its_stream():
+def test_raising_generator_source_is_called_again(monkeypatch):
+    """A source that raises is called again after a backoff, and one keeping
+    its cursor on self resumes where it stopped: each item exactly once."""
+    monkeypatch.setenv("PIPE_SOURCE_RETRY_S", "0.1")
     pipe = Pipe(stats_interval=0)
-    pipe.add(_GenRaisesMidway(), outqn=8)
+    pipe.add(_ResumableSource(), outqn=8)
     pipe.add(Collector(), workers=2, outqn=8)
     assert sorted(r["id"] for r in pipe) == list(range(10))
+
+
+def test_repeated_source_failures_back_off_and_recover(monkeypatch):
+    monkeypatch.setenv("PIPE_SOURCE_RETRY_S", "0.2")
+    pipe = Pipe(stats_interval=0)
+    pipe.add(_FlakySource(), outqn=8)
+    t0 = time.time()
+    assert sorted(r["id"] for r in pipe) == list(range(6))
+    # Two failures without progress in between: 0.2s, then 0.4s.
+    assert time.time() - t0 >= 0.6

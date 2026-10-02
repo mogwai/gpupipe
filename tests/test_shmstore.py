@@ -6,7 +6,6 @@ import time
 
 import numpy as np
 import pytest
-import torch
 
 pytest.importorskip("pipe._rustq")
 
@@ -15,6 +14,12 @@ from pipe._rustq import Store  # noqa: E402
 from pipe import Pipe  # noqa: E402
 from pipe.shmqueue import ShmQueue  # noqa: E402
 from pipe.shmstore import STORE_MIN_BYTES, PayloadStore, _ndarray_block  # noqa: E402
+
+try:  # torch is optional: tensor tests skip without it
+    import torch
+except ImportError:
+    torch = None
+needs_torch = pytest.mark.skipif(torch is None, reason="needs PyTorch")
 
 BIG = STORE_MIN_BYTES // 4 * 4  # float32 elements' worth of bytes, rounded
 
@@ -71,6 +76,7 @@ def test_blocks_are_freed_and_reused(store):
     assert store.core.used <= 16 << 20  # one segment, recycled throughout
 
 
+@needs_torch
 def test_cpu_tensors_go_through_the_store_writable_and_shared(store):
     q = ShmQueue(8, store=store)
     t = torch.arange(BIG, dtype=torch.float32)
@@ -83,6 +89,7 @@ def test_cpu_tensors_go_through_the_store_writable_and_shared(store):
     assert r[10] == -1.0
 
 
+@needs_torch
 def test_requires_grad_survives_the_store(store):
     q = ShmQueue(8, store=store)
     t = torch.ones(BIG, requires_grad=True)
@@ -97,7 +104,7 @@ def test_store_full_falls_back_to_copying(capsys):
         b = hop(q, np.ones(1 << 19, dtype=np.float32))  # 2 MiB > the whole store
         assert np.array_equal(b, np.ones(1 << 19, dtype=np.float32))
         assert _ndarray_block(b) is None and b.flags.writeable  # plain pickled copy
-        assert "payload store can't fit" in capsys.readouterr().out
+        assert "payload store is at its cap" in capsys.readouterr().out
     finally:
         small.close()
 
@@ -148,7 +155,6 @@ class _Check:
 
 
 def test_pipeline_passes_arrays_through_the_store(monkeypatch):
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
     monkeypatch.delenv("PIPE_STORE", raising=False)
     pipe = Pipe(stats_interval=0)
     pipe.add(_Waves(200), outqn=16)
@@ -166,7 +172,6 @@ def test_pipeline_passes_arrays_through_the_store(monkeypatch):
 
 
 def test_pipeline_store_can_be_disabled(monkeypatch):
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
     monkeypatch.setenv("PIPE_STORE", "0")
     pipe = Pipe(stats_interval=0)
     pipe.add(_Waves(5), outqn=4)
@@ -176,7 +181,7 @@ def test_pipeline_store_can_be_disabled(monkeypatch):
 
 
 def test_store_is_attached_by_name_across_processes(store):
-    import torch.multiprocessing as mp
+    import multiprocessing as mp
 
     q = ShmQueue(4, store=store)
     p = mp.Process(target=_put_wave, args=(q,))
@@ -232,7 +237,7 @@ def _stress_forwarder(qin, qout, n):
 
 
 def test_refcounts_hold_up_across_many_processes(store):
-    import torch.multiprocessing as mp
+    import multiprocessing as mp
 
     qa, qb = ShmQueue(8, store=store), ShmQueue(8, store=store)
     producers, forwarders, n, nbytes = 4, 4, 150, 512 << 10
@@ -291,7 +296,7 @@ def _put_mixed(q, src, n):
 
 
 def test_mixed_sizes_cross_process(store):
-    import torch.multiprocessing as mp
+    import multiprocessing as mp
 
     q = ShmQueue(6, ring_bytes=256 << 10, store=store)  # payloads > 64 KiB leave the ring
     procs = [mp.Process(target=_put_mixed, args=(q, s, 60)) for s in range(2)]
@@ -366,7 +371,6 @@ class _CrashOnItem:
 
 @pytest.fixture
 def on_store(monkeypatch):
-    monkeypatch.delenv("PIPE_QUEUE", raising=False)
     monkeypatch.delenv("PIPE_STORE", raising=False)
     monkeypatch.delenv("PIPE_STORE_MB", raising=False)
 
@@ -509,3 +513,129 @@ def test_pipeline_in_docker_sized_shm(on_store, monkeypatch, capsys):
     assert sorted(x["id"] for x in got) == list(range(40))
     assert all((x["b"] == 2 * x["id"]).all() for x in got)
     assert "--shm-size" in capsys.readouterr().out
+
+
+# === memory caps, orphans, crash cleanup ===
+
+def test_full_store_spills_big_messages_to_disk_not_shm():
+    """With the store full, a big message goes to a file, not a new shm
+    object: shared memory (RAM) stays within the store's cap."""
+    import tempfile
+
+    small = PayloadStore(limit_bytes=1 << 20)
+    try:
+        q = ShmQueue(4, ring_bytes=64 << 10, store=small)
+        spill_dir = os.path.join(tempfile.gettempdir(), q._core.name.lstrip("/") + ".spill")
+        blobs = [os.urandom(600 << 10) for _ in range(3)]  # bytes: pickled into the message
+        for b in blobs:
+            q.put(b)
+        assert len(os.listdir(spill_dir)) >= 2  # the store took at most one
+        if os.path.isdir("/dev/shm"):
+            assert not [n for n in os.listdir("/dev/shm") if n.startswith(q._core.name.lstrip("/") + "s")]
+        assert [q.get() for _ in blobs] == blobs
+    finally:
+        small.close()
+
+
+def test_warning_names_the_limit_that_was_hit(monkeypatch, capsys):
+    from pipe import shmstore
+
+    for free, expect in ((64 << 30, "payload store is at its cap"), (1 << 20, "/dev/shm is full")):
+        monkeypatch.setattr(shmstore, "shm_free_bytes", lambda f=free: f)
+        monkeypatch.setattr(shmstore, "_full_warned", False)
+        small = PayloadStore(limit_bytes=1 << 20)
+        try:
+            assert shmstore._alloc(small.core, 4 << 20) is None
+            assert expect in capsys.readouterr().out
+        finally:
+            small.close()
+
+
+class _Endless:
+    def __call__(self):
+        i = 0
+        while True:
+            time.sleep(0.01)
+            yield {"id": i}
+            i += 1
+
+
+def _pipeline_then_hang(pid_file):
+    pipe = Pipe(stats_interval=0, health_check_interval=0)
+    pipe.add(_Endless(), outqn=4)
+    pipe.add(_Pass(), workers=2, outqn=4)
+    pipe.start()
+    with open(pid_file, "w") as f:
+        f.write(" ".join(str(p.pid) for p in pipe.processes))
+    for _ in pipe:
+        pass
+
+
+def test_workers_exit_when_the_parent_dies(on_store, tmp_path):
+    import multiprocessing as mp
+    import signal
+
+    pid_file = str(tmp_path / "pids")
+    parent = mp.Process(target=_pipeline_then_hang, args=(pid_file,))
+    parent.start()
+    deadline = time.time() + 60
+    while not (os.path.exists(pid_file) and open(pid_file).read()) and time.time() < deadline:
+        time.sleep(0.1)
+    pids = [int(x) for x in open(pid_file).read().split()]
+    assert len(pids) == 3
+    time.sleep(1.0)
+    os.kill(parent.pid, signal.SIGKILL)  # a crash: no cleanup runs
+    parent.join()
+
+    def alive(p):
+        try:
+            os.kill(p, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    deadline = time.time() + 15
+    while any(alive(p) for p in pids) and time.time() < deadline:
+        time.sleep(0.2)
+    assert not any(alive(p) for p in pids), "orphaned workers kept running"
+
+
+def _crash_leaving_shm(pid_file):
+    from multiprocessing import resource_tracker
+
+    st = PayloadStore(limit_bytes=256 << 20, seg_bytes=16 << 20)
+    st.core.alloc(1 << 20)  # a size-class block in a regular segment
+    st.core.alloc(40 << 20)  # a dedicated segment (not tracker-registered)
+    ring = ShmQueue(2, ring_bytes=64 << 10)
+    ring.put(os.urandom(200 << 10))  # an unread spilled message
+    # Forget the tracker registrations so only the sweep can clean up, then
+    # die without running any cleanup (as a SIGKILLed owner would).
+    for n in [st.name, *st.core.segment_names(st.core.limit // st.core.seg_bytes), ring._core.name]:
+        resource_tracker.unregister(n, "shared_memory")
+    with open(pid_file, "w") as f:  # not an mp.Queue: os._exit would beat its feeder thread
+        f.write(str(os.getpid()))
+    os._exit(0)
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs /dev/shm (Linux)")
+def test_sweep_removes_what_a_dead_owner_left(tmp_path):
+    import multiprocessing as mp
+
+    from pipe.shmstore import sweep_dead_owners
+
+    live = PayloadStore(limit_bytes=64 << 20)  # ours: must survive the sweep
+    try:
+        pid_file = str(tmp_path / "pid")
+        p = mp.Process(target=_crash_leaving_shm, args=(pid_file,))
+        p.start()
+        p.join(timeout=120)
+        dead = int(open(pid_file).read())
+        ns = os.stat("/proc/self/ns/pid").st_ino
+        mark = f"{ns:x}.{dead:x}_"
+        left = [n for n in os.listdir("/dev/shm") if mark in n]
+        assert len(left) >= 4, left  # control, regular + dedicated segment, ring, spill
+        assert sweep_dead_owners() >= len(left)
+        assert not [n for n in os.listdir("/dev/shm") if mark in n]
+        assert Store.attach(live.name)  # a live owner's store is untouched
+    finally:
+        live.close()

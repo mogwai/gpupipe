@@ -19,7 +19,6 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "torch>=2.0.0",
     "numpy",
     "rich>=13.0.0",
 ]
@@ -29,10 +28,16 @@ Homepage = "https://github.com/mogwai/gpupipe"
 Repository = "https://github.com/mogwai/gpupipe"
 
 [project.optional-dependencies]
+# PyTorch is optional: CPU pipelines run (and their workers start) without it.
+# GPU stages and the tensor fast paths use it when it is installed.
+torch = [
+    "torch>=2.0.0",
+]
 web = [
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
     "lz4>=4.0.0",
+    "torch>=2.0.0",  # pipe.web serializes with torch.save
 ]
 dev = [
     "pytest>=7.0.0",
@@ -47,33 +52,34 @@ where = ["src"]
 # editable installs, which tests/test_planned_preserved.py relies on.
 
 [[tool.setuptools-rust.ext-modules]]
-# The shared-memory ring under pipe's queues (rust/, wrapped by pipe.shmqueue).
-# Optional: without a Rust toolchain the build skips it and pipe falls back to
-# torch.multiprocessing.Queue. Release even for editable installs — a debug
-# build is ~10x slower and would distort every benchmark.
+# The shared-memory transport (rust/, wrapped by pipe.shmqueue / pipe.shmstore).
+# Required: wheels ship it; a source build needs a Rust toolchain. Release even
+# for editable installs — a debug build is ~10x slower.
 target = "pipe._rustq"
 path = "rust/Cargo.toml"
 binding = "PyO3"
-optional = true
 debug = false
 
 [tool.cibuildwheel]
-# CPython 3.10-3.14 plus free-threaded 3.14t, Linux (manylinux) and macOS.
+# CPython 3.10-3.14 plus free-threaded 3.14t: Linux (manylinux) x86_64 and
+# aarch64, each on its own runner; macOS arm64 and x86_64.
 # No musllinux (torch ships no musl wheels); no Windows (the extension's
 # wait/wake is futex/ulock: Linux and macOS only).
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
 skip = "*-musllinux_* *_i686"
-# Torch-free smoke test of the built extension (see the script); no-deps so
-# each wheel's test env doesn't download torch.
+# Torch-free smoke test of each wheel: the extension, then a CPU pipeline.
 test-command = "python {project}/scripts/check_wheel.py"
-test-environment = { PIP_NO_DEPS = "1" }
 
 [tool.cibuildwheel.linux]
 before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 
-[tool.cibuildwheel.macos.environment]
-MACOSX_DEPLOYMENT_TARGET = "11.0"  # Rust's minimum is above CPython's
+[tool.cibuildwheel.macos]
+# Intel wheels are cross-compiled on the Apple Silicon runner (setuptools-rust
+# picks the Rust target from ARCHFLAGS) and tested under Rosetta.
+archs = ["arm64", "x86_64"]
+before-all = "rustup target add x86_64-apple-darwin"
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }  # Rust's minimum is above CPython's
 
 [tool.setuptools_scm]
 write_to = "src/pipe/_version.py"

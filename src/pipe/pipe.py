@@ -1,13 +1,13 @@
 import contextlib
+import multiprocessing as mp
 import os
 import signal
+import subprocess
 import threading
+from multiprocessing import Event, RawValue
 from queue import Empty
 
-import torch
-import torch.multiprocessing as mp
-from torch.multiprocessing import Event, Queue, RawValue
-
+from . import _torch
 from .lifecycle import LifecycleMixin
 from .monitors import _collect_stats
 from .queues import InstrumentedQueue, PipeIterator, _InputChannel  # noqa: F401 (kept importable from pipe.pipe)
@@ -58,7 +58,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.health_check_interval = health_check_interval
         self.allow_full_restart = allow_full_restart
         self.jobs = []
-        self.queues: list[Queue] = []
+        self.queues = []  # one shmqueue.ShmQueue per edge
         self.store = None  # shared payload store, created per start()
         self.processes = []
         self.worker_info = []
@@ -86,7 +86,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.profile = profile
         self.profile_dir = None
         self.profile_rss = {}
-        self.gpus = self._get_gpu_count()
+        self._gpus = None  # counted on first GPU stage (see gpus)
         self.expected_consumers = expected_consumers
 
         # Manager (for timing_dict) is created lazily in start(): only for
@@ -99,11 +99,38 @@ class Pipe(LifecycleMixin, SequentialMixin):
         self.stage_worker_counts = []
         self.stage_done_events = []
 
+    @property
+    def gpus(self):
+        """Visible CUDA GPUs, counted when a GPU stage is first added, so a CPU
+        pipeline never imports torch or touches the driver."""
+        if self._gpus is None:
+            self._gpus = self._get_gpu_count()
+        return self._gpus
+
+    @gpus.setter
+    def gpus(self, n):
+        self._gpus = n
+
     def _get_gpu_count(self):
+        torch = _torch.available()
         try:
-            if torch.cuda.is_available():
-                return torch.cuda.device_count()
-            _log("CUDA not available, pergpu flag will be ignored")
+            if torch is not None:
+                if torch.cuda.is_available():
+                    return torch.cuda.device_count()
+                _log("CUDA not available, pergpu flag will be ignored")
+                return 0
+            # No torch: GPU pinning still works for other CUDA users (it only
+            # sets CUDA_VISIBLE_DEVICES), so count devices with nvidia-smi.
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10,
+            )
+            n = len(out.stdout.split()) if out.returncode == 0 else 0
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible is not None:
+                n = min(n, len([d for d in visible.split(",") if d.strip()]))
+            return n
+        except (OSError, subprocess.SubprocessError):
             return 0
         except Exception as e:
             print(f"Error detecting GPUs: {e}")
@@ -188,7 +215,7 @@ class Pipe(LifecycleMixin, SequentialMixin):
                     f"{hang_timeout}"
                 )
 
-        gpu_count = self.gpus
+        gpu_count = self.gpus if (gpus is not None or pergpu or gpu_id is not None) else 0
 
         # Resolve the stage's GPU pool into a single canonical list `gpu_list`:
         #   gpus=[5,6]   -> pin this stage's workers to GPUs 5 and 6 (round-robin)

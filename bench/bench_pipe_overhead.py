@@ -2,10 +2,8 @@
 
 Times first -> last item at the consumer (spawn and shutdown excluded), so the
 figure is pure pipe overhead: serialization + queue transport + worker loop.
-Compare transports with PIPE_QUEUE=mp vs the default shared-memory ring:
 
-    PIPE_QUEUE=mp python bench/bench_pipe_overhead.py
-    python bench/bench_pipe_overhead.py
+    python bench/bench_pipe_overhead.py [n_items]
 """
 import os
 import sys
@@ -50,7 +48,6 @@ def run(n, stages, workers, chunk, payload_bytes):
 
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000
-    print(f"queue: {os.environ.get('PIPE_QUEUE', 'auto')}")
     print(f"{'stages':>6} {'workers':>7} {'chunk':>5} {'payload':>7} {'items/s':>10} {'us/item':>8}")
     for stages, workers, chunk, payload in [
         (1, 1, 0, 64), (3, 1, 0, 64), (3, 4, 0, 64),

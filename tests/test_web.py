@@ -5,9 +5,10 @@ Run with: pytest test_web.py -q
 import io
 
 import pytest
-import torch
 
 from pipe import End, Pipe
+
+torch = pytest.importorskip("torch")
 
 pytest.importorskip("fastapi")
 

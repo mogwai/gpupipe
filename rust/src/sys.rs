@@ -242,10 +242,27 @@ pub fn shm_unlink(name: &str) {
     }
 }
 
+/// Owner prefix for shm names: on Linux "<pid-namespace inode>.<pid>", so a
+/// later pipeline can tell which names belong to a dead owner in ITS OWN pid
+/// namespace (containers sharing /dev/shm via --ipc=host see other pids) and
+/// sweep them (shmstore.sweep_dead_owners). macOS can't list shm objects and
+/// caps names at 31 chars, so it keeps the bare pid.
+pub fn owner_tag() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ns = std::fs::metadata("/proc/self/ns/pid").map(|m| m.ino()).unwrap_or(0);
+        format!("{:x}.{:x}", ns, std::process::id())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("{:x}", std::process::id())
+    }
+}
+
 pub fn unique_name(tag: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
-    // macOS caps shm names at 31 chars.
-    format!("/{tag}{:x}_{:x}_{:x}", std::process::id(), n, t & 0xffff)
+    format!("/{tag}{}_{:x}_{:x}", owner_tag(), n, t & 0xffff)
 }

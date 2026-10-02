@@ -9,7 +9,6 @@ import os
 import time
 
 import pytest
-import torch
 from conftest import Collector
 
 from pipe import End, Pipe
@@ -18,6 +17,16 @@ from pipe.workers import _cpu_chunk
 N_CPU = os.cpu_count() or 1
 HAS_AFFINITY = hasattr(os, "sched_getaffinity")
 FULL_MACHINE = frozenset(range(N_CPU))
+
+try:
+    import torch
+except ImportError:  # masks are still checked; thread counts need torch
+    torch = None
+
+
+def _threads(n):
+    """The thread-count set every worker should report."""
+    return {n if torch is not None else None}
 
 
 class Gen:
@@ -45,7 +54,7 @@ class AffinityReporter:
     def __call__(self, item):
         time.sleep(0.003)  # spread work so every worker in the pool gets some
         item["mask"] = tuple(sorted(os.sched_getaffinity(0)))
-        item["nthreads"] = torch.get_num_threads()
+        item["nthreads"] = torch.get_num_threads() if torch is not None else None
         return item
 
 
@@ -85,7 +94,7 @@ def test_workers_pinned_to_their_slices():
     # ...and pinning actually happened (a failed setaffinity would report FULL_MACHINE)
     assert tuple(sorted(FULL_MACHINE)) not in seen
     # threads sized to the (1-core) slice
-    assert {r["nthreads"] for r in res} == {1}
+    assert {r["nthreads"] for r in res} == _threads(1)
 
 
 @pytest.mark.skipif(N_CPU < 8, reason="need >=8 cores")
@@ -96,7 +105,7 @@ def test_multicore_slice_sets_thread_count():
     seen = {r["mask"] for r in res}
     expected = _expected_masks(pool, 2)  # {(0,1,2,3), (4,5,6,7)}
     assert seen <= expected, f"unexpected masks: {seen - expected}"
-    assert {r["nthreads"] for r in res} == {4}
+    assert {r["nthreads"] for r in res} == _threads(4)
 
 
 @pytest.mark.skipif(N_CPU < 8, reason="need >=8 cores")
@@ -126,7 +135,7 @@ def test_single_worker_owns_whole_pool():
     pool = [0, 1]
     res = _report(pool, workers=1)
     assert {r["mask"] for r in res} == {(0, 1)}
-    assert {r["nthreads"] for r in res} == {2}
+    assert {r["nthreads"] for r in res} == _threads(2)
 
 
 @pytest.mark.skipif(N_CPU < 2, reason="need >=2 cores")
@@ -136,7 +145,7 @@ def test_more_workers_than_cores_oversubscribe():
     res = _report(pool, workers=4)
     seen = {r["mask"] for r in res}
     assert seen <= {(0,), (1,)}, seen
-    assert {r["nthreads"] for r in res} == {1}
+    assert {r["nthreads"] for r in res} == _threads(1)
 
 
 @pytest.mark.skipif(N_CPU < 2, reason="need >=2 cores")
@@ -185,7 +194,7 @@ def test_cpu_threads_sets_count_without_pinning():
         (AffinityReporter(), {"cpu_threads": 6, "outqn": 32}),
         (Collector(), {"workers": 1, "outqn": None}),
     ])
-    assert {r["nthreads"] for r in res} == {6}
+    assert {r["nthreads"] for r in res} == _threads(6)
     assert {r["mask"] for r in res} == {tuple(sorted(FULL_MACHINE))}, "must stay unpinned"
 
 
@@ -196,7 +205,7 @@ def test_default_is_two_threads():
         (AffinityReporter(), {"outqn": 32}),
         (Collector(), {"workers": 1, "outqn": None}),
     ])
-    assert {r["nthreads"] for r in res} == {2}
+    assert {r["nthreads"] for r in res} == _threads(2)
 
 
 @pytest.mark.skipif(N_CPU < 8, reason="need >=8 cores")
@@ -209,7 +218,7 @@ def test_cpu_threads_overrides_slice_size():
         (AffinityReporter(), {"cpus": list(range(8)), "workers": 2, "cpu_threads": 3, "outqn": 32}),
         (Collector(), {"workers": 1, "outqn": None}),
     ])
-    assert {r["nthreads"] for r in res} == {3}, "cpu_threads should override slice size"
+    assert {r["nthreads"] for r in res} == _threads(3), "cpu_threads should override slice size"
     assert {len(r["mask"]) for r in res} == {4}, "still pinned to the 4-core slice"
 
 

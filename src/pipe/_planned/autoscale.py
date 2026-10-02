@@ -209,7 +209,7 @@ def _signal_worker_to_stop(pipe_instance, stage_idx):
 
 def _spawn_additional_worker(pipe_instance, stage_idx, job):
     """Spawn an additional worker for the given stage."""
-    from torch.multiprocessing import Process
+    from multiprocessing import Process
 
     from ..workers import _cpu_chunk, _threaded_worker_run, _worker_run
 

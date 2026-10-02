@@ -4,15 +4,14 @@ monitor threads, per-worker and per-stage restart, and graceful/forced shutdown.
 Mixed into `Pipe` (methods keep operating on `self`); split out to keep pipe.py
 focused on the public API (init/add/iterate)."""
 import contextlib
+import multiprocessing as mp
 import os
 import threading
 import time
+from multiprocessing import Event, Value
 from queue import Full
 
-import torch
-import torch.multiprocessing as mp
-from torch.multiprocessing import Event, Value
-
+from . import _torch
 from .monitors import (
     _health_monitor_thread,
     _stats_monitor_thread,
@@ -379,7 +378,8 @@ class LifecycleMixin:
                 if p.is_alive():
                     p.kill()
 
-            if torch.cuda.is_available():
+            torch = _torch.loaded()
+            if torch is not None and torch.cuda.is_available():
                 torch.cuda.ipc_collect()
         else:
             for q in self.queues:

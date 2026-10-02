@@ -356,7 +356,7 @@ def test_debug_tracks_counts():
 
 def test_debug_transit_latency():
     """InstrumentedQueue tracks transit latency."""
-    from torch.multiprocessing import Queue
+    from multiprocessing import Queue
     q = InstrumentedQueue(Queue(maxsize=10))
 
     q.put("item1")
@@ -415,7 +415,7 @@ def test_debug_with_batch():
 
 
 def test_no_debug_plain_queues():
-    """Without debug=True, queues are plain mp.Queue (not instrumented)."""
+    """Without debug=True, queues are plain (not instrumented)."""
     pipe = Pipe(raise_errors=True, stats_interval=0, health_check_interval=0)
     pipe.add(Generator(5), outqn=20)
     pipe.add(Passthrough(), workers=1, outqn=0)

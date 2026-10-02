@@ -29,3 +29,28 @@ jobs:
       - name: The extension must have built
         run: uv run --no-sync python scripts/check_wheel.py
       - run: uv run --no-sync python -m pytest tests -n auto -q
+
+  no-torch:
+    # CPU pipelines must install, run and test without PyTorch
+    # (torch-only tests skip themselves).
+    name: tests without torch (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install (no torch; builds the Rust extension)
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+          if uv run --no-sync python -c "import torch" 2>/dev/null; then echo "torch got installed"; exit 1; fi
+      - name: The extension must have built
+        run: uv run --no-sync python scripts/check_wheel.py
+      - run: uv run --no-sync python -m pytest tests -n auto -q

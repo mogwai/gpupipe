@@ -1,6 +1,6 @@
 """Inter-stage queue over the Rust shared-memory ring (`pipe._rustq`).
 
-A drop-in for torch.multiprocessing.Queue as pipe uses it. The Rust core only
+The queue on every pipeline edge (multiprocessing.Queue's surface). The Rust core only
 moves bytes: a put is one memcpy into a ring every attached process maps, a
 get is one memcpy out, and nobody enters the kernel unless they have to sleep
 — no feeder thread, no pipe, no semaphores. That is 2-8x the item throughput
@@ -30,18 +30,13 @@ from multiprocessing.reduction import ForkingPickler
 from queue import Empty, Full
 
 import numpy as np
-import torch
 
-from . import shmstore
+from . import _torch, shmstore
 from ._rustq import RingQueue
 
 __all__ = ["ShmQueue"]
 
 _INLINE_TENSOR_BYTES = int(os.environ.get("PIPE_INLINE_TENSOR_BYTES", 1 << 20))
-_INLINE_DTYPES = {
-    torch.float32, torch.float64, torch.float16, torch.bfloat16,
-    torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8, torch.bool,
-}
 
 
 def _ring_bytes(maxsize):
@@ -70,6 +65,8 @@ def edge_ring_bytes(maxsize, n_edges):
 
 
 def _rebuild_inline(buf, dtype, shape, requires_grad):
+    import torch
+
     t = torch.frombuffer(buf, dtype=dtype) if len(buf) else torch.empty(0, dtype=dtype)
     t = t.reshape(shape)
     if requires_grad:
@@ -77,7 +74,7 @@ def _rebuild_inline(buf, dtype, shape, requires_grad):
     return t
 
 
-def _tensor_reducer(torch_reduce):
+def _tensor_reducer(torch_reduce, torch):
     def reduce(t):
         st = _tls.store
         if st is not None:
@@ -87,7 +84,7 @@ def _tensor_reducer(torch_reduce):
         if (
             t.device.type == "cpu"
             and t.layout is torch.strided
-            and t.dtype in _INLINE_DTYPES
+            and t.dtype in shmstore.tensor_itemsizes()
             and t.numel() * t.element_size() <= _tls.inline_max
             and (t.is_leaf or not t.requires_grad)  # torch refuses non-leaf grads; so do we
         ):
@@ -120,8 +117,11 @@ def _dumps(obj, inline_max, store):
     if st is None or st[2] != n:
         buf = io.BytesIO()
         p = ForkingPickler(buf, pickle.HIGHEST_PROTOCOL)
-        if torch.Tensor in p.dispatch_table:
-            p.dispatch_table[torch.Tensor] = _tensor_reducer(p.dispatch_table[torch.Tensor])
+        # Tensor fast paths only once a stage has imported torch (which
+        # registers its reducers, changing n and so rebuilding this pickler).
+        torch = _torch.loaded()
+        if torch is not None and torch.Tensor in p.dispatch_table:
+            p.dispatch_table[torch.Tensor] = _tensor_reducer(p.dispatch_table[torch.Tensor], torch)
         p.dispatch_table[np.ndarray] = _reduce_ndarray
         st = _tls.p = (buf, p, n)
     buf, p, _ = st
@@ -183,6 +183,7 @@ class ShmQueue:
 
     def put(self, obj, block=True, timeout=None):
         data = _dumps(obj, self._inline_max, self._store)
+        disk = False
         if len(data) > self._spill_at and self._store is not None:
             # Too big for the ring's fast path (e.g. a large bytes field): park
             # it in a recycled store block rather than a fresh shm object per
@@ -191,7 +192,11 @@ class ShmQueue:
             if blk is not None:
                 data = pickle.dumps((shmstore.load_spilled, (self._store.name, *blk.share())), 5)
                 data = _SPILLED + data
-        if not self._core.put(data, block, timeout):
+            else:
+                # Store full: spill to disk rather than growing shared memory
+                # (RAM) past the store's cap with a shm object per message.
+                disk = True
+        if not self._core.put(data, block, timeout, disk):
             raise Full
 
     def put_nowait(self, obj):

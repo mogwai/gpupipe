@@ -1,7 +1,7 @@
 import contextlib
 import gc
-import multiprocessing
 import inspect
+import multiprocessing
 import os
 import pickle
 import resource
@@ -12,8 +12,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Full
 
-import torch
-
+from . import _torch
 from .queues import _InputChannel, _OutputChannel
 from .types import End, WorkerStop
 from .utils import _log
@@ -91,7 +90,9 @@ def _setup_cpu(cpu_affinity, cpu_threads, worker_desc):
         n = len(cpu_affinity)
     else:
         n = 2
-    torch.set_num_threads(n)
+    torch = _torch.loaded()  # a CPU stage that never imported torch keeps it that way
+    if torch is not None:
+        torch.set_num_threads(n)
     s = str(n)
     os.environ["OMP_NUM_THREADS"] = s
     os.environ["MKL_NUM_THREADS"] = s
@@ -317,6 +318,9 @@ def _has_cuda_tensor(obj, _depth=0):
     Sending one through a queue exports CUDA IPC memory, which makes the
     owning process unsafe to checkpoint (see scavenge._checkpoint_hazard).
     Depth-limited: nesting deeper than this isn't worth the per-item cost."""
+    torch = _torch.loaded()
+    if torch is None:
+        return False
     if torch.is_tensor(obj):
         return obj.is_cuda
     if _depth >= 2:
@@ -328,14 +332,61 @@ def _has_cuda_tensor(obj, _depth=0):
     return False
 
 
+def _exit_with_parent(worker_desc):
+    """Exit this worker if the pipeline's parent process dies.
+
+    Without this a crashed or killed parent left its workers running as
+    orphans: a source kept producing (claiming work, holding resources) for a
+    pipeline nobody would ever read. Blocks on the parent's process sentinel
+    in a daemon thread, so it costs nothing while the parent lives."""
+    import multiprocessing.connection
+
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch():
+        multiprocessing.connection.wait([parent.sentinel])
+        print(f"Worker {worker_desc}: pipeline parent died; exiting", flush=True)
+        os._exit(1)
+
+    threading.Thread(target=watch, name="pipe-parent-watch", daemon=True).start()
+
+
+class _SourceBackoff:
+    """Delay before calling a root stage again after its generator raised:
+    PIPE_SOURCE_RETRY_S (default 1s), doubling up to 60s, back to the base once
+    a call makes progress. A source keeping its cursor on self (a DB loader)
+    resumes; one that keeps failing doesn't spin."""
+
+    def __init__(self):
+        self.base = float(os.environ.get("PIPE_SOURCE_RETRY_S", "1.0"))
+        self.failures = 0
+
+    def wait(self, made_progress, stop, worker_desc):
+        if made_progress:
+            self.failures = 0
+        delay = min(self.base * 2 ** self.failures, 60.0)
+        self.failures += 1
+        print(f"Worker {worker_desc}: calling the source again in {delay:g}s")
+        deadline = time.monotonic() + delay
+        while not stop():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(0.1, left))
+
+
 def _drain_source_generator(gen, emit, stop, on_item, worker_desc, raise_errors):
     """Send every item of a root stage's generator downstream.
 
-    The generator IS the stream: calling the stage again would restart it
-    from item 0 and duplicate everything already sent. So a failed send drops
-    just that item, and a generator that raises ends the stream; both are
-    reported (raise_errors=True still raises). Connection errors propagate to
-    the caller's pipeline-restart handling."""
+    Returns (raised, sent). A failed send drops just that item: re-calling
+    the stage would restart the generator from item 0 and duplicate
+    everything already sent. A generator that raises is reported, and the
+    caller calls the stage again after a backoff (_SourceBackoff).
+    raise_errors=True still raises; connection errors propagate to the
+    caller's pipeline-restart handling."""
+    sent = 0
     try:
         for gen_item in gen:
             if stop():
@@ -343,6 +394,7 @@ def _drain_source_generator(gen, emit, stop, on_item, worker_desc, raise_errors)
             if gen_item is None or _is_end(gen_item):
                 continue
             on_item(gen_item)
+            sent += 1
             if emit is None:
                 continue
             try:
@@ -359,8 +411,10 @@ def _drain_source_generator(gen, emit, stop, on_item, worker_desc, raise_errors)
     except Exception as e:
         if raise_errors:
             raise
-        print(f"Worker {worker_desc} source generator raised; ending its stream: {e}")
+        print(f"Worker {worker_desc} source generator raised: {e}")
         traceback.print_exc()
+        return True, sent
+    return False, sent
 
 
 def _timed_call(worker, arg, busy_since):
@@ -444,7 +498,8 @@ def _release_pool_on_stall():
     the pool regrows on the next allocation at cudaMalloc cost, nothing against
     a multi-second stall. Fires once per stall (see queues._put_retry).
     """
-    if not torch.cuda.is_initialized():
+    torch = _torch.loaded()
+    if torch is None or not torch.cuda.is_initialized():
         return
     before = torch.cuda.memory_reserved()
     torch.cuda.empty_cache()
@@ -455,8 +510,8 @@ def _release_pool_on_stall():
 def _park_release_gpu(worker, worker_desc, emit=None, out_ch=None):
     """Phase 1 of releasing a finished worker's GPU before it parks.
 
-    Workers park after End (see the callers) so the CPU tensors they put on the
-    torch.multiprocessing queues stay valid until every consumer is done. Only
+    Workers park after End (see the callers) so tensors they sent through
+    torch's fd/IPC sharing stay valid until every consumer is done. Only
     the PROCESS has to survive for that. Left alone, a GPU worker that finishes
     early in a drain keeps its weights, compiled graphs and the whole caching-
     allocator pool (20-30 GB per card on a large model) until the last item of
@@ -478,7 +533,8 @@ def _park_release_gpu(worker, worker_desc, emit=None, out_ch=None):
     more reference) and call _free_cuda_pool(). Guarded on is_initialized() so
     a CPU worker never creates a context here.
     """
-    if not torch.cuda.is_initialized():
+    torch = _torch.loaded()
+    if torch is None or not torch.cuda.is_initialized():
         return
     if hasattr(worker, "on_park"):
         try:
@@ -516,7 +572,8 @@ def _free_cuda_pool(worker_desc):
     The primary context (~0.5 GB) stays until exit; nothing short of leaving the
     process releases it.
     """
-    if not torch.cuda.is_initialized():
+    torch = _torch.loaded()
+    if torch is None or not torch.cuda.is_initialized():
         return
     try:
         before = torch.cuda.memory_reserved()
@@ -565,6 +622,8 @@ def _worker_run(
     """Worker process using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
     is_root = (in_queue is None)
+    _exit_with_parent(worker_desc)
+    source_backoff = _SourceBackoff()
 
     # Pin to this worker's CPU slice (if cpus= was set) and size threads: explicit
     # cpu_threads > slice size > the default 2-thread cap that avoids oversubscription.
@@ -589,7 +648,10 @@ def _worker_run(
             # creates the ~500 MB primary context. A scavenge worker that
             # starts held defers it until released, so a parked worker owns no
             # GPU memory at all and needs no checkpoint to give the GPU up.
-            if scavenge_hold is None or not scavenge_hold.value:
+            # Only if the stage already imported torch: CUDA_VISIBLE_DEVICES
+            # alone pins any CUDA user (torch imported later sees one device).
+            torch = _torch.loaded()
+            if torch is not None and (scavenge_hold is None or not scavenge_hold.value):
                 torch.cuda.set_device(0)  # logical 0 == physical `physical`
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
@@ -686,7 +748,9 @@ def _worker_run(
         # it is ours (skipped entirely if the stream ended while we waited).
         if not stream_over and gpu_id is not None:
             try:
-                torch.cuda.set_device(0)
+                torch = _torch.loaded()
+                if torch is not None:
+                    torch.cuda.set_device(0)
             except Exception as e:  # noqa: BLE001
                 print(f"Failed to set GPU {gpu_id} after scavenge hold: {e}")
 
@@ -750,11 +814,16 @@ def _worker_run(
                             items_processed += 1
                             total_audio_duration += extract_audio_duration(gen_item)
 
-                    _drain_source_generator(
-                        result, _emit if out_queue else None,
-                        lambda: should_stop.value or (drain_event is not None and drain_event.is_set()),
+                    def _stopping():
+                        return should_stop.value or (drain_event is not None and drain_event.is_set())
+
+                    raised, sent = _drain_source_generator(
+                        result, _emit if out_queue else None, _stopping,
                         _count, worker_desc, raise_errors,
                     )
+                    if raised:
+                        source_backoff.wait(sent > 0, _stopping, worker_desc)
+                        continue
                     # Generator exhausted = done
                     if timing_dict is not None and worker_id is not None:
                         total_process_time += time.time() - start_time
@@ -986,6 +1055,7 @@ def _threaded_worker_run(
     """Threaded worker using Event-based completion signaling."""
     worker_desc = f"{stage_name} ({worker_id})" if stage_name else worker_id
     is_root = (in_queue is None)
+    _exit_with_parent(worker_desc)
 
     # Pin to this worker's CPU slice (if cpus= was set) and size threads: explicit
     # cpu_threads > slice size > the default 2-thread cap that avoids oversubscription.
@@ -995,7 +1065,11 @@ def _threaded_worker_run(
 
     if gpu_id is not None:
         try:
-            torch.cuda.set_device(gpu_id)
+            # Threads share one process, so CUDA_VISIBLE_DEVICES can't pin
+            # them: torch's current device has to.
+            torch = _torch.available()
+            if torch is not None:
+                torch.cuda.set_device(gpu_id)
         except Exception as e:
             print(f"Failed to set GPU {gpu_id}: {e}")
 
@@ -1104,6 +1178,7 @@ def _threaded_worker_run(
 
     def _thread_loop(in_ch, out_ch, _emit, local_items, local_time, local_audio,
                      consecutive_empty, EMPTY_THRESHOLD):
+        source_backoff = _SourceBackoff()
         while not should_stop.value and not thread_stop.is_set():
             if out_ch is not None:
                 out_ch.maybe_flush()
@@ -1126,13 +1201,18 @@ def _threaded_worker_run(
                                 local_items += 1
                                 local_audio += extract_audio_duration(gen_item)
 
-                        _drain_source_generator(
-                            result, _emit if out_queue else None,
-                            lambda: should_stop.value or thread_stop.is_set() or (
+                        def _stopping():
+                            return should_stop.value or thread_stop.is_set() or (
                                 drain_event is not None and drain_event.is_set()
-                            ),
+                            )
+
+                        raised, sent = _drain_source_generator(
+                            result, _emit if out_queue else None, _stopping,
                             _count, worker_desc, raise_errors,
                         )
+                        if raised:
+                            source_backoff.wait(sent > 0, _stopping, worker_desc)
+                            continue
                         # Generator exhausted = done
                         if timing_dict is not None and worker_id is not None:
                             local_time += time.time() - start_time

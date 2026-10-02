@@ -14,28 +14,36 @@ Semantics:
   ("assignment destination is read-only") instead of silently changing data
   another item or stage may share; call .copy() for a private writable array.
 - CPU tensors arrive writable but shared (torch has no read-only tensors),
-  just as torch.multiprocessing shares them today.
+  just as torch's own process sharing does.
 - Blocks are refcounted across processes and reused once every view is gone.
   If the store is full, items fall back to being copied; nothing blocks.
 """
+import functools
 import os
 import pickle
+import re
+import shutil
+import tempfile
 import threading
 import weakref
 from multiprocessing import resource_tracker
 
 import numpy as np
-import torch
 
 from ._rustq import Block, Store
 
 STORE_MIN_BYTES = int(os.environ.get("PIPE_STORE_MIN_BYTES", 64 << 10))
 
-_TENSOR_DTYPES = {
-    torch.float32, torch.float64, torch.float16, torch.bfloat16,
-    torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8, torch.bool,
-}
-_ITEMSIZE = {dt: torch.empty((), dtype=dt).element_size() for dt in _TENSOR_DTYPES}
+@functools.lru_cache(maxsize=1)
+def tensor_itemsizes():
+    """{dtype: bytes per element} for the tensor dtypes moved as raw bytes
+    (inline or via the store). Built on first use: torch is only imported in
+    processes whose stages use it."""
+    import torch
+
+    dts = (torch.float32, torch.float64, torch.float16, torch.bfloat16,
+           torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8, torch.bool)
+    return {dt: torch.empty((), dtype=dt).element_size() for dt in dts}
 
 _attached = {}  # store name -> Store (this process)
 _attach_lock = threading.Lock()
@@ -55,6 +63,60 @@ def shm_free_bytes():
     except OSError:
         return None
     return st.f_bavail * st.f_frsize
+
+
+# Linux shm/spill names start "gpq"/"gps" + "<pid-ns inode>.<owner pid>_"
+# (sys.rs owner_tag); spill dirs are "<ring name>.spill" in the temp dir.
+_OWNED = re.compile(r"^gp[qs]([0-9a-f]+)\.([0-9a-f]+)_")
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_dead_owners():
+    """Remove queues, payload-store segments and spills left in /dev/shm (and
+    spill dirs in the temp dir) by pipelines whose owner process died without
+    cleaning up — a crash, OOM kill, or SIGKILL. A normal stop removes them,
+    and the resource tracker covers what the owner registered, but segments a
+    worker created on demand, and anything left when the tracker died too,
+    would otherwise sit in RAM until reboot. Linux only (macOS can't list shm
+    objects). Only names from this pid namespace are judged, so containers
+    sharing /dev/shm (--ipc=host) never sweep each other's. Returns the count."""
+    if not os.path.isdir("/dev/shm"):
+        return 0
+    try:
+        ns = os.stat("/proc/self/ns/pid").st_ino
+    except OSError:
+        return 0
+    removed = 0
+    for base, is_dir in (("/dev/shm", False), (tempfile.gettempdir(), True)):
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for name in names:
+            m = _OWNED.match(name)
+            if not m or int(m.group(1), 16) != ns or (is_dir and not name.endswith(".spill")):
+                continue
+            if _alive(int(m.group(2), 16)):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if is_dir:
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def warn_if_small_shm():
@@ -130,13 +192,18 @@ def _alloc(st, nbytes):
     if got is None:
         if not _full_warned:
             _full_warned = True
+            # Which limit stopped it: a new size-class block needs a whole new
+            # segment, a big one its own dedicated segment.
+            dedicated = nbytes + 64 > min(64 << 20, st.seg_bytes // 4)
+            need = nbytes if dedicated else st.seg_bytes
             free = shm_free_bytes()
-            if st.used + nbytes <= st.limit and free is not None:
-                why = f"/dev/shm is full ({free >> 20} MiB free; run Docker with a bigger --shm-size)"
+            if free is not None and free < need + (1 << 20):
+                why = f"/dev/shm is full ({free >> 20} MiB free; give Docker a bigger --shm-size)"
             else:
-                why = (f"the payload store can't fit a {nbytes >> 20} MiB array ({st.used >> 20} of "
-                       f"{st.limit >> 20} MiB in use; raise PIPE_STORE_MB, or --shm-size in Docker)")
-            print(f"WARNING: {why}: copying large arrays until shared memory frees up")
+                why = (f"the payload store is at its cap ({st.used >> 20} of {st.limit >> 20} MiB "
+                       f"reserved; raise PIPE_STORE_MB)")
+            print(f"WARNING: {why}: copying large arrays, and spilling big messages to disk, "
+                  f"until shared memory frees up")
         return None
     return got
 
@@ -192,10 +259,12 @@ def _rebuild_ndarray(name, seg, boff, dedicated, dtype, shape, strides, off):
 
 def reduce_tensor(t, st):
     """Store reduction for a CPU tensor, or None to fall back."""
+    import torch
+
     if not (
         t.device.type == "cpu"
         and t.layout is torch.strided
-        and t.dtype in _TENSOR_DTYPES
+        and t.dtype in tensor_itemsizes()
         and t.numel() * t.element_size() >= STORE_MIN_BYTES
         and (t.is_leaf or not t.requires_grad)  # torch refuses non-leaf grads; so do we
     ):
@@ -215,8 +284,10 @@ def reduce_tensor(t, st):
 
 
 def _rebuild_tensor(name, seg, boff, dedicated, dtype, shape, stride, storage_offset, requires_grad):
+    import torch
+
     blk = store(name).adopt(seg, boff, dedicated)
-    base = torch.frombuffer(blk, dtype=dtype, count=len(blk) // _ITEMSIZE[dtype])
+    base = torch.frombuffer(blk, dtype=dtype, count=len(blk) // tensor_itemsizes()[dtype])
     _tensor_blocks[blk.addr] = blk
     t = base.as_strided(shape, stride, storage_offset)
     if requires_grad:
