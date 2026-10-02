@@ -1,5 +1,13 @@
-# Build wheels (with the Rust shared-memory extension) and an sdist.
-# Artifacts only: publishing to PyPI is a separate, deliberate step.
+# Build wheels (with the Rust shared-memory extension) and an sdist on every
+# PR, and publish them.
+#
+# Release: push a tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`.
+# setuptools-scm takes the version from the tag. Every file is checked to be
+# exactly that version, then uploaded to PyPI by trusted publishing (OIDC, no
+# stored token) and attached to a GitHub release.
+#
+# Rehearsal: run this workflow by hand with "testpypi" ticked. It uploads a
+# dev version to https://test.pypi.org.
 name: wheels
 
 on:
@@ -7,6 +15,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      testpypi:
+        description: "Upload to TestPyPI (a rehearsal; releases publish from v* tags)"
+        type: boolean
+        default: false
 
 jobs:
   wheels:
@@ -33,7 +46,47 @@ jobs:
         with:
           fetch-depth: 0
       - run: pipx run build --sdist
+      - name: The sdist builds a wheel on its own
+        run: pip wheel --no-deps -w /tmp/from-sdist dist/*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: dist/*.tar.gz
+
+  publish:
+    name: publish (${{ github.event_name == 'push' && 'PyPI' || 'TestPyPI' }})
+    needs: [wheels, sdist]
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || (github.event_name == 'workflow_dispatch' && inputs.testpypi)
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'push' && 'pypi' || 'testpypi' }}
+      url: ${{ github.event_name == 'push' && 'https://pypi.org/project/gpupipe/' || 'https://test.pypi.org/project/gpupipe/' }}
+    permissions:
+      id-token: write  # trusted publishing
+      contents: write  # the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the files
+        run: |
+          python scripts/check_dist.py dist ${{ github.event_name == 'push' && github.ref_name || '' }}
+          pipx run twine check --strict dist/*
+      - name: Upload to TestPyPI
+        if: github.event_name == 'workflow_dispatch'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+      - name: Upload to PyPI
+        if: github.event_name == 'push'
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --verify-tag --generate-notes

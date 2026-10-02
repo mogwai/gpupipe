@@ -69,7 +69,7 @@ for result in pipe:
 
 > **Autoscaling** (queue-pressure-based worker scaling) is a **planned feature** —
 > designed and implemented, but not currently wired into `Pipe`. See
-> [`PLANNED.md`](PLANNED.md) for the design and re-integration steps.
+> [`PLANNED.md`](https://github.com/mogwai/gpupipe/blob/main/PLANNED.md) for the design and re-integration steps.
 
 ## Capability Tour
 
@@ -197,7 +197,7 @@ pytest tests/test_basic.py -v
 
 ## Documentation
 
-- [`PIPE_REFERENCE.md`](PIPE_REFERENCE.md) - the full reference: worker types, return-value
+- [`PIPE_REFERENCE.md`](https://github.com/mogwai/gpupipe/blob/main/PIPE_REFERENCE.md) - the full reference: worker types, return-value
   semantics, completion signaling, tensor handling, DDP, env vars, pitfalls
-- [`examples/`](examples/) - runnable examples and job templates
-- [`PLANNED.md`](PLANNED.md) - designed-but-unwired features (autoscaling)
+- [`examples/`](https://github.com/mogwai/gpupipe/tree/main/examples) - runnable examples and job templates
+- [`PLANNED.md`](https://github.com/mogwai/gpupipe/blob/main/PLANNED.md) - designed-but-unwired features (autoscaling)
