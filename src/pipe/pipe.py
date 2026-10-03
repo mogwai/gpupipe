@@ -384,12 +384,15 @@ class Pipe(LifecycleMixin, SequentialMixin):
                     q.qsize() * max(1, j.get("chunk_eff", 0))
                     for q, j in zip(self.queues, self.jobs)
                 )
-                print(
-                    f"Starting to drain... {stopped_str} stopped (their inputs are not drained); "
-                    f"finishing ~{in_flight} items already in the pipeline. "
-                    "(Ctrl+C again to force stop)",
-                    flush=True,
-                )
+                # A terminal Ctrl+C also kills a `| tee` on stdout; a print raising
+                # BrokenPipeError here would escape the handler into the user's loop.
+                with contextlib.suppress(OSError):
+                    print(
+                        f"Starting to drain... {stopped_str} stopped (their inputs are not drained); "
+                        f"finishing ~{in_flight} items already in the pipeline. "
+                        "(Ctrl+C again to force stop)",
+                        flush=True,
+                    )
             prev_handler = signal.signal(signal.SIGINT, _drain_on_sigint)
 
         try:

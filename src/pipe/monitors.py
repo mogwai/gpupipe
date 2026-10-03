@@ -96,7 +96,10 @@ def _health_monitor_thread(
                     need_full_restart = True
                     break
 
-            if need_full_restart and pipe_instance.allow_full_restart:
+            # A full restart recreates the queues, throwing away exactly the items a
+            # drain is finishing, so while draining only restart workers in place.
+            draining = pipe_instance.drain_event.is_set()
+            if need_full_restart and pipe_instance.allow_full_restart and not draining:
                 print("   Triggering full pipeline restart to recreate queues...")
                 try:
                     pipe_instance.restart(reason="Worker crash requiring queue refresh")

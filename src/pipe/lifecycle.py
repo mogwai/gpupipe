@@ -335,9 +335,15 @@ class LifecycleMixin:
         _log(f"Worker {worker_id} restarted with PID {p.pid}")
 
     def restart(self, reason="ConnectionError"):
+        # _stop() clears drain_event; a restart mid-drain (e.g. the health monitor
+        # recovering a crashed worker after Ctrl+C) must not cancel the drain, or the
+        # root stage starts producing again.
+        draining = self.drain_event.is_set()
         self._stop(force=True)
 
         self.start()  # recreates the manager lazily if stats are enabled
+        if draining:
+            self.drain_event.set()
         _log(f"Pipeline restarted due to {reason}")
 
     def stop(self, force=False):
