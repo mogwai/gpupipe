@@ -1,4 +1,5 @@
 """Test drain mode: first Ctrl+C drains queues, second force-stops."""
+import os
 import time
 from queue import Empty
 
@@ -221,3 +222,75 @@ def test_should_stop_does_not_drop_inflight_put():
     print(f"PASS: items {ids} delivered, in-flight item 3 not dropped")
 
 
+
+
+class FileCountingRoot:
+    """Appends a line per call, so calls made by respawned processes are counted too."""
+    def __init__(self, path):
+        self.path = path
+
+    def __call__(self):
+        with open(self.path, "a") as f:
+            f.write("call\n")
+        time.sleep(0.01)
+        return 1
+
+
+def test_restart_during_drain_keeps_draining(tmp_path):
+    """A restart mid-drain (the health monitor recovering crashed workers after
+    Ctrl+C) must not cancel the drain. _stop() clears drain_event, so restart()
+    used to bring the root back producing: under `script | tee`, Ctrl+C killed
+    tee, every print crashed its worker, and each crash-triggered restart
+    re-ran the root — ~100 extra root calls in 25 s."""
+    calls = tmp_path / "calls"
+    p = Pipe(sequential=False, stats_interval=0, health_check_interval=0)
+    p.add(FileCountingRoot(str(calls)), workers=1, outqn=5)
+    p.add(SlowSink(delay=0.05), workers=1, outqn=50)
+    p.start()
+    try:
+        time.sleep(1.0)
+        p.drain_event.set()
+        time.sleep(0.5)
+        p.restart(reason="test: crash during drain")
+        assert p.drain_event.is_set(), "restart() cancelled the drain"
+        time.sleep(0.5)
+        n = len(calls.read_text().splitlines())
+        time.sleep(1.5)
+        assert len(calls.read_text().splitlines()) == n, "root kept producing after the restart"
+    finally:
+        p.stop(force=True)
+
+
+class CrashOnFlag:
+    """Passes items through until `flag` exists, then kills its own process: a
+    worker dying mid-drain, like one printing to a `| tee` that Ctrl+C took out."""
+    def __init__(self, flag):
+        self.flag = flag
+
+    def __call__(self, x):
+        if os.path.exists(self.flag):
+            os._exit(1)
+        time.sleep(0.05)
+        return x
+
+
+def test_worker_crashes_during_drain_do_not_resume_root(tmp_path):
+    """End to end through the health monitor: workers crashing while a drain runs
+    must not bring the root back. After 3 crashes the monitor used to run a full
+    restart, which both cleared the drain and recreated the queues being drained."""
+    calls, flag = tmp_path / "calls", tmp_path / "crash"
+    p = Pipe(sequential=False, stats_interval=0, health_check_interval=0.2)
+    p.add(FileCountingRoot(str(calls)), workers=1, outqn=5)
+    p.add(CrashOnFlag(str(flag)), workers=1, outqn=50)
+    p.start()
+    try:
+        time.sleep(1.0)
+        p.drain_event.set()
+        flag.touch()
+        time.sleep(1.0)  # the root finishes any call it was in
+        n = len(calls.read_text().splitlines())
+        time.sleep(3.0)  # several crash/restart rounds of the sink
+        assert p.drain_event.is_set(), "a crash-triggered restart cancelled the drain"
+        assert len(calls.read_text().splitlines()) == n, "root resumed producing after worker crashes"
+    finally:
+        p.stop(force=True)
