@@ -440,6 +440,60 @@ def test_full_store_in_a_pipeline_copies_instead(on_store, monkeypatch):
     assert all((x["a"] == x["id"]).all() and x["a"].flags.writeable for x in got)
 
 
+def test_a_put_retried_on_a_full_queue_shares_its_arrays_once(store):
+    # Each retry encoded the message again, taking another store block for
+    # its array that the attempts that didn't go never released: a stage
+    # blocked on a full queue filled akro's 16 GiB store in a minute.
+    import threading
+
+    from pipe.queues import _put_retry
+
+    n = (3 << 20) // 4  # 3 MiB: a size-class block, four to a 16 MiB segment
+    q = ShmQueue(1, store=store)
+    q.put({"a": np.ones(n, dtype=np.float32)})  # the queue is full
+    used = store.core.used
+    taker = threading.Timer(1.0, lambda: q.get(timeout=5))  # ~9 retries first
+    taker.start()
+    _put_retry(q, {"a": np.full(n, 7, dtype=np.float32)})
+    taker.join()
+    assert (q.get(timeout=5)["a"] == 7).all()
+    # one block for the retried array (room in the first segment), not a
+    # block an attempt (a segment every four)
+    assert store.core.used == used, (used, store.core.used)
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="counts fds in /proc")
+@needs_torch
+def test_a_retried_put_of_a_big_tensor_leaves_no_fd_behind(monkeypatch):
+    # With the store full (or none), a big CPU tensor goes by torch's fd
+    # sharing, and each encoding parked another dup of its fd for a receiver
+    # that, for the attempts that didn't go, never came: ~100k in akro.
+    import threading
+
+    from pipe.queues import _put_retry
+
+    def shm_fds():
+        n = 0
+        for f in os.listdir("/proc/self/fd"):
+            try:
+                n += os.readlink(f"/proc/self/fd/{f}").startswith("/dev/shm/")
+            except OSError:
+                pass
+        return n
+
+    q = ShmQueue(1)  # no store: big tensors by torch's sharing
+    q.put(0)  # the queue is full
+    before = shm_fds()
+    taker = threading.Timer(1.0, lambda: q.get(timeout=5))
+    taker.start()
+    _put_retry(q, {"t": torch.full((2 << 20,), 7.0)})
+    taker.join()
+    got = q.get(timeout=5)
+    assert float(got["t"][3]) == 7.0
+    del got
+    assert shm_fds() - before <= 2, f"{shm_fds() - before} shm fds left after one put"
+
+
 class _BigArrays:
     """Arrays on both store paths: size-class blocks (2 MiB) and dedicated
     segments (24 MiB > seg_bytes/4)."""

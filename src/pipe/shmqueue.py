@@ -182,6 +182,15 @@ class ShmQueue:
         return f"<ShmQueue {self._core.name} maxsize={self._maxsize} ring={self._core.ring_bytes >> 10}KiB>"
 
     def put(self, obj, block=True, timeout=None):
+        self.put_encoded(self.encode(obj), block, timeout)
+
+    def encode(self, obj):
+        """`obj` as this queue sends it, for `put_encoded`: made once however
+        often a full queue makes the put retry. Each encoding shares the
+        message's arrays anew (a store block reference, torch's fd for a big
+        CPU tensor) and an attempt that didn't go never gave them back: a
+        stage blocked on a full queue leaked them ~10 times a second (akro:
+        its 16 GiB store full in a minute, then ~100k fds)."""
         data = _dumps(obj, self._inline_max, self._store)
         disk = False
         if len(data) > self._spill_at and self._store is not None:
@@ -196,6 +205,11 @@ class ShmQueue:
                 # Store full: spill to disk rather than growing shared memory
                 # (RAM) past the store's cap with a shm object per message.
                 disk = True
+        return data, disk
+
+    def put_encoded(self, encoded, block=True, timeout=None):
+        """Put what `encode` made; raises Full as `put` does (try it again)."""
+        data, disk = encoded
         if not self._core.put(data, block, timeout, disk):
             raise Full
 

@@ -72,6 +72,17 @@ class Chunk:
         self.items = state
 
 
+def putter(queue, msg):
+    """put(timeout) for `msg` on `queue`, encoded once however many times it's
+    tried (ShmQueue.encode: a retry must not share its arrays again); any
+    other queue's put as it is."""
+    encode = getattr(queue, "encode", None)
+    if encode is None:
+        return lambda timeout: queue.put(msg, timeout=timeout)
+    encoded = encode(msg)
+    return lambda timeout: queue.put_encoded(encoded, timeout=timeout)
+
+
 def _put_retry(queue, msg, on_stall=None, stall_s=2.0):
     """Blocking put that retries forever on Full (0.1s put timeout + 10ms backoff).
 
@@ -81,9 +92,10 @@ def _put_retry(queue, msg, on_stall=None, stall_s=2.0):
     _release_pool_on_stall). Never raises: a failing hook must not lose the put.
     """
     t0 = None
+    put = putter(queue, msg)
     while True:
         try:
-            queue.put(msg, timeout=0.1)
+            put(0.1)
             return
         except Full:
             if on_stall is not None:

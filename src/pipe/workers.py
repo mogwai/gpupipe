@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Full
 
 from . import _torch
-from .queues import _InputChannel, _OutputChannel
+from .queues import _InputChannel, _OutputChannel, putter
 from .types import End, WorkerStop
 from .utils import _log
 
@@ -152,9 +152,10 @@ def _make_push(all_queues, stage_names, should_stop):
             except Full:
                 return False
         deadline = None if timeout is None else time.monotonic() + timeout
+        put = putter(target, item)
         while not (should_stop is not None and should_stop.value):
             try:
-                target.put(item, timeout=0.1)
+                put(0.1)
                 return True
             except Full:
                 if deadline is not None and time.monotonic() >= deadline:
